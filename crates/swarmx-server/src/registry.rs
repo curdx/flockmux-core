@@ -31,8 +31,9 @@ pub struct Lifecycle {
 }
 
 pub struct AgentSlot {
-    /// The PTY carrying this agent's I/O — every CLI (claude/codex/opencode)
-    /// runs as an interactive TUI scraped over a pseudo-terminal. Consumers go
+    /// The PTY carrying this agent's I/O — every CLI (claude/codex/opencode/
+    /// reasonix/zulu/kimi) runs as an interactive TUI scraped over a
+    /// pseudo-terminal. Consumers go
     /// through the `AgentSlot` methods (`is_alive`, `pty_stream`, `pty_input`,
     /// …) rather than touching the channel directly.
     pub channel: AgentChannel,
@@ -64,7 +65,7 @@ pub struct AgentSlot {
     /// `--port` swarmx spawned the TUI on. `Some(port)` is the signal that
     /// this agent's prompts (bootstrap + wakes) are delivered via
     /// `crate::opencode_tui` instead of keystroke injection. `None` for the
-    /// keystroke CLIs (claude/codex).
+    /// keystroke CLIs (claude/codex/kimi).
     pub tui_http_port: Option<u16>,
     /// For reasonix: the `--addr` port its `reasonix serve` HTTP+SSE control API
     /// listens on. `Some(port)` routes this agent's bootstrap/wakes through
@@ -78,8 +79,9 @@ pub struct AgentSlot {
     pub zulu: Option<Arc<crate::zulu_serve::ZuluConv>>,
 }
 
-/// An agent's PTY I/O. Every CLI (claude/codex/opencode) runs as an interactive
-/// TUI scraped over a pseudo-terminal. Kept as a single-variant enum so the
+/// An agent's PTY I/O. Every CLI (claude/codex/opencode/reasonix/zulu/kimi)
+/// runs as an interactive TUI scraped over a pseudo-terminal. Kept as a
+/// single-variant enum so the
 /// accessor methods below give consumers a stable, channel-agnostic surface.
 pub enum AgentChannel {
     Pty {
@@ -104,6 +106,18 @@ impl AgentSlot {
     pub fn try_exit_code(&self) -> Option<i32> {
         match &self.channel {
             AgentChannel::Pty { bridge, .. } => bridge.try_exit_code(),
+        }
+    }
+
+    /// The shim's OS pid — also its process-group id on unix, since
+    /// portable-pty `setsid`s the shim at spawn, making it the group leader of
+    /// the whole CLI tree. The reaper persists this into the agents row
+    /// (`record_agent_shim_pid`) so a server crash/SIGKILL leaves enough of a
+    /// process ledger for the next boot to really kill the orphaned tree
+    /// instead of just marking the row killed.
+    pub fn shim_pid(&self) -> Option<u32> {
+        match &self.channel {
+            AgentChannel::Pty { bridge, .. } => bridge.pid(),
         }
     }
 
@@ -136,7 +150,7 @@ impl AgentSlot {
     }
 
     /// The TUI HTTP-control port for opencode agents (see `tui_http_port` field
-    /// and `crate::opencode_tui`). `None` for keystroke CLIs (claude/codex).
+    /// and `crate::opencode_tui`). `None` for keystroke CLIs (claude/codex/kimi).
     pub fn tui_http_port(&self) -> Option<u16> {
         self.tui_http_port
     }
@@ -190,7 +204,19 @@ impl Registry {
     }
 
     pub fn remove(&self, agent_id: &str) -> Option<Arc<Mutex<AgentSlot>>> {
-        self.inner.remove(agent_id).map(|(_, v)| v)
+        let slot = self.inner.remove(agent_id).map(|(_, v)| v);
+        if slot.is_some() {
+            // Slot removal is THE convergence point for agent retirement —
+            // REST teardown, the wake coordinator's auto-kill, and the
+            // reaper's post-grace eviction all funnel through here — so this
+            // is where the per-agent config scratch under `~/.swarmx/`
+            // (codex/reasonix homes, opencode/mcp/wake entries) gets
+            // reclaimed. A handful of small removes, idempotent, and
+            // path-validated inside; previously only the engine probe ever
+            // cleaned these, so torn-down agents leaked them forever.
+            crate::engine_probe::remove_agent_scratch(agent_id);
+        }
+        slot
     }
 
     /// Snapshot of every live agent. Used by `GET /api/agent` so a freshly

@@ -21,8 +21,8 @@ pub use models::{
     ListMessagesOpts, MessageRecord, NewAgent, NewBlackboardOp, NewFusionBatch, NewGoal,
     NewGoalEvidence,
     NewMessage, NewRecording, NewSpellRun, NewThoughtTrace, NewThoughtTraceEvent, NewThread,
-    NewWorker, NewWorkspace, NewWorkspaceRoot, RecordingRecord, SpellRunRecord, TaskRecord,
-    ThoughtTraceRecord, ThoughtTraceStep, ThreadRecord, UsageByAgent, UsageByDay, UsageByModel,
-    WorkerRecord, WorkspaceRecord, WorkspaceRootRecord,
+    NewWorker, NewWorkspace, NewWorkspaceRoot, OrphanedAgentProcess, RecordingRecord,
+    SpellRunRecord, TaskRecord, ThoughtTraceRecord, ThoughtTraceStep, ThreadRecord, UsageByAgent,
+    UsageByDay, UsageByModel, WorkerRecord, WorkspaceRecord, WorkspaceRootRecord,
 };
 pub use store::{PruneStats, Store};

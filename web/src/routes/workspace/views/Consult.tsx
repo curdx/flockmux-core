@@ -1,5 +1,5 @@
 /**
- * Consult (研究委员会) — the answer/research fusion view. Ask a question, pick a
+ * Consult (多模对比) — the answer/research fusion view. Ask a question, pick a
  * panel of zulu models; the server runs panel → judge → synthesis and returns
  * the structured analysis + final answer. Distinct from the code-competition
  * 竞赛 (Fusion) view.
@@ -61,9 +61,9 @@ export default function ConsultView() {
     <div className="mx-auto flex max-w-3xl flex-col gap-4 overflow-y-auto p-6">
       <div className="flex items-center gap-2">
         <Users className="size-5 text-accent-primary" />
-        <h1 className="text-lg font-semibold">{t("consult.title", "研究委员会")}</h1>
+        <h1 className="text-lg font-semibold">{t("consult.title")}</h1>
         <span className="font-caption text-xs text-foreground-tertiary">
-          {t("consult.subtitle", "多模型并行答题 → judge 结构化对比 → 综合定稿（zulu 一把 license 驱动）")}
+          {t("consult.subtitle")}
         </span>
       </div>
 
@@ -89,15 +89,12 @@ export default function ConsultView() {
           <textarea
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
-            placeholder={t(
-              "consult.placeholder",
-              "提一个值得多模型会诊的问题（技术选型、竞品分析、方案评审、高风险决策的反方检查…）",
-            )}
+            placeholder={t("consult.placeholder")}
             className="min-h-20 w-full resize-y rounded-md border border-border-subtle bg-surface-elevated px-3 py-2 text-sm text-foreground focus:border-accent-primary focus:outline-none"
           />
           <div className="flex flex-col gap-1">
             <span className="font-caption text-[11px] text-foreground-tertiary">
-              {t("consult.panelLabel", { defaultValue: "Panel（选 2–8 个模型 · 已选 {{count}}）", count: picked.length })}
+              {t("consult.panelLabel", { count: picked.length })}
             </span>
             <div className="flex flex-wrap gap-1.5">
               {models.map((m) => {
@@ -127,10 +124,10 @@ export default function ConsultView() {
               className="inline-flex items-center gap-1.5 rounded-md bg-accent-primary px-3 py-1.5 text-sm font-medium text-white transition-colors hover:opacity-90 disabled:opacity-50"
             >
               {running ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
-              {running ? t("consult.running", "会诊中…（约 1–2 分钟）") : t("consult.start", "开始会诊")}
+              {running ? t("consult.running", "对比中…（约 1–2 分钟）") : t("consult.start", "开始对比")}
             </button>
             <span className="font-caption text-[11px] text-foreground-tertiary">
-              {t("consult.cost", "成本 ≈ (panel + 2)× 单次调用；这是高价值任务按钮，不是默认路径。")}
+              {t("consult.cost", "成本约等于（所选模型数 + 2）次调用；适合高价值问题，不要当默认操作。")}
             </span>
           </div>
         </>

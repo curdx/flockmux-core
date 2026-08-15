@@ -231,14 +231,11 @@ export function McpManager() {
 
       {/* 服务器 */}
       <section className="flex flex-col gap-2.5">
-        <SectionLabel text={t("mcp.serversTitle", "服务器")} />
+        <SectionLabel text={t("mcp.serversTitle")} />
         <p className="flex items-start gap-1.5 rounded-md border border-status-warning/40 bg-status-warning-soft px-3 py-2 font-caption text-[11px] leading-relaxed text-foreground-secondary">
           <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-status-warning" />
           <span>
-            {t(
-              "mcp.userScopeWarning",
-              "这里的开关会写入用户级 claude / codex 配置，并对所有工作区和正在运行的 agent 生效。启用或关闭前请确认当前项目可信。",
-            )}
+            {t("mcp.userScopeWarning")}
           </span>
         </p>
         <div className="flex flex-col gap-3">
@@ -278,8 +275,8 @@ export function McpManager() {
                       <span className="font-heading text-sm font-semibold text-foreground-primary">
                         {meta?.name ?? srv.id}
                       </span>
-                      <span className="rounded bg-surface-tertiary px-1 font-mono text-[9px] uppercase text-foreground-tertiary">
-                        stdio
+                      <span className="rounded bg-surface-tertiary px-1 font-caption text-[9px] text-foreground-tertiary">
+                        {t("mcp.tagStdio")}
                       </span>
                       <span className="font-caption text-[10px] text-foreground-tertiary">
                         {t("mcp.needsNode", "需 Node.js LTS")}
@@ -471,9 +468,14 @@ export function McpManager() {
 
 // ── 子组件 ──────────────────────────────────────────────────────────
 
+function displayToolVersion(v: string | undefined): string | undefined {
+  if (!v) return v;
+  return v.trim().split(/[\s(]/)[0] || v;
+}
+
 function SectionLabel({ text }: { text: string }) {
   return (
-    <span className="font-heading text-xs font-semibold uppercase tracking-wider text-foreground-tertiary">
+    <span className="font-heading text-xs font-semibold tracking-wider text-foreground-tertiary">
       {text}
     </span>
   );
@@ -515,7 +517,7 @@ function RuntimeChip({
       )}
       <span>{label}</span>
       {info?.version ? (
-        <span className="opacity-80">{info.version}</span>
+        <span className="opacity-80">{displayToolVersion(info.version)}</span>
       ) : present === false ? (
         <span>{required ? t("mcp.notInstalled", { defaultValue: "未安装" }) : "—"}</span>
       ) : null}
@@ -537,10 +539,10 @@ function CliToggle({
   onChange: (v: boolean) => void;
 }) {
   return (
-    <span className="flex items-center gap-2">
-      <span className="font-heading text-[13px] text-foreground-secondary">{label}</span>
+    <span className="flex items-center gap-1.5">
+      <span className="font-heading text-[13px] leading-none text-foreground-secondary">{label}</span>
       {pending ? (
-        <Loader2 className="size-4 animate-spin text-foreground-tertiary" />
+        <Loader2 className="size-3.5 animate-spin text-foreground-tertiary" />
       ) : (
         <Switch
           size="sm"

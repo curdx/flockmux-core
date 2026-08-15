@@ -25,6 +25,7 @@ import { SwarmPanel } from "../components/SwarmPanel";
 import { SpellsLauncher } from "../components/SpellsLauncher";
 import { useSwarmFeed } from "../hooks/useSwarmFeed";
 import { toast } from "@/lib/toast";
+import { notifySpawnFallbacks } from "../lib/engineFallback";
 import {
   isTauriWindow,
   TAURI_DRAG_REGION,
@@ -147,6 +148,8 @@ export default function DebugRoute() {
     try {
       const workspace_id = await ensureDebugWorkspace();
       const agent = await api.spawnAgent({ cli, workspace_id });
+      // Engine fallback is never silent (billing red line) — see CreateWizard.
+      notifySpawnFallbacks(t, [agent]);
       // De-dup against the WS-driven refreshAgents that may have already
       // inserted this agent_id (agent_state event lands before this resolves).
       setAgents((prev) =>

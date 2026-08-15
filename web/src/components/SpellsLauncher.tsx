@@ -28,6 +28,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, ApiError } from "../api/http";
 import type { SpellInfo } from "../api/types";
+import { notifySpawnFallbacks } from "../lib/engineFallback";
 
 interface Props {
   /** Notify the parent that new agents popped into existence so it can
@@ -121,6 +122,8 @@ export function SpellsLauncher({
         ...(threadId ? { thread_id: threadId } : {}),
         ...(wd ? { workspace_dir: wd } : {}),
       });
+      // Engine fallback is never silent (billing red line) — see CreateWizard.
+      notifySpawnFallbacks(t, resp.agents);
       setLastRun(
         t("spells.launchedSummary", {
           defaultValue: "已通过 {{name}} 启动 {{count}} 个 agent：{{agents}}",

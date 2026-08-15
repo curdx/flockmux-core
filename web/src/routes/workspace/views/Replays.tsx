@@ -327,15 +327,14 @@ export default function ReplaysView() {
                       agentId={r.agent_id}
                       roleLookup={roleLookup}
                       size="sm"
+                      showId={false}
+                      title={roleDisplayName(resolveRole(r.agent_id, roleLookup))}
                       className="min-w-0 flex-1"
                     />
                     {unscopedIds.has(r.id) && (
                       <span
                         className="rounded-full bg-surface-tertiary px-2 py-0.5 font-caption text-[10px] text-foreground-tertiary"
-                        title={t("replays.unscopedHint", {
-                          defaultValue:
-                            "该录像的 agent 没有归属工作空间（可能由 MCP 直接拉起，或 agent 行已被清理）",
-                        })}
+                        title={t("replays.unscopedHint")}
                       >
                         {t("replays.unscoped", { defaultValue: "未归属" })}
                       </span>
@@ -361,7 +360,7 @@ export default function ReplaysView() {
 
                   <Link
                     to={`/chat/${workspace.id}/replays/${encodeURIComponent(r.id)}`}
-                    aria-label={`${t("replays.play")} · ${r.agent_id}`}
+                    aria-label={`${t("replays.play")} · ${roleDisplayName(resolveRole(r.agent_id, roleLookup))}`}
                     className="group/thumb relative block h-32 overflow-hidden border-y border-[#1F1F1F] bg-term-bg"
                   >
                     <CastThumb recording={r} live={live} t={t} />
@@ -397,7 +396,7 @@ export default function ReplaysView() {
                       type="button"
                       onClick={() => downloadRecordingCast(r.id)}
                       className="flex h-8 items-center gap-1 rounded-md border border-border-subtle bg-surface-elevated px-2.5 text-xs hover:bg-surface-tertiary"
-                      title={t("player.downloadCast")}
+                      title={t("replays.download")}
                     >
                       <Download className="size-3" />
                       {t("replays.download")}

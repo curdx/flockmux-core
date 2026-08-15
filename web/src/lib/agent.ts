@@ -59,15 +59,15 @@ export function roleInitial(role: string): string {
 }
 
 /** User-facing display name for a role. The orchestrator is shown as the
- *  friendly "队长 / Captain" everywhere it's rendered (chip, message sender,
+ *  friendly "规划 / Plan" everywhere it's rendered (chip, message sender,
  *  DAG node) so the UI never surfaces the raw "orchestrator" slug alongside the
- *  "队长" we use in every other surface (W-UX naming unification). All other
+ *  "规划" we use in every other surface (W-UX naming unification). All other
  *  roles render their own label (e.g. "Backend Engineer") unchanged. Color +
  *  avatar initial still key off the raw slug, so theming is untouched. */
 export function roleDisplayName(role: string | null | undefined): string {
   const r = (role ?? "").toLowerCase();
   if (r === "orchestrator" || r === "captain" || r === "self") {
-    return i18n.t("chat.role.captain", { defaultValue: "队长" });
+    return i18n.t("chat.role.captain", { defaultValue: "规划" });
   }
   // Built-in worker roles get a localized label so the DAG / chips / member
   // list don't surface raw English slugs in a Chinese UI. The match is on a
@@ -81,21 +81,39 @@ export function roleDisplayName(role: string | null | undefined): string {
   // initial still key off the raw slug, so theming is untouched.
   const norm = r.replace(/[\s_]+/g, "-");
   const KNOWN: Record<string, { key: string; en: string }> = {
-    reviewer: { key: "chat.role.reviewer", en: "Code Reviewer" },
-    "code-reviewer": { key: "chat.role.reviewer", en: "Code Reviewer" },
-    researcher: { key: "chat.role.researcher", en: "Researcher" },
-    "docs-writer": { key: "chat.role.docsWriter", en: "Docs Writer" },
-    "doc-writer": { key: "chat.role.docsWriter", en: "Docs Writer" },
-    backend: { key: "chat.role.backend", en: "Backend Engineer" },
-    "backend-engineer": { key: "chat.role.backend", en: "Backend Engineer" },
-    frontend: { key: "chat.role.frontend", en: "Frontend Engineer" },
-    "frontend-engineer": { key: "chat.role.frontend", en: "Frontend Engineer" },
-    "test-runner": { key: "chat.role.testRunner", en: "Test Runner" },
-    fixer: { key: "chat.role.fixer", en: "Fixer" },
+    reviewer: { key: "chat.role.reviewer", en: "Review" },
+    "code-reviewer": { key: "chat.role.reviewer", en: "Review" },
+    researcher: { key: "chat.role.researcher", en: "Research" },
+    "docs-writer": { key: "chat.role.docsWriter", en: "Docs" },
+    "doc-writer": { key: "chat.role.docsWriter", en: "Docs" },
+    backend: { key: "chat.role.backend", en: "Backend" },
+    "backend-engineer": { key: "chat.role.backend", en: "Backend" },
+    frontend: { key: "chat.role.frontend", en: "Frontend" },
+    "frontend-engineer": { key: "chat.role.frontend", en: "Frontend" },
+    "test-runner": { key: "chat.role.testRunner", en: "Test" },
+    fixer: { key: "chat.role.fixer", en: "Fix" },
+    "merge-resolver": { key: "chat.role.mergeResolver", en: "Resolve" },
+    "fusion-contestant": { key: "chat.role.fusionContestant", en: "Contestant" },
+    "fusion-judge": { key: "chat.role.fusionJudge", en: "Review" },
   };
   const hit = KNOWN[norm];
   if (hit) return i18n.t(hit.key, { defaultValue: hit.en });
   return role ?? "agent";
+}
+
+/**
+ * When several live agents share the same display role (two「规划」is common
+ * after a double-spawn), append a short id so chips / rails / lists aren't
+ * identical twins the user can't tell apart.
+ */
+export function roleLabelAmong(
+  agent: { agent_id: string; role: string },
+  peers: ReadonlyArray<{ agent_id: string; role: string }>,
+): string {
+  const name = roleDisplayName(agent.role);
+  const dupes = peers.filter((p) => roleDisplayName(p.role) === name).length;
+  if (dupes <= 1) return name;
+  return `${name} · ${agent.agent_id.slice(-4)}`;
 }
 
 /** Resolve a role label for an agent_id.

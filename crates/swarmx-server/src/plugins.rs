@@ -33,8 +33,16 @@ pub enum McpFormat {
     /// `--mcp-config <file> --strict-mcp-config` (injected in spawn.rs) to
     /// dodge the shared-cwd `mcpServers` collision (M6b).
     ClaudeLocalScope,
-    /// codex: a single global `[mcp_servers.swarmx-swarm]` section in
-    /// `~/.codex/config.toml`; per-spawn identity rides in via env.
+    /// codex: MCP injection is PER-AGENT today — pre-spawn writes an isolated
+    /// `~/.swarmx/codex-home/<agent_id>/config.toml` (the user's `~/.codex`
+    /// MCP servers inherited + this agent's own `[mcp_servers.swarmx-swarm]`)
+    /// and spawn points the child at it via `CODEX_HOME`; the user's global
+    /// `~/.codex/config.toml` is NOT mutated (stale swarm sections from older
+    /// swarmx versions are self-healed away). The variant name is historical
+    /// (the first implementation DID append one global section): renaming it
+    /// would also touch the `cli/mod.rs` dispatch and the CI invariant in
+    /// `scripts/harness-check.mjs` that greps for this literal, so the name
+    /// (and the `"codex-global-toml"` wire value) stays.
     CodexGlobalToml,
     /// opencode: a per-agent config file at `~/.swarmx/opencode/<agent_id>.json`
     /// carrying `mcp.swarmx-swarm` (local stdio, per-agent identity in
@@ -275,6 +283,19 @@ pub struct CliPlugin {
     /// billing.
     #[serde(default)]
     pub blocked_env_prefixes: Vec<String>,
+    /// Provider env prefixes THIS CLI authenticates with, declared explicitly
+    /// per plugin (e.g. reasonix declares `DEEPSEEK_`, codex `OPENAI_`).
+    /// `spawn.rs` forwards ONLY these prefixes into the child, still
+    /// intersected with `blocked_env_prefixes` above (a blocked prefix never
+    /// crosses — claude declares `ANTHROPIC_` but blocks it by default, the
+    /// billing red line). This replaced a hard-coded
+    /// `ANTHROPIC_/OPENAI_/CLAUDE_/DEEPSEEK_` list that forwarded EVERY
+    /// provider's keys into EVERY plugin: these CLIs are full-shell agents,
+    /// so an ambient foreign key (say `ANTHROPIC_API_KEY` inside codex) is
+    /// plaintext handed to the model. Empty = no provider env at all (zulu
+    /// passes an explicit license argv; claude/kimi ride OAuth from `$HOME`).
+    #[serde(default)]
+    pub provider_env_prefixes: Vec<String>,
     /// If true, the host patches the CLI's per-workspace trust state before
     /// spawn so the CLI doesn't prompt "Do you trust this folder?" — fine
     /// for swarmx because workspaces always live under `~/.swarmx/`
@@ -292,12 +313,17 @@ pub struct CliPlugin {
     /// If true, the host writes (or refreshes) an MCP server entry pointing
     /// at the `swarmx-mcp` binary so the spawned agent can call swarm
     /// tools (send_message / blackboard / …) from inside its native toolbox.
-    /// Currently honoured for:
-    ///   - `id = "claude"` — writes `~/.claude.json projects.<ws>.mcpServers.swarmx-swarm`
-    ///     (local scope, no approval prompt; per-spawn entry carries agent_id)
-    ///   - `id = "codex"`  — appends `[mcp_servers.swarmx-swarm]` to
-    ///     `~/.codex/config.toml` (global config; per-spawn identity rides
-    ///     in via the `SWARMX_AGENT_ID` env passthrough)
+    /// Dispatch is keyed on `mcp_format`, NOT on `id` (see [`McpFormat`] for
+    /// the full per-format detail); the shipped manifests use:
+    ///   - claude   — `~/.claude.json projects.<ws>.mcpServers.swarmx-swarm`
+    ///     (local scope, no approval prompt) + a per-agent `--mcp-config`
+    ///   - codex    — a PER-AGENT `~/.swarmx/codex-home/<agent_id>/config.toml`
+    ///     injected via `CODEX_HOME` (the user's global `~/.codex/config.toml`
+    ///     is no longer mutated; see [`McpFormat::CodexGlobalToml`])
+    ///   - opencode — a per-agent `~/.swarmx/opencode/<agent_id>.json` via
+    ///     `OPENCODE_CONFIG` (deep-merges over the user's config)
+    ///   - reasonix / zulu / kimi — a project-level
+    ///     `<ws>/.mcp.json` / `<ws>/.comate/mcp.json` / `<ws>/.kimi-code/mcp.json`
     #[serde(default)]
     pub auto_inject_mcp: bool,
     /// If true, the host installs a workspace-local Stop hook that runs
@@ -849,6 +875,35 @@ mod tests {
             "claude must block ambient ANTHROPIC_* env by default",
         );
         assert_eq!(codex.billing_surface, BillingSurface::CliAccount);
+
+        // Provider env is declared PER PLUGIN (spawn forwards only these
+        // prefixes, intersected with blocked_env_prefixes) — the isolation
+        // that keeps one provider's keys out of another full-shell agent.
+        // claude declares ANTHROPIC_ only to keep an explicit user opt-in
+        // reachable; the block above still wins by default.
+        assert_eq!(
+            claude.provider_env_prefixes,
+            vec!["ANTHROPIC_", "CLAUDE_"],
+            "claude declares its own family; ANTHROPIC_ stays blocked by default"
+        );
+        assert_eq!(codex.provider_env_prefixes, vec!["OPENAI_"]);
+        assert!(
+            opencode.provider_env_prefixes.is_empty(),
+            "opencode authenticates via its own auth.json, not ambient env keys"
+        );
+        assert_eq!(
+            reasonix.provider_env_prefixes,
+            vec!["DEEPSEEK_"],
+            "reasonix is the ONLY plugin that receives DEEPSEEK_*"
+        );
+        assert!(
+            zulu.provider_env_prefixes.is_empty(),
+            "zulu auth is the explicit license argv, never an ambient key"
+        );
+        assert!(
+            kimi.provider_env_prefixes.is_empty(),
+            "kimi rides OAuth from ~/.kimi-code; KIMI_MODEL_* stays blocked"
+        );
 
         // Input delivery: claude/codex type into the PTY's TUI (keystroke,
         // the default); opencode is driven over its `/tui/*` HTTP control API.

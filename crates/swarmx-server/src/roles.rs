@@ -1,10 +1,12 @@
 //! Role registry — reusable per-agent SOP templates loaded from `roles/`.
 //!
-//! STATUS: like the spell registry, deliberately minimal — only the
-//! `orchestrator` role ships and is used (by the `init` spell). The role_ref
-//! merge machinery is fully implemented + tested but otherwise unexercised.
-//! See `spells.rs` header for the full decision rationale; don't delete it as
-//! "dead" nor pad it speculatively.
+//! STATUS: 8 builtin roles ship — `orchestrator` (pulled by the `init`
+//! spell) plus 7 worker roles (frontend / backend / reviewer / test-runner /
+//! docs-writer / researcher / fixer) that the orchestrator instantiates daily
+//! via `swarm_spawn_worker`. The spell-side `role_ref` merge machinery is
+//! fully implemented + tested but exercised only by the init spell's
+//! orchestrator entry. See `spells.rs` header for the full decision
+//! rationale; don't delete it as "dead" nor pad it speculatively.
 //!
 //! A *role* is the spell-author-facing equivalent of MetaGPT's pinned
 //! "PM/Architect/Engineer/QA" team slots: a markdown file under `roles/`
@@ -28,6 +30,8 @@
 //! default_cli = "claude"
 //! artifact_paths = ["apps/frontend/**"]
 //! handoff_signal = "frontend.done"
+//! # optional W2-1 verify gate; default off — see verify.rs
+//! done_checks = ["npm test"]
 //! system_prompt_template = """ ... """
 //! +++
 //!
@@ -89,6 +93,16 @@ pub struct RoleManifest {
     /// no upstream (frontend, backend).
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// W2-1 verify gate (OPT-IN, default empty = off): objective check
+    /// commands the server runs in the worker's cwd when it writes its
+    /// handoff key, BEFORE the completion is accepted (farewell + auto-kill).
+    /// A failed check bounces the delivery back to the worker with the
+    /// output tail so it can fix and re-deliver. Every entry is
+    /// allowlist-validated at spawn time (`verify::validate_verify_cmd`,
+    /// argv exec, never a shell). Empty keeps the legacy behaviour
+    /// "handoff write == done" — zero change for existing roles.
+    #[serde(default)]
+    pub done_checks: Vec<String>,
     /// Template string used as the agent's system_prompt unless the
     /// spell explicitly overrides it. Supports the same `{task}` and
     /// `{<role>_id}` placeholders as a spell's inline system_prompt
@@ -120,7 +134,8 @@ pub struct RoleManifest {
     /// Tool / MCP allowlist for this role (P1-B hard capability gating).
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
-    /// Declared modality (`ui` | `backend` | `docs` | `shell`) — a P1-A rule
+    /// Declared modality (`ui` | `backend` | `docs` | `shell` | `research` |
+    /// `review` — the enum `validate_manifest` checks against) — a P1-A rule
     /// signal. Declared, never inferred from free text.
     #[serde(default)]
     pub modality: String,
@@ -525,6 +540,23 @@ system_prompt_template = "x"
         assert!(r.manifest.consumes.is_empty());
         assert!(r.manifest.tool_allowlist.is_empty());
         assert!(r.manifest.modality.is_empty());
+        // W2-1: the verify gate defaults OFF.
+        assert!(r.manifest.done_checks.is_empty());
+    }
+
+    #[test]
+    fn manifest_parses_done_checks() {
+        let src = r#"+++
+id = "backend"
+default_cli = "claude"
+done_checks = ["cargo test", "cargo clippy"]
+system_prompt_template = "x"
++++"#;
+        let r = parse_role(src, Path::new("/tmp/b.md")).unwrap();
+        assert_eq!(
+            r.manifest.done_checks,
+            vec!["cargo test".to_string(), "cargo clippy".to_string()]
+        );
     }
 
     #[test]
@@ -600,5 +632,15 @@ system_prompt_template = "x"
         // Built-in worker roles declare a typed `produces`.
         assert_eq!(reg.get("frontend").unwrap().manifest.produces, vec!["done"]);
         assert_eq!(reg.get("backend").unwrap().manifest.default_cli, "codex");
+        // W2-1: every builtin ships with the verify gate OFF — opting in is a
+        // per-project decision (`.swarmx/roles/` overlay), so the default
+        // "handoff write == done" behaviour never changes for existing users.
+        for r in reg.list() {
+            assert!(
+                r.manifest.done_checks.is_empty(),
+                "builtin role `{}` must not enable done_checks by default",
+                r.manifest.id
+            );
+        }
     }
 }

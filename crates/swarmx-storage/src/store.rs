@@ -10,8 +10,8 @@ use crate::models::{
     MessageRecord, NewAgent, NewBlackboardOp, NewFusionBatch, NewGoal, NewGoalEvidence, NewMessage,
     NewRecording,
     NewSpellRun, NewThoughtTrace, NewThoughtTraceEvent, NewThread, NewWorker, NewWorkspace,
-    NewWorkspaceRoot, RecordingRecord, SpellRunRecord, ThoughtTraceRecord, ThreadRecord,
-    WorkerRecord, WorkspaceRecord, WorkspaceRootRecord,
+    NewWorkspaceRoot, OrphanedAgentProcess, RecordingRecord, SpellRunRecord, ThoughtTraceRecord,
+    ThreadRecord, WorkerRecord, WorkspaceRecord, WorkspaceRootRecord,
 };
 use crate::schema;
 use anyhow::{Context, Result};
@@ -23,6 +23,15 @@ use std::sync::Arc;
 
 const MAX_THOUGHT_TRACE_SUMMARY_STEPS: usize = 12;
 const THOUGHT_TRACE_RECENT_DONE_APPEND_WINDOW_MS: i64 = 30_000;
+
+/// SELECT list shared by both message-search paths (FTS MATCH and the CJK
+/// substring fallback) — the row shape is identical, only FROM/WHERE differ.
+const MESSAGE_SEARCH_COLS: &str = "\
+    m.id, m.from_agent, m.to_agent, m.kind, m.body, m.sent_at, \
+    m.delivered_at, m.read_at, m.in_reply_to, m.thread_id, m.meta, \
+    tt.id, tt.trigger_message_id, tt.response_message_id, tt.agent_id, \
+    tt.workspace_id, tt.thread_id, tt.status, tt.started_at, \
+    tt.completed_at, tt.summary_json, tt.updated_at";
 
 /// True if `e` is a `SQLITE_BUSY` / `SQLITE_LOCKED` failure — the only
 /// errors `with_busy_retry` re-runs on.
@@ -44,12 +53,12 @@ fn is_busy(e: &SqliteError) -> bool {
 /// character is literal token text, so no input can form an operator.
 ///
 /// Tokenization mirrors the `unicode61` tokenizer used by `messages_fts`: we
-/// break on every non-alphanumeric character (Unicode-aware, so CJK and other
-/// scripts still search). Each token becomes `"token"`, with any embedded `"`
-/// escaped per the FTS5 spec by doubling it (`""`); tokens are joined by spaces
-/// (implicit AND). Returns an empty string when the input has no searchable
-/// characters — the caller treats that as "no results" rather than running an
-/// (also-invalid) empty MATCH.
+/// break on every non-alphanumeric character (Unicode-aware, so non-ASCII
+/// token text survives the rewrite). Each token becomes `"token"`, with any
+/// embedded `"` escaped per the FTS5 spec by doubling it (`""`); tokens are
+/// joined by spaces (implicit AND). Returns an empty string when the input
+/// has no searchable characters — the caller treats that as "no results"
+/// rather than running an (also-invalid) empty MATCH.
 fn sanitize_fts5_query(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 2);
     for token in raw.split(|c: char| !c.is_alphanumeric()) {
@@ -71,6 +80,25 @@ fn sanitize_fts5_query(raw: &str) -> String {
         out.push('"');
     }
     out
+}
+
+/// True when the query contains characters from scripts the FTS5 `unicode61`
+/// tokenizer cannot split (CJK ideographs, kana, hangul): unicode61 merges a
+/// run of them into ONE token, so `MATCH '"共享"'` can never hit a body like
+/// 「把结论放到共享区」 — Chinese search silently returned zero rows (the
+/// agent then wrongly concluded "nobody discussed this"). Such queries must
+/// take the substring path in `search_messages` instead. (FTS5 trigram was
+/// considered and rejected: it only matches ≥3-char substrings, so 2-char
+/// words — the common case in Chinese — would still miss.)
+fn needs_substring_match(raw: &str) -> bool {
+    raw.chars().any(|c| {
+        matches!(c,
+            '\u{3400}'..='\u{4DBF}'   // CJK Extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+            | '\u{3040}'..='\u{30FF}' // hiragana / katakana
+            | '\u{AC00}'..='\u{D7AF}' // hangul syllables
+        )
+    })
 }
 
 /// True if `e` is a UNIQUE/constraint failure — used by `create_workspace` to
@@ -496,6 +524,34 @@ impl Store {
         .context("spawn_blocking record_shim_exit")?
     }
 
+    /// Persist the shim's OS pid + (unix) process-group id — the process
+    /// identity the startup orphan reaper needs to really kill the tree after
+    /// a server crash/SIGKILL (migration 0029). First-write-wins: the
+    /// `shim_pid IS NULL` guard makes re-records a no-op so a stale writer
+    /// can't clobber a fresher value. Returns true when this call did the
+    /// write; false when the row doesn't exist yet (the reaper retries on its
+    /// next sweep — `record_agent_spawn` can race us) or was already recorded.
+    pub async fn record_agent_shim_pid(
+        &self,
+        id: String,
+        pid: i64,
+        pgid: Option<i64>,
+    ) -> Result<bool> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<bool> {
+                let n = conn.execute(
+                    "UPDATE agents SET shim_pid = ?2, shim_pgid = ?3 \
+                     WHERE id = ?1 AND shim_pid IS NULL",
+                    params![id, pid, pgid],
+                )?;
+                Ok(n > 0)
+            })
+        })
+        .await
+        .context("spawn_blocking record_agent_shim_pid")?
+    }
+
     /// Persist an "alive but can't work" failure reason (auth/quota banner from
     /// the HealthScanner, or the first-response watchdog firing). Read back by
     /// `list_agents` into `AgentInfo.last_error` so the UI can re-render an
@@ -611,6 +667,75 @@ impl Store {
         })
         .await
         .context("spawn_blocking agent_silent_since_ready")?
+    }
+
+    /// Stalled-agent probe backing the NeedsYou inbox's "该醒没醒" signal: of
+    /// the given agent ids, which ones are ALIVE (shim reported ready, not
+    /// killed, no shim exit) yet have unread mailbox mail whose OLDEST message
+    /// has waited at least `silence_ms`, with no persisted activity in that
+    /// same window (`last_activity_at` NULL or older than the cutoff)?
+    ///
+    /// This is deliberately a much tighter signal than the 0.3.0
+    /// "suspected-stuck" heuristic that cried wolf (a codex mid-turn emitting
+    /// exec events got flagged): an idle worker waiting for work has NO
+    /// unread mail and never matches; a busy worker keeps `last_activity_at`
+    /// fresh and never matches. Matching requires something to be WAITING for
+    /// the agent while the agent shows no sign of life — the exact shape of
+    /// a broken wake chain (wake-check never fired / the push-wake injection
+    /// never landed).
+    ///
+    /// Batch variant (one query per chunk, N+1 not allowed in the agents
+    /// list path). `MIN(sent_at)` over unread mail is NULL when nothing is
+    /// unread, and `NULL <= cutoff` is false — so "no unread" needs no
+    /// separate clause.
+    pub async fn stalled_agents_with_unread(
+        &self,
+        ids: Vec<String>,
+        now_ms: i64,
+        silence_ms: i64,
+    ) -> Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let cutoff = now_ms - silence_ms;
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(
+                &pool,
+                |conn| -> rusqlite::Result<std::collections::HashSet<String>> {
+                    // 900 ids + 2 cutoff binds stay under SQLite's 999-var cap.
+                    const CHUNK: usize = 900;
+                    let mut stalled = std::collections::HashSet::new();
+                    for chunk in ids.chunks(CHUNK) {
+                        let placeholders = vec!["?"; chunk.len()].join(",");
+                        let sql = format!(
+                            "SELECT a.id FROM agents a \
+                             WHERE a.id IN ({placeholders}) \
+                               AND a.shim_ready_at IS NOT NULL \
+                               AND a.killed_at IS NULL \
+                               AND a.shim_exit_at IS NULL \
+                               AND (a.last_activity_at IS NULL OR a.last_activity_at <= ?) \
+                               AND (SELECT MIN(m.sent_at) FROM messages m \
+                                    WHERE m.to_agent = a.id AND m.read_at IS NULL) <= ?"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let mut binds: Vec<rusqlite::types::Value> =
+                            chunk.iter().map(|id| id.clone().into()).collect();
+                        binds.push(cutoff.into());
+                        binds.push(cutoff.into());
+                        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                            row.get::<_, String>(0)
+                        })?;
+                        for r in rows {
+                            stalled.insert(r?);
+                        }
+                    }
+                    Ok(stalled)
+                },
+            )
+        })
+        .await
+        .context("spawn_blocking stalled_agents_with_unread")?
     }
 
     /// Persist the agent's most recent tool-level activity time, called by the
@@ -1837,6 +1962,12 @@ impl Store {
     }
 
     pub async fn search_messages(&self, query: String) -> Result<Vec<MessageRecord>> {
+        // CJK queries can never hit the FTS index (see needs_substring_match)
+        // — route them to per-token substring LIKEs. The messages table is
+        // local-scale, so a full scan is cheap.
+        if needs_substring_match(&query) {
+            return self.search_messages_substring(query).await;
+        }
         // Never feed the raw user string to FTS5 MATCH: bare special characters
         // (`*` `:` `(` `-` `^` `"`, the AND/OR/NOT/NEAR keywords, …) are FTS5
         // *query operators*, so a malformed query would surface as a raw SQLite
@@ -1854,25 +1985,74 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             with_busy_retry(&pool, |conn| -> rusqlite::Result<Vec<MessageRecord>> {
                 // Join messages_fts → messages on rowid; order by FTS rank.
-                let mut stmt = conn.prepare(
-                    "SELECT m.id, m.from_agent, m.to_agent, m.kind, m.body, m.sent_at, \
-                        m.delivered_at, m.read_at, m.in_reply_to, m.thread_id, m.meta, \
-                        tt.id, tt.trigger_message_id, tt.response_message_id, tt.agent_id, \
-                        tt.workspace_id, tt.thread_id, tt.status, tt.started_at, \
-                        tt.completed_at, tt.summary_json, tt.updated_at \
-                 FROM messages_fts \
-                 JOIN messages m ON m.id = messages_fts.rowid \
-                 LEFT JOIN thought_traces tt ON tt.response_message_id = m.id \
-                 WHERE messages_fts MATCH ?1 \
-                 ORDER BY rank \
-                 LIMIT 200",
-                )?;
+                let sql = format!(
+                    "SELECT {MESSAGE_SEARCH_COLS} \
+                     FROM messages_fts \
+                     JOIN messages m ON m.id = messages_fts.rowid \
+                     LEFT JOIN thought_traces tt ON tt.response_message_id = m.id \
+                     WHERE messages_fts MATCH ?1 \
+                     ORDER BY rank \
+                     LIMIT 200"
+                );
+                let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(params![match_query], message_with_trace_from_row)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
         })
         .await
         .context("spawn_blocking search_messages")?
+    }
+
+    /// Substring fallback for queries `porter unicode61` can't tokenize (CJK —
+    /// see [`needs_substring_match`]). One ANDed `LIKE '%token%'` per token
+    /// (same implicit-AND semantics as the MATCH token list); `%` `_` `\` in
+    /// the input are escaped so user text always matches literally. There is
+    /// no FTS rank here, so results come back newest-first.
+    async fn search_messages_substring(&self, query: String) -> Result<Vec<MessageRecord>> {
+        // Same tokenization rule as sanitize_fts5_query: split on every
+        // non-alphanumeric character.
+        let tokens: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            // Tokens are alphanumeric-only by construction, so LIKE wildcards
+            // (`%`/`_`) can't actually appear — split turned them into
+            // separators. Escape anyway in case the split rule is ever
+            // loosened (same precedent as the `"` escape in sanitize_fts5_query).
+            .map(|t| {
+                t.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            })
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<Vec<MessageRecord>> {
+                let likes = (1..=tokens.len())
+                    .map(|i| format!("m.body LIKE ?{i} ESCAPE '\\'"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let sql = format!(
+                    "SELECT {MESSAGE_SEARCH_COLS} \
+                     FROM messages m \
+                     LEFT JOIN thought_traces tt ON tt.response_message_id = m.id \
+                     WHERE {likes} \
+                     ORDER BY m.sent_at DESC \
+                     LIMIT 200"
+                );
+                let patterns: Vec<String> = tokens.iter().map(|t| format!("%{t}%")).collect();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    rusqlite::params_from_iter(patterns.iter()),
+                    message_with_trace_from_row,
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+        })
+        .await
+        .context("spawn_blocking search_messages_substring")?
     }
 
     pub async fn mark_delivered(&self, ids: Vec<i64>, at_ms: i64) -> Result<()> {
@@ -2316,6 +2496,49 @@ impl Store {
         })
         .await
         .context("spawn_blocking mark_orphan_agents_killed")?
+    }
+
+    /// Candidate set for the startup orphan PROCESS reaper
+    /// (`swarmx-server/src/reaper.rs`): rows settled as killed at/after
+    /// `since_ms` whose shim pid is on file and whose shim never recorded an
+    /// exit — i.e. agents the previous server process still had live when it
+    /// died, whose real process tree may have been reparented to init instead
+    /// of reaped. Callers pass a `since_ms` a small window behind boot: the
+    /// window is what keeps an intentionally-killed agent from an OLD session
+    /// (whose pid may since have been recycled by an unrelated process) out of
+    /// the kill set. `shim_exit_at IS NULL` additionally excludes rows whose
+    /// shim was already observed dead — probing those is wasted work (their
+    /// pid is gone; a CLI that survived its own dead shim is a known residual
+    /// gap, see the reaper). Rows spawned before migration 0029 have
+    /// `shim_pid NULL` and are unreachable here — their processes can no
+    /// longer be identified, so for them the DB mark is all we can do.
+    pub async fn orphaned_agent_processes(
+        &self,
+        since_ms: i64,
+    ) -> Result<Vec<OrphanedAgentProcess>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<Vec<OrphanedAgentProcess>> {
+                let mut stmt = conn.prepare(
+                    "SELECT id, cli, shim_pid, shim_pgid FROM agents \
+                     WHERE shim_pid IS NOT NULL \
+                       AND shim_exit_at IS NULL \
+                       AND killed_at IS NOT NULL AND killed_at >= ?1 \
+                     ORDER BY spawned_at ASC",
+                )?;
+                let rows = stmt.query_map(params![since_ms], |row| {
+                    Ok(OrphanedAgentProcess {
+                        id: row.get(0)?,
+                        cli: row.get(1)?,
+                        shim_pid: row.get(2)?,
+                        shim_pgid: row.get(3)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+        })
+        .await
+        .context("spawn_blocking orphaned_agent_processes")?
     }
 
     /// Finalize any recording rows left in the "live" state — i.e. the
@@ -3588,8 +3811,82 @@ mod tests {
         assert_eq!(sanitize_fts5_query("   "), "");
         assert_eq!(sanitize_fts5_query(""), "");
 
-        // Non-ASCII (CJK) tokens are preserved so unicode61 search still works.
+        // Non-ASCII token text survives the rewrite (pure-CJK queries no
+        // longer reach this function — search_messages routes them to the
+        // substring path — but mixed text keeps its non-ASCII tokens).
         assert_eq!(sanitize_fts5_query("会议"), "\"会议\"");
+    }
+
+    #[test]
+    fn needs_substring_match_flags_cjk_only() {
+        assert!(needs_substring_match("共享"));
+        assert!(needs_substring_match("review 会议")); // mixed → substring path
+        assert!(needs_substring_match("かな"));
+        assert!(!needs_substring_match("planner"));
+        assert!(!needs_substring_match("café")); // accented Latin tokenizes fine
+        assert!(!needs_substring_match(""));
+    }
+
+    #[tokio::test]
+    async fn search_messages_matches_cjk_substrings() {
+        // Regression: `porter unicode61` merges a run of hanzi into ONE FTS
+        // token, so `MATCH '"共享"'` silently missed a body like 「…共享区…」
+        // and agents concluded "nobody discussed this". The substring path
+        // must hit 2-char words too (FTS5 trigram only matches ≥3 chars).
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("swarmx.db")).await.unwrap();
+        let msg = |body: &str, at: i64| NewMessage {
+            from_agent: "a".into(),
+            to_agent: "b".into(),
+            kind: "note".into(),
+            body: body.into(),
+            sent_at: at,
+            in_reply_to: None,
+            meta: None,
+        };
+        store
+            .insert_message(msg("把结论写到共享区黑板,别忘了 review 流程", 1))
+            .await
+            .unwrap();
+        store
+            .insert_message(msg("pure English message about the planner", 2))
+            .await
+            .unwrap();
+        store
+            .insert_message(msg("另一条:会议纪要已经归档", 3))
+            .await
+            .unwrap();
+
+        // 2-char Chinese word — the case trigram could never match.
+        let hits = store.search_messages("共享".into()).await.unwrap();
+        assert_eq!(hits.len(), 1, "2-char CJK word must hit, got: {hits:?}");
+        assert!(hits[0].body.contains("共享区"));
+
+        // 3-char Chinese word.
+        let hits = store.search_messages("会议纪要".into()).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("会议纪要"));
+
+        // Multiple CJK tokens AND together, like the MATCH token list.
+        let hits = store.search_messages("共享 黑板".into()).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        let hits = store.search_messages("共享 归档".into()).await.unwrap();
+        assert!(hits.is_empty(), "AND semantics: no single body has both");
+
+        // Mixed CJK+Latin query takes the substring path and still hits.
+        let hits = store.search_messages("共享 review".into()).await.unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // LIKE wildcards can't smuggle in: `%`/`_` are non-alphanumeric, so
+        // the tokenizer splits them away — "共_" degenerates to "共" (the same
+        // fate FTS specials meet in sanitize_fts5_query).
+        let hits = store.search_messages("共_".into()).await.unwrap();
+        assert_eq!(hits.len(), 1, "`_` is a separator, not a wildcard");
+
+        // English still goes through FTS (porter stem: planner → planner).
+        let hits = store.search_messages("planner".into()).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("planner"));
     }
 
     #[test]

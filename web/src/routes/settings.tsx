@@ -1262,10 +1262,14 @@ function PluginsPanel() {
                   <div className="flex flex-col gap-2 rounded-md border border-status-warning/35 bg-surface-base p-3">
                     <div className="flex flex-col gap-1">
                       <span className="font-heading text-xs font-semibold text-foreground-primary">
-                        {t("settings.plugins.installTitle", { title: p.install.title })}
+                        {t(`settings.plugins.installHeading.${p.id}`, {
+                          defaultValue: p.install.title,
+                        })}
                       </span>
                       <span className="font-caption text-[11px] text-foreground-secondary">
-                        {p.install.summary}
+                        {t(`settings.plugins.installSummary.${p.id}`, {
+                          defaultValue: p.install.summary,
+                        })}
                       </span>
                     </div>
                     {/* one-click install (runs the whitelisted command server-side) */}
@@ -1500,43 +1504,11 @@ function PrivacyPanel() {
 
 // ── About panel ─────────────────────────────────────────────────────────
 
-interface CrateInfo {
-  name: string;
-  desc: string;
-}
-const CRATES: CrateInfo[] = [
-  { name: "swarmx-server", desc: "axum HTTP/WS gateway · :7777" },
-  { name: "swarmx-pty", desc: "portable-pty bridge + WebSocket frame protocol" },
-  { name: "swarmx-shim", desc: "wraps claude/codex CLIs · injects hooks + MCP" },
-  { name: "swarmx-mcp", desc: "MCP server exposed to each agent (swarm bridge)" },
-  { name: "swarmx-swarm", desc: "blackboard + mailbox + wake coordinator" },
-  { name: "swarmx-storage", desc: "rusqlite-backed message/recording/event store" },
-  { name: "swarmx-recorder", desc: "asciicast v2 writer for every PTY" },
-  { name: "swarmx-protocol", desc: "wire types shared client/server/shim" },
-  { name: "swarmx-cli", desc: "(stub) future `swarmx up` launcher" },
-];
-
-const DEPS: { name: string; ver: string; what: string }[] = [
-  { name: "react", ver: "18.3", what: "UI runtime" },
-  { name: "react-router-dom", ver: "6.30", what: "routing" },
-  { name: "tailwindcss", ver: "4.x", what: "styling (CSS-first @theme)" },
-  { name: "react-i18next", ver: "17.0", what: "i18n" },
-  { name: "react-markdown", ver: "10.x", what: "Context Board renderer" },
-  { name: "@xyflow/react", ver: "12.x", what: "DAG canvas" },
-  { name: "@dagrejs/dagre", ver: "3.x", what: "DAG auto-layout" },
-  { name: "cmdk", ver: "latest", what: "command palette (⌘K)" },
-  { name: "asciinema-player", ver: "3.15", what: "replay player" },
-  { name: "@xterm/xterm", ver: "5.5", what: "terminal (Agent Drawer / Debug)" },
-  { name: "tauri 2.x", ver: "2.11", what: "desktop shell" },
-];
-
 function AboutPanel() {
   const { t } = useTranslation();
   const apiEndpoint = HTTP_BASE
     ? HTTP_BASE.replace(/^https?:\/\//, "")
-    : import.meta.env.DEV
-      ? `127.0.0.1:7777 (${window.location.host} proxy)`
-      : window.location.host;
+    : window.location.host;
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-8 p-8">
       <PanelTitle
@@ -1572,42 +1544,6 @@ function AboutPanel() {
         <code className="inline-block rounded border border-border-subtle bg-surface-tertiary px-2 py-1 font-mono text-xs text-foreground-primary">
           {apiEndpoint}
         </code>
-      </Field>
-
-      <Field label={t("settings.about.cratesTitle")} hint={t("settings.about.cratesHint")}>
-        <ul className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-          {CRATES.map((c) => (
-            <li
-              key={c.name}
-              className="flex flex-col rounded border border-border-subtle bg-surface-elevated px-3 py-2"
-            >
-              <span className="font-mono text-xs font-semibold text-foreground-primary">
-                {c.name}
-              </span>
-              <span className="font-caption text-[11px] text-foreground-tertiary">
-                {c.desc}
-              </span>
-            </li>
-          ))}
-        </ul>
-      </Field>
-
-      <Field label={t("settings.about.depsTitle")}>
-        <ul className="flex flex-col gap-1">
-          {DEPS.map((d) => (
-            <li
-              key={d.name}
-              className="flex items-baseline gap-2 px-3 py-1.5 font-caption text-xs"
-            >
-              <span className="font-mono font-semibold text-foreground-primary">
-                {d.name}
-              </span>
-              <span className="font-mono text-foreground-tertiary">{d.ver}</span>
-              <span className="flex-1" />
-              <span className="text-foreground-secondary">{d.what}</span>
-            </li>
-          ))}
-        </ul>
       </Field>
     </div>
   );

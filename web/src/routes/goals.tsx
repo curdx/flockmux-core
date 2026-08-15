@@ -565,9 +565,7 @@ function GoalCard({
             </button>
           </div>
           <p className="mt-1.5 font-caption text-[10px] text-foreground-tertiary">
-            {t("goals.evidenceKindHint", {
-              defaultValue: "类型：note 记录进展 · proof 证明完成 · blocker 标记阻塞",
-            })}
+            {t("goals.evidenceKindHint")}
           </p>
           {evidenceErr && (
             <p className="mt-2 font-caption text-[11px] text-status-danger">{evidenceErr}</p>

@@ -131,6 +131,15 @@ export interface SpawnAgentResponse {
   cli: string;
   role: string;
   workspace: string;
+  /** Set when the requested CLI wasn't installed and the server substituted
+   *  an installed fallback engine: the ORIGINALLY requested plugin id (`cli`
+   *  then names the engine that actually spawned). Billing red line: the
+   *  fallback filter admits API-billed engines (e.g. reasonix), so the UI
+   *  must surface this loudly instead of a paid engine running in disguise. */
+  fallback_from?: string | null;
+  /** Billing surface of the engine that ACTUALLY spawned (kebab-case token:
+   *  "interactive-subscription" | "cli-account" | "api-key" | …). */
+  billing_surface?: string | null;
 }
 
 export interface AgentInfo {
@@ -161,6 +170,15 @@ export interface AgentInfo {
    *  The chat surfaces this so the user isn't silently misled into thinking a
    *  finished-looking turn actually delivered. Live agents are never flagged. */
   handoff_missing?: boolean;
+  /** True when the agent looks STALLED — alive (shim ready, not exited, not
+   *  killed, not paused) yet holding unread mailbox mail older than a
+   *  conservative threshold (10min) with no activity in that window
+   *  (computed server-side; see `stalled_agents_with_unread` in store.rs).
+   *  This is the inbox's "该醒没醒" signal: it only fires when something is
+   *  provably WAITING for the agent while it shows no sign of life, so an
+   *  idle worker (no unread) or a busy one (fresh activity) never matches.
+   *  Word it honestly in the UI: "可能卡住", never "卡住了". */
+  stalled?: boolean;
   /** FK into the workspaces table. Null for pre-migration rows or for
    *  legacy spawn paths from before Step 3. The frontend groups the
    *  left nav by this — historical rows fall through to the unnamed
@@ -223,6 +241,15 @@ export interface MessageMeta {
   child_role?: string;
   /** For "dispatch": the worker's registry slug (diagnostic). */
   role_slug?: string;
+  /** For "dispatch": set when the worker's requested engine wasn't installed
+   *  and a fallback engine was spawned instead (billing red line — the card
+   *  shows the substitution so a paid-API engine never runs in disguise). */
+  fallback_from?: string;
+  /** For "dispatch": the fallback engine that actually spawned. */
+  fallback_cli?: string;
+  /** For "dispatch": billing surface of the engine that actually spawned
+   *  (kebab-case token, e.g. "api-key" = billed per API key). */
+  billing_surface?: string;
 }
 
 export interface MessageRecord {
@@ -370,6 +397,11 @@ export interface RunSpellAgent {
   role: string;
   cli: string;
   agent_id: string;
+  /** Set when this agent's requested CLI wasn't installed and a fallback
+   *  engine was spawned instead (same contract as SpawnAgentResponse). */
+  fallback_from?: string | null;
+  /** Billing surface of the engine that actually spawned (kebab-case token). */
+  billing_surface?: string | null;
 }
 
 export interface RunSpellResponse {
@@ -699,8 +731,14 @@ export interface UsagePricingResponse {
   source: "default" | "user" | string;
   path: string;
   rules: UsagePricingRule[];
-  /** Models no rule matches fall through to this embedded snapshot (LiteLLM). */
-  fallback?: { source: string; models: number };
+  /** Models no rule matches fall through to LiteLLM (embedded / disk / refreshed). */
+  fallback?: {
+    source: string;
+    models: number;
+    origin?: "embedded" | "disk" | "refreshed" | string;
+    auto_refresh?: boolean;
+    cache_path?: string;
+  };
 }
 
 // ── goals (GET/POST/PATCH /api/goals) ─────────────────────────────────────
@@ -855,6 +893,12 @@ export interface FusionContestantDiff {
   /** True if the contestant never got an isolated worktree (degraded to
    *  shared) — its work isn't separable. */
   degraded: boolean;
+  /** Objective check outcome, present when the batch carried a check_cmd and
+   *  the judge stage ran it in this contestant's worktree (auto AND manual
+   *  judging both run the gate). null/undefined = no gate ran. */
+  check_passed?: boolean | null;
+  /** Truncated stdout/stderr tail of the check — WHY it failed, not just that. */
+  check_output?: string | null;
 }
 
 /** `POST /api/workspaces/:id/fusion/:bid/judge` response. */

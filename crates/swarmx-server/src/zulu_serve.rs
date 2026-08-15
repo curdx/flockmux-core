@@ -107,15 +107,22 @@ fn stream_client() -> Result<reqwest::Client> {
         .context("build zulu sse http client")
 }
 
+/// `GET /health` → serve answering? Single-shot reachability probe: true only
+/// on a success response from the serve port (false = wedged / never bound).
+async fn serve_reachable(port: u16) -> bool {
+    let Ok(c) = control_client() else { return false };
+    matches!(
+        c.get(format!("{}/health", base(port))).send().await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
 /// `GET /health` → serve bound? Polls until it answers or the window elapses.
 async fn wait_serve_ready(port: u16, overall: Duration) -> bool {
-    let Ok(c) = control_client() else { return false };
     let start = Instant::now();
     while start.elapsed() < overall {
-        if let Ok(r) = c.get(format!("{}/health", base(port))).send().await {
-            if r.status().is_success() {
-                return true;
-            }
+        if serve_reachable(port).await {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -346,7 +353,10 @@ async fn run_turn(conv: &ZuluConv, agent_id: &str, prompt: &str, mode: &str) -> 
 
 /// Called by the WakeCoordinator for a zulu agent. If a turn is already running,
 /// the driver's post-turn drain picks the wake up (return false). Otherwise
-/// atomically claim busy, consume pending wakes, and run them as a turn.
+/// atomically claim busy, consume pending wakes, and run them as a turn. The
+/// consume is gated on a serve reachability probe: consuming against a wedged /
+/// never-bound serve would mark the wake READ yet never deliver it (the exact
+/// net-loss reasonix hit live — see `reasonix_serve::wake_if_idle`).
 pub async fn wake_if_idle(
     conv: std::sync::Arc<ZuluConv>,
     agent_id: &str,
@@ -356,6 +366,21 @@ pub async fn wake_if_idle(
     // handles the wake (atomic consume ⇒ no double).
     if conv.busy.swap(true, Ordering::SeqCst) {
         return Ok(false);
+    }
+    // Reachability pre-check BEFORE consuming: `consume_wakes` is atomic and
+    // stamps the mailbox wake READ on the server, but the follow-up
+    // `POST /session` against an unreachable serve then fails — NET-LOSING
+    // the wake (marked read, never delivered; the waiter hangs forever).
+    // Leave the wake un-consumed so the driver's post-turn drain (once serve
+    // answers) or the next BlackboardChanged re-delivers it. The caller
+    // (`deliver_wake`) logs this Err as a `warn!`, doesn't panic.
+    if !serve_reachable(conv.serve_port).await {
+        conv.busy.store(false, Ordering::SeqCst);
+        return Err(anyhow!(
+            "zulu serve unreachable on :{}; leaving wake in the mailbox for \
+             the driver / next deliver to retry (not consuming)",
+            conv.serve_port
+        ));
     }
     match consume_wakes(&conv.swarmx_url, agent_id).await {
         Ok(n) if n > 0 => {
@@ -652,5 +677,57 @@ mod tests {
         conv.set_conv_id("cid-1");
         let b1 = session_body(&conv, "hi", "Agent");
         assert_eq!(b1["conversationId"], "cid-1");
+    }
+
+    #[tokio::test]
+    async fn wake_if_idle_does_not_consume_when_serve_unreachable() {
+        // Mock swarmx-server consume endpoint that COUNTS calls: if the wake
+        // were (wrongly) consumed, this counter would move.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_in_handler = hits.clone();
+        let app = axum::Router::new().route(
+            "/api/message/consume_wakes",
+            axum::routing::post(move || {
+                let hits = hits_in_handler.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({ "count": 1 }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let swarmx_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // A port nothing listens on stands in for a wedged / never-bound serve.
+        let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let conv = std::sync::Arc::new(ZuluConv::new(
+            dead_port,
+            "M".into(),
+            "L".into(),
+            "/tmp".into(),
+            swarmx_url,
+        ));
+        let registry = Registry::new();
+        let err = wake_if_idle(conv.clone(), "zulu-test", &registry)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unreachable"),
+            "refused wake must surface the reachability error: {err:#}"
+        );
+        assert!(
+            !conv.busy.load(Ordering::SeqCst),
+            "busy released after a refused wake"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "wake must NOT be consumed while serve is unreachable"
+        );
     }
 }

@@ -20,9 +20,15 @@
 // Identity + server come from the env swarmx's spawn.rs injects into the
 // opencode process: SWARMX_AGENT_ID, SWARMX_SERVER_URL.
 //
-// STATUS: written from opencode v1.17.x source (plugin Hooks API + @opencode-ai
-// SDK `client.session.prompt`), NOT yet validated against a live opencode. Pin
-// the event shape / SDK call against a running opencode before relying on it.
+// STATUS: validated against a live opencode (1.17.7). The per-agent
+// OPENCODE_CONFIG merge that loads this plugin is VERIFIED LIVE (see
+// cli-plugins/opencode.toml + crates/swarmx-server/src/cli/opencode.rs), the
+// tool.execute.* → POST /api/agent/:id/activity path is the server's
+// documented production ingress for opencode (routes/rest.rs), and the
+// dogfood run (dogfood-output/report.md) drove a live opencode captain
+// end-to-end with zero JS errors. The session.idle → consume_wakes →
+// client.session.prompt loop mirrors wake_check.rs and is race-guarded
+// server-side (wake.rs pre-consumes so kick and plugin don't double-fire).
 
 const AGENT_ID = process.env.SWARMX_AGENT_ID
 const SERVER_URL = (process.env.SWARMX_SERVER_URL || "http://127.0.0.1:7777").replace(/\/+$/, "")

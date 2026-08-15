@@ -43,6 +43,11 @@ home_env = "HOME"
 billing_surface = "api-key"
 requires_explicit_billing_opt_in = false
 blocked_env_prefixes = []
+# Declare the DEEPSEEK_ provider family so spawn.rs forwards DEEPSEEK_API_KEY
+# & co. into the child — reasonix is the ONLY plugin that receives them.
+# Nothing else (ANTHROPIC_/OPENAI_/…) is declared, so no foreign provider key
+# reaches this full-shell agent.
+provider_env_prefixes = ["DEEPSEEK_"]
 
 # No "do you trust this folder?" gate in reasonix.
 auto_trust_workspace = false

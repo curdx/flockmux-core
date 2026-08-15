@@ -20,7 +20,7 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { BarChart3, Loader2, RefreshCw, RotateCcw, Save } from "lucide-react";
+import { BarChart3, ChevronDown, Loader2, RefreshCw, RotateCcw, Save } from "lucide-react";
 import { api, ApiError } from "@/api/http";
 import { roleDisplayName } from "@/lib/agent";
 import { fmtTokens } from "@/lib/format";
@@ -263,9 +263,6 @@ export default function UsageRoute() {
           <div className="flex flex-col gap-1">
             <h1 className="font-display text-lg text-foreground-primary">{t("usage.title")}</h1>
             <p className="font-caption text-xs text-foreground-tertiary">{t("usage.subtitle")}</p>
-            <p className="font-caption text-[11px] text-foreground-tertiary">
-              {t("usage.trustHint")}
-            </p>
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2 sm:shrink-0 sm:justify-end">
             {updatedAt && (
@@ -326,19 +323,6 @@ export default function UsageRoute() {
           />
         )}
 
-        {pricing && (
-          <PricingEditor
-            pricing={pricing}
-            rules={pricingDraft}
-            dirty={pricingDirty}
-            saving={pricingSaving}
-            error={pricingError}
-            onChange={setPricingDraft}
-            onSave={savePricing}
-            onReset={confirmResetPricing}
-          />
-        )}
-
         {data && !loading && data.totals.events > 0 && (
           // Stale (last poll errored) → dim the whole block so the numbers read
           // as "possibly outdated", in concert with the stale banner above.
@@ -372,7 +356,7 @@ export default function UsageRoute() {
             {/* per-day trend (recharts) */}
             {chartData.length > 0 && (
               <section className="flex flex-col gap-2">
-                <h2 className="flex flex-wrap items-baseline gap-x-2 font-caption text-xs uppercase tracking-wide text-foreground-tertiary">
+                <h2 className="flex flex-wrap items-baseline gap-x-2 font-caption text-xs tracking-wide text-foreground-tertiary">
                   {t("usage.byDay")}
                   {/* Server buckets rows by UTC calendar day; say so so a user in
                       a non-UTC zone doesn't read the day boundary as local. */}
@@ -431,7 +415,7 @@ export default function UsageRoute() {
 
             {/* per-model */}
             <section className="flex flex-col gap-2">
-              <h2 className="font-caption text-xs uppercase tracking-wide text-foreground-tertiary">
+              <h2 className="font-caption text-xs tracking-wide text-foreground-tertiary">
                 {t("usage.byModel")}
               </h2>
               <UsageTable
@@ -453,7 +437,7 @@ export default function UsageRoute() {
 
             {/* per-agent */}
             <section className="flex flex-col gap-2">
-              <h2 className="font-caption text-xs uppercase tracking-wide text-foreground-tertiary">
+              <h2 className="font-caption text-xs tracking-wide text-foreground-tertiary">
                 {t("usage.byAgent")}
               </h2>
               <UsageTable
@@ -478,6 +462,20 @@ export default function UsageRoute() {
               />
             </section>
           </div>
+        )}
+
+        {/* 价目编辑是高级项：默认收起，别在空态下面摊一墙数字。 */}
+        {pricing && (
+          <PricingEditor
+            pricing={pricing}
+            rules={pricingDraft}
+            dirty={pricingDirty}
+            saving={pricingSaving}
+            error={pricingError}
+            onChange={setPricingDraft}
+            onSave={savePricing}
+            onReset={confirmResetPricing}
+          />
         )}
       </div>
       <ConfirmActionDialog action={confirm} onOpenChange={(open) => !open && setConfirm(null)} />
@@ -507,6 +505,7 @@ function PricingEditor({
   onReset: () => void;
 }) {
   const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
   const [compact, setCompact] = useState(() =>
     typeof window !== "undefined"
       ? window.matchMedia("(max-width: 767.98px)").matches
@@ -570,14 +569,47 @@ function PricingEditor({
   const contextLabel = (rule: UsagePricingRule) => `${rule.label} ${t("usage.ctx")}`;
 
   return (
-    <section className="flex flex-col gap-2 rounded-lg border border-border-subtle bg-surface-secondary p-4">
+    <section className="flex flex-col gap-2 rounded-lg border border-border-subtle bg-surface-secondary/60">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-4 py-3 text-left transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-primary/40"
+      >
+        <div className="min-w-0 flex-1">
+          <h2 className="font-caption text-xs font-medium uppercase tracking-wide text-foreground-tertiary">
+            {t("usage.pricingTitle")}
+            <span className="ml-2 font-normal normal-case tracking-normal">
+              {t("usage.pricingAdvanced", { defaultValue: "高级 · 改估算单价" })}
+            </span>
+          </h2>
+          {!open && (
+            <p className="mt-0.5 truncate font-caption text-[11px] text-foreground-tertiary">
+              {t("usage.pricingMeta", {
+                unit: pricing.unit,
+                source:
+                  pricing.source === "user"
+                    ? t("usage.pricingUser")
+                    : t("usage.pricingDefault"),
+                path: foldHome(pricing.path),
+              })}
+            </p>
+          )}
+        </div>
+        <ChevronDown
+          className={cn(
+            "size-4 shrink-0 text-foreground-tertiary transition-transform duration-200",
+            open && "rotate-180",
+          )}
+          aria-hidden
+        />
+      </button>
+      {open && (
+        <div className="flex flex-col gap-2 border-t border-border-subtle px-4 pb-4 pt-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="font-caption text-xs uppercase tracking-wide text-foreground-tertiary">
-            {t("usage.pricingTitle")}
-          </h2>
-          <p className="mt-1 font-caption text-[11px] text-foreground-tertiary">
-            {t("usage.pricingMeta", {
+          <p className="font-caption text-[11px] text-foreground-tertiary">
+            {t("usage.pricingMetaOpen", {
               unit: pricing.unit,
               source:
                 pricing.source === "user"
@@ -589,9 +621,17 @@ function PricingEditor({
           {pricing.fallback && pricing.fallback.models > 0 && (
             <p className="mt-0.5 font-caption text-[11px] text-foreground-tertiary">
               {t("usage.pricingFallback", {
-                defaultValue:
-                  "未列出的模型自动套用 LiteLLM 价格表兜底（覆盖 {{count}} 个模型）",
                 count: pricing.fallback.models,
+                origin:
+                  pricing.fallback.origin === "disk"
+                    ? t("usage.pricingFallbackOriginDisk")
+                    : pricing.fallback.origin === "refreshed"
+                      ? t("usage.pricingFallbackOriginRefreshed")
+                      : t("usage.pricingFallbackOriginEmbedded"),
+                auto:
+                  pricing.fallback.auto_refresh === false
+                    ? t("usage.pricingFallbackAutoOff")
+                    : t("usage.pricingFallbackAutoOn"),
               })}
             </p>
           )}
@@ -748,6 +788,8 @@ function PricingEditor({
             ))}
           </tbody>
           </table>
+        </div>
+      )}
         </div>
       )}
     </section>

@@ -75,14 +75,14 @@ export function OrchestratorFailureCard({
     kind === "escalated"
       ? t("chat.orchestratorFailure.titleEscalated", "多次重试仍未成功，需要你处理")
       : isAuth
-        ? t("chat.orchestratorFailure.titleAuth", "队长还没法开始")
+        ? t("chat.orchestratorFailure.titleAuth", "规划还没法开始")
         : isRate
-          ? t("chat.orchestratorFailure.titleRate", "队长暂时被限流")
+          ? t("chat.orchestratorFailure.titleRate", "规划暂时被限流")
           : isCrash
-            ? t("chat.orchestratorFailure.titleCrash", "队长意外退出")
+            ? t("chat.orchestratorFailure.titleCrash", "规划意外退出")
             : isTimeout
-              ? t("chat.orchestratorFailure.titleTimeout", "队长启动后没有响应")
-              : t("chat.orchestratorFailure.title", "队长还不能开始工作");
+              ? t("chat.orchestratorFailure.titleTimeout", "规划启动后没有响应")
+              : t("chat.orchestratorFailure.title", "规划还不能开始工作");
 
   const copy = async () => {
     if (!loginCommand) return;

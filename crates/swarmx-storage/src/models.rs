@@ -64,6 +64,23 @@ pub struct AgentRecord {
     pub last_error_at: Option<i64>,
 }
 
+/// Process identity of an agent whose row was settled as killed while its
+/// real process tree may still be running — the candidate set the server's
+/// startup orphan reaper works through (migration 0029). A server crash /
+/// SIGKILL orphans the shim → CLI tree to init; the next boot probes
+/// `shim_pid`, validates the command line, then kills `shim_pgid` (unix) or
+/// the pid tree (Windows). See `Store::orphaned_agent_processes` and
+/// `swarmx-server/src/reaper.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanedAgentProcess {
+    pub id: String,
+    pub cli: String,
+    pub shim_pid: i64,
+    /// Unix process-group id (kill target). `None` on Windows.
+    #[serde(default)]
+    pub shim_pgid: Option<i64>,
+}
+
 /// A "direction" inside a workspace — its own orchestrator + worker subtree +
 /// dual ledger + (optionally) an isolated git worktree. See migration 0009.
 #[derive(Debug, Clone, Serialize, Deserialize)]

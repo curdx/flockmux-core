@@ -49,15 +49,31 @@ import type {
 
 import i18n from "@/i18n";
 import { HTTP_BASE } from "../lib/apiBase";
+import { isTauriWindow } from "@/lib/tauriWindowChrome";
 import { dedupe } from "@/lib/requestDedupe";
 import { apiRoutes } from "./endpoints";
 import type { ApiEndpoint } from "./endpoints";
 
+/** User-facing copy when fetch never reaches the server. Packaged App ≠
+ *  `cargo run`: never mention loopback ports or "make sure swarmx is running". */
+export function networkErrorCopy(): string {
+  if (isTauriWindow()) {
+    return i18n.t("common.networkErrorApp", {
+      defaultValue:
+        "暂时出了点问题。若顶部有「重启」，点一下；还不行就关掉再打开应用。",
+    });
+  }
+  return i18n.t("common.networkErrorDev", {
+    defaultValue: "暂时连不上本地服务。开发时请确认后端已启动，然后重试。",
+  });
+}
+
 /** Thrown by `request()` on any non-2xx response. Carries the HTTP `status`
  *  (so callers can special-case 404 → empty-state instead of a red error)
  *  and a `detail` string that is the server's `{ error }` envelope unwrapped
- *  (or the raw body text when not JSON). `.message` keeps the
- *  `METHOD path → status: detail` form for dev-facing logs. */
+ *  (or the raw body text when not JSON). `.message` is also user-safe for
+ *  network failures (status 0); for HTTP errors it keeps a compact
+ *  `METHOD path → status: detail` form for logs — prefer `.detail` in UI. */
 export class ApiError extends Error {
   status: number;
   detail: string;
@@ -93,22 +109,17 @@ async function request<T>(
     // ignore. Everything else here is a connection-layer failure (fetch rejects
     // with a TypeError like "Failed to fetch" / "Load failed"): the request
     // never reached the server, so there's no Response and the `!res.ok` →
-    // ApiError path below never runs. Without this, that bare English TypeError
-    // leaks all the way to the UI. Normalize it to a Chinese, beginner-friendly
-    // ApiError (status 0 = no HTTP response, distinct from any real status code).
-    // The friendly copy goes in BOTH `detail` and `message`: callers surface one
-    // or the other (some show `e.detail` directly to the user), so both must be
-    // user-safe — the raw English TypeError is appended to `message` for dev logs.
+    // ApiError path below never runs.
+    //
+    // BOTH `detail` and `message` must be user-safe: many toast/UI sites show
+    // `e.message`. Technical crumbs (method/path/TypeError) go to console only
+    // — packaged App users must never see 127.0.0.1:7777 or GET /api/….
     if (e instanceof DOMException && e.name === "AbortError") throw e;
     const original = (e as Error)?.message || String(e);
-    const friendly = i18n.t("common.networkError", {
-      defaultValue: "连接不上本地服务（127.0.0.1:7777），请确认 swarmx 正在运行",
-    });
-    throw new ApiError(
-      0,
-      friendly,
-      `${friendly}（${method} ${path}：${original}）`,
-    );
+    const friendly = networkErrorCopy();
+    // eslint-disable-next-line no-console
+    console.warn(`[swarmx] network error ${method} ${path}:`, original);
+    throw new ApiError(0, friendly, friendly);
   }
   if (!res.ok) {
     // Read the body stream EXACTLY ONCE. The old code did `res.json()` then

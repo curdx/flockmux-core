@@ -93,6 +93,7 @@ interface AgentNodeData extends Record<string, unknown> {
 }
 
 function AgentNode({ data }: NodeProps<Node<AgentNodeData>>) {
+  const { t } = useTranslation();
   const a = data.info;
   const role = a.role;
   const live = a.killed_at == null && a.shim_exit == null;
@@ -161,8 +162,9 @@ function AgentNode({ data }: NodeProps<Node<AgentNodeData>>) {
             a.handoff_failed ? "text-state-danger" : "text-state-success",
           )}
         >
-          {a.handoff_failed ? "✗" : "→"} {a.handoff_signal}
-          {a.handoff_failed && ".error"}
+          {a.handoff_failed
+            ? t("tasks.failed", { defaultValue: "失败" })
+            : t("tasks.delivered", { defaultValue: "已交付" })}
         </div>
       )}
       <Handle type="source" position={Position.Bottom} className="!bg-foreground-tertiary" />
@@ -659,7 +661,7 @@ export default function DagView() {
       }),
       description: t(
         "agent.confirm.wake.desc",
-        "会向该 agent 投递一条手动唤醒消息，推动它继续读取 mailbox / blackboard。仅在它确实卡住或需要人工催促时使用。",
+        "一般不用点——卡住时系统会自动催。只有它还在睡、自动催没用时再用。",
       ),
       confirmLabel: t("agent.wake"),
       onConfirm: async () => {
@@ -667,7 +669,7 @@ export default function DagView() {
           await api.wakeAgent(selected.agent_id);
         } catch (e) {
           toast.error(
-            t("agent.wakeFailed", { defaultValue: "唤醒失败" }),
+            t("agent.wakeFailed", { defaultValue: "催促失败" }),
             { description: (e as Error)?.message },
           );
         }
@@ -691,17 +693,31 @@ export default function DagView() {
       description: paused
         ? t(
             "agent.confirm.resume.desc",
-            "会恢复该 agent 的自动唤醒，并投递一次手动唤醒让它继续处理当前工作。",
+            "会恢复自动催促，并让它马上接着干。",
           )
         : t(
             "agent.confirm.pause.desc",
-            "会发送 Ctrl-C 中断当前 turn，并让自动唤醒跳过该 agent，直到你恢复它。",
+            "会打断它当前这一轮，并暂时不再自动催它，直到你点「继续」。",
           ),
       confirmLabel: paused ? t("agent.resume") : t("agent.pause"),
       variant: paused ? "default" : "destructive",
       onConfirm: onTogglePauseSelected,
     });
   }, [onTogglePauseSelected, selected, t]);
+
+  // 空图只渲染单一 EmptyState（UX-030），不再左栏/右栏复读
+  if (liveAgents.length === 0) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+        <EmptyState
+          icon={<Activity className="size-8" />}
+          title={t("dag.empty")}
+          hint={t("dag.emptyHint")}
+          primaryAction={{ label: t("dag.emptyAction"), href: ".." }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
@@ -828,8 +844,7 @@ export default function DagView() {
             {error}
           </div>
         )}
-        {liveAgents.length > 0 && (
-          <div className="absolute top-3 right-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap items-center justify-end gap-2 lg:top-4 lg:right-4">
+        <div className="absolute top-3 right-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap items-center justify-end gap-2 lg:top-4 lg:right-4">
             {pausedCount > 0 && (
               <span className="rounded-full bg-surface-elevated px-2 py-0.5 font-caption text-[10px] text-foreground-tertiary">
                 {t("dag.pausedCount", { count: pausedCount })}
@@ -864,15 +879,6 @@ export default function DagView() {
               {t("dag.resumeAll")}
             </button>
           </div>
-        )}
-        {liveAgents.length === 0 ? (
-          <EmptyState
-            icon={<Activity className="size-8" />}
-            title={t("dag.empty")}
-            hint={t("dag.emptyHint")}
-            primaryAction={{ label: t("dag.emptyAction"), href: ".." }}
-          />
-        ) : (
           <ReactFlowProvider>
             <Canvas
               // Role filter applies to the canvas too (parity with the left
@@ -887,7 +893,6 @@ export default function DagView() {
               focusNonce={focusNonce}
             />
           </ReactFlowProvider>
-        )}
       </div>
 
       <aside className="flex max-h-72 shrink-0 flex-col gap-4 overflow-y-auto border-t border-border-subtle bg-surface-elevated p-4 lg:max-h-none lg:w-[300px] lg:border-t-0 lg:border-l lg:p-5">

@@ -34,6 +34,12 @@ home_env = "HOME"
 # CLI-account surface like codex; swarmx still can't meter subscription spend.
 billing_surface = "cli-account"
 requires_explicit_billing_opt_in = false
+# No provider env forwarded: opencode authenticates per-provider via its own
+# `opencode auth login` (shared auth.json), not ambient env keys. An empty
+# declaration means ANTHROPIC_/OPENAI_/DEEPSEEK_ all stay OUT of this
+# full-shell agent; a user who needs env-key auth adds the prefix via a
+# ~/.swarmx/cli-plugins/opencode.toml overlay (explicit opt-in).
+provider_env_prefixes = []
 
 # MCP: write the per-agent opencode.json (mcp + permission + autoupdate).
 # Format `opencode-json` → pre_spawn::write_opencode_per_agent_config.

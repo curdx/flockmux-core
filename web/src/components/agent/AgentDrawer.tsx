@@ -262,7 +262,7 @@ export function AgentDrawer({ agentId, activities, onClose }: Props) {
       }),
       description: t("agent.confirm.wake.desc", {
         defaultValue:
-          "会向该 agent 投递一条手动唤醒消息，推动它继续读取 mailbox / blackboard。仅在它确实卡住或需要人工催促时使用。",
+          "一般不用点——卡住时系统会自动催。只有它还在睡、自动催没用时再用。",
       }),
       confirmLabel: t("agent.wake"),
       onConfirm: async () => {
@@ -271,12 +271,12 @@ export function AgentDrawer({ agentId, activities, onClose }: Props) {
           toast.success(
             t("agent.wakeOk", {
               role: info?.role ?? agentId.slice(0, 8),
-              defaultValue: "已唤醒 {{role}}",
+              defaultValue: "已催促 {{role}}",
             }),
           );
         } catch (e) {
           toast.error(
-            t("agent.wakeFailed", { defaultValue: "唤醒失败" }),
+            t("agent.wakeFailed", { defaultValue: "催促失败" }),
             { description: e instanceof ApiError ? e.detail : (e as Error)?.message },
           );
         }
@@ -297,8 +297,8 @@ export function AgentDrawer({ agentId, activities, onClose }: Props) {
     } catch (e) {
       toast.error(
         wasPaused
-          ? t("agent.resumeFailed", { defaultValue: "恢复失败" })
-          : t("agent.pauseFailed", { defaultValue: "暂停失败" }),
+          ? t("agent.resumeFailed", { defaultValue: "无法继续" })
+          : t("agent.pauseFailed", { defaultValue: "无法暂停" }),
         { description: e instanceof ApiError ? e.detail : (e as Error)?.message },
       );
     }
@@ -309,20 +309,19 @@ export function AgentDrawer({ agentId, activities, onClose }: Props) {
       title: paused
         ? t("agent.confirm.resume.title", {
             role: info?.role ?? agentId.slice(0, 8),
-            defaultValue: "恢复 agent？",
+            defaultValue: "让 {{role}} 继续？",
           })
         : t("agent.confirm.pause.title", {
             role: info?.role ?? agentId.slice(0, 8),
-            defaultValue: "暂停 agent？",
+            defaultValue: "暂停 {{role}}？",
           }),
       description: paused
         ? t("agent.confirm.resume.desc", {
-            defaultValue:
-              "会恢复该 agent 的自动唤醒，并投递一次手动唤醒让它继续处理当前工作。",
+            defaultValue: "会恢复自动催促，并让它马上接着干。",
           })
         : t("agent.confirm.pause.desc", {
             defaultValue:
-              "会发送 Ctrl-C 中断当前 turn，并让自动唤醒跳过该 agent，直到你恢复它。",
+              "会打断它当前这一轮，并暂时不再自动催它，直到你点「继续」。",
           }),
       confirmLabel: paused ? t("agent.resume") : t("agent.pause"),
       variant: paused ? "default" : "destructive",
@@ -487,8 +486,19 @@ function Header({
                   : info?.shim_ready
                     ? t("agent.status.ready")
                     : t("agent.status.starting")}
-              {spawnedAt && (
+              {/* 死后别用 now-spawned 继续涨——小白会以为它还在跑 */}
+              {spawnedAt && live && (
                 <> · {t("agent.status.uptime", { delta: formatDelta(now - spawnedAt) })}</>
+              )}
+              {spawnedAt && !live && info?.killed_at != null && (
+                <>
+                  {" "}
+                  ·{" "}
+                  {t("agent.status.lived", {
+                    delta: formatDelta(info.killed_at - spawnedAt),
+                    defaultValue: "存活 {{delta}}",
+                  })}
+                </>
               )}
             </span>
           </div>
@@ -501,29 +511,41 @@ function Header({
           是重复，drawer 这边删了。Wake / Pause / Restart 保留，是 agent
           独有的操作。 */}
       <div className="flex items-center gap-2 px-5 pt-1 pb-4">
-        <Button size="sm" variant="outline" onClick={onWake}>
-          <Zap className="size-3" />
-          {t("agent.wake")}
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={onTogglePause}
-          disabled={!live}
-          title={info?.paused ? t("agent.resume") : t("agent.pause")}
-        >
-          {info?.paused ? (
-            <>
-              <Play className="size-3" />
-              {t("agent.resume")}
-            </>
-          ) : (
-            <>
-              <Pause className="size-3" />
-              {t("agent.pause")}
-            </>
-          )}
-        </Button>
+        {/* Wake is an escape hatch — auto-nudge handles stalls. Ghost + soft
+            label so the drawer doesn't look like an ops console. Hidden when
+            the agent is already exited: 催一个死人只会让小白更懵. */}
+        {live && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-foreground-tertiary"
+            onClick={onWake}
+            title={t("agent.confirm.wake.desc")}
+          >
+            <Zap className="size-3" />
+            {t("agent.wake")}
+          </Button>
+        )}
+        {live && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onTogglePause}
+            title={info?.paused ? t("agent.resume") : t("agent.pause")}
+          >
+            {info?.paused ? (
+              <>
+                <Play className="size-3" />
+                {t("agent.resume")}
+              </>
+            ) : (
+              <>
+                <Pause className="size-3" />
+                {t("agent.pause")}
+              </>
+            )}
+          </Button>
+        )}
         {/* "重启" 按钮删了 —— 它一直 disabled 标"暂未实现"，给用户露出一个
             按不动的死按钮。等真支持重启再加回来。 */}
       </div>
@@ -963,14 +985,18 @@ function StatBar({ info, now }: { info: AgentInfo | null; now: number }) {
         },
         {
           label: t("agent.stat.hook"),
-          value: info?.shim_ready
-            ? t("agent.stat.active")
-            : info
-              ? t("agent.stat.wait")
-              : "—",
-          color: info?.shim_ready
-            ? "text-state-success"
-            : "text-foreground-tertiary",
+          // shim_ready 在死后仍可能为 true（退出前已就绪）——死人不能再显示「忙碌」
+          value: !live
+            ? t("agent.stat.off")
+            : info?.shim_ready
+              ? t("agent.stat.active")
+              : info
+                ? t("agent.stat.wait")
+                : "—",
+          color:
+            live && info?.shim_ready
+              ? "text-state-success"
+              : "text-foreground-tertiary",
         },
       ] as const,
     [info, live, spawnedAt, now, t],

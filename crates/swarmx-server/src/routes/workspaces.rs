@@ -1208,10 +1208,10 @@ pub async fn judge_fusion_handler(
 
 /// The judge-stage core, callable by the HTTP handler AND the autopilot autochain
 /// (in-process, no self-HTTP). Creates the privileged judge direction, gathers
-/// every contestant's diff bundle (+ runs the objective gate in auto mode), flips
-/// the batch to `judging`, and in auto mode spawns the judge agent plus its
-/// watchdog. Takes an owned `AppState` so the body's `&state`/`state.clone()`
-/// usages are untouched.
+/// every contestant's diff bundle (+ runs the objective gate when the batch
+/// carries a check_cmd, auto and manual alike), flips the batch to `judging`,
+/// and in auto mode spawns the judge agent plus its watchdog. Takes an owned
+/// `AppState` so the body's `&state`/`state.clone()` usages are untouched.
 async fn enter_judge_stage(
     state: AppState,
     ws: swarmx_storage::WorkspaceRecord,
@@ -1249,9 +1249,11 @@ async fn enter_judge_stage(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
     };
 
-    // The objective gate command, if this batch carries one. Only runs in auto
-    // mode (the auto-judge is what consumes the result); manual judging is left
-    // exactly as before.
+    // The objective gate command, if this batch carries one. Runs in BOTH
+    // modes: the auto-judge consumes the result in its prompt, and the manual
+    // flow shows pass/fail + output tail on the contestant cards — previously
+    // manual judging silently ignored a check_cmd the create form accepts for
+    // both modes (the Fusion form offers the input unconditionally).
     let check_cmd = batch.check_cmd.clone().filter(|c| !c.trim().is_empty());
 
     // Gather each contestant's diff bundle.
@@ -1274,11 +1276,12 @@ async fn enter_judge_stage(
             }
             _ => Vec::new(),
         };
-        // OBJECTIVE GATE: in auto mode with a check_cmd, RUN the check in this
-        // contestant's worktree before any LLM deliberation. This catches the
-        // "looks correct but fails at runtime" class a pure-diff judge misses.
-        // The contestant's worktree dir is derived the same way isolation does.
-        let (check_passed, check_output) = if auto && check_cmd.is_some() {
+        // OBJECTIVE GATE: with a check_cmd, RUN the check in this contestant's
+        // worktree before any deliberation — auto AND manual mode alike. This
+        // catches the "looks correct but fails at runtime" class a pure-diff
+        // judge misses. The contestant's worktree dir is derived the same way
+        // isolation does.
+        let (check_passed, check_output) = if check_cmd.is_some() {
             match (&th.isolation == "worktree", th.branch.as_deref()) {
                 (true, Some(br)) if !br.is_empty() => {
                     let dir = crate::worktree::worktree_dest(&cwd, br)
@@ -1596,14 +1599,27 @@ async fn spawn_panel_contestant(
 /// as output, so a contestant is never silently passed. Output is tail-truncated
 /// to keep the judge prompt bounded.
 async fn run_contestant_check(worktree_dir: &str, check_cmd: &str) -> (bool, String) {
+    run_contestant_check_with_timeout(worktree_dir, check_cmd, CHECK_TIMEOUT).await
+}
+
+/// Hard ceiling for one contestant check run. Test/build suites can be slow;
+/// this only bounds a pathological hang — before it, a check command that
+/// never exits (e.g. `npm test` accidentally starting a dev server) wedged
+/// the judge FOREVER on `.output()`. Same value and reasoning as verify.rs's
+/// VERIFY_TIMEOUT.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Test seam: same as [`run_contestant_check`] with a caller-chosen timeout,
+/// so the hung-check path is exercised in milliseconds.
+async fn run_contestant_check_with_timeout(
+    worktree_dir: &str,
+    check_cmd: &str,
+    timeout: std::time::Duration,
+) -> (bool, String) {
     let dir = worktree_dir.to_string();
     let cmd = check_cmd.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        crate::runtime_path::shell_command(&cmd)
-            .current_dir(&dir)
-            .output()
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || run_check_timeboxed(&cmd, &dir, timeout)).await;
 
     match result {
         Ok(Ok(out)) => {
@@ -1614,10 +1630,93 @@ async fn run_contestant_check(worktree_dir: &str, check_cmd: &str) -> (bool, Str
             let tail = tail_chars(&combined, 1500);
             (out.status.success(), tail)
         }
-        Ok(Err(e)) => (false, format!("failed to run check command: {e}")),
+        Ok(Err(msg)) => (false, msg),
         Err(e) => (false, format!("check task panicked/cancelled: {e}")),
     }
 }
+
+/// Blocking core of the contestant check: spawn the shell, wait with a hard
+/// timeout (the `worktree.rs::git()` channel pattern), and on timeout kill the
+/// whole process tree so a hung check leaves no orphans holding the worktree.
+/// A timeout is a FAILED check with the evidence in the message (fail-loud —
+/// the judge must never treat an unverifiable contestant as passing).
+fn run_check_timeboxed(
+    cmd: &str,
+    dir: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let mut c = crate::runtime_path::shell_command(cmd);
+    c.current_dir(dir);
+    // Own process group so a timeout can killpg the whole forked tree
+    // (`sh -c "npm test"` forks grandchildren; killing just the shell strands
+    // them). Same pattern as verify.rs's exec_timeboxed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
+    let child = c
+        .spawn()
+        .map_err(|e| format!("failed to run check command: {e}"))?;
+    let pid = child.id(); // == pgid on unix (process_group(0))
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        // wait_with_output drains both pipes (so a full pipe can't deadlock
+        // the child) and reaps it.
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(out)) => {
+            let _ = waiter.join();
+            Ok(out)
+        }
+        Ok(Err(e)) => {
+            let _ = waiter.join();
+            Err(format!("check wait failed: {e}"))
+        }
+        Err(_) => {
+            kill_check_tree(pid);
+            // Where a real tree-kill exists the child is already dying, so
+            // join reaps it promptly. On the compile-only fallback (neither
+            // unix nor windows) no kill exists — detach rather than block the
+            // judge on the runaway child.
+            #[cfg(any(unix, windows))]
+            let _ = waiter.join();
+            #[cfg(not(any(unix, windows)))]
+            drop(waiter);
+            Err(format!(
+                "check command timed out after {timeout:?}; process tree killed"
+            ))
+        }
+    }
+}
+
+/// Best-effort tree kill for a timed-out contestant check.
+#[cfg(unix)]
+fn kill_check_tree(pid: u32) {
+    // SAFETY: killpg on a pgid we created via process_group(0) above.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+/// Windows has no killpg; `taskkill /T` kills the shell's whole child tree.
+#[cfg(windows)]
+fn kill_check_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .output();
+}
+
+/// Compile-only fallback: std has no portable kill-by-pid. The judge is still
+/// unblocked (the caller detaches the waiter instead of joining it) and the
+/// check still fails loud; the runaway child finishes on its own.
+#[cfg(not(any(unix, windows)))]
+fn kill_check_tree(_pid: u32) {}
 
 /// Keep the last `max` chars of `s`, prefixing an ellipsis when truncated.
 fn tail_chars(s: &str, max: usize) -> String {
@@ -3817,4 +3916,45 @@ fn own_artifact_id(xml: &str) -> Option<String> {
     xml_tag_values(&xml[search_from..], "artifactId")
         .into_iter()
         .next()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn contestant_check_judged_by_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let (passed, _) = run_contestant_check(&cwd, "exit 0").await;
+        assert!(passed, "exit 0 passes the gate");
+        let (passed, _) = run_contestant_check(&cwd, "exit 3").await;
+        assert!(!passed, "non-zero exit fails the gate");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contestant_check_timeout_fails_loud_instead_of_wedging_judge() {
+        // Regression: a hung check command (`sleep 30` standing in for e.g. an
+        // `npm test` that accidentally starts a dev server) used to block the
+        // judge on `.output()` forever. With the timebox it returns promptly
+        // as a FAILED check with the evidence, and the tree is killpg'ed.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let start = std::time::Instant::now();
+        let (passed, out) = run_contestant_check_with_timeout(
+            &cwd,
+            "sleep 30",
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(!passed, "a timed-out check is a failed check");
+        assert!(out.contains("timed out"), "evidence kept for the judge: {out}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "the judge is unblocked promptly, took {:?}",
+            start.elapsed()
+        );
+    }
 }

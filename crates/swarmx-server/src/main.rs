@@ -12,6 +12,7 @@
 //! visits from driving their agents over a cross-site WebSocket (WS bypasses
 //! CORS, so the CORS layer alone is not a security boundary).
 
+mod agent_lifecycle;
 mod billing;
 // Per-CLI behavior adapters (claude / codex / opencode) behind one CliAdapter
 // trait — every CLI-specific spawn seam lives in its own `cli/<name>.rs`, so the
@@ -25,17 +26,17 @@ mod reasonix_serve;
 mod zulu_serve;
 mod comate;
 mod fusion;
+mod input_delivery;
 mod plugins;
 mod pty_query;
 mod pty_stream;
 mod reaper;
 mod registry;
 mod roles;
-// W2-1 phase 1: the verification-gate executor (security-hardened allowlist +
-// timeboxed process-group exec), unit-tested. Phase 2 wires it into the handoff
-// path (spawn schema + persist + interception + `verifying` status) — see
-// docs/w2-1-verification-gate-design-2026-06-15.md. `allow(dead_code)` until then.
-#[allow(dead_code)]
+// W2-1 verification gate: security-hardened allowlist + timeboxed process-group
+// exec. Wired into the handoff path (role manifest `done_checks` → spawn
+// validation → exit-key gate before auto-kill) — see
+// docs/w2-1-verification-gate-design-2026-06-15.md.
 mod verify;
 mod routes;
 mod runtime_path;
@@ -380,11 +381,7 @@ async fn main() -> Result<()> {
     // Liveness reaper: deterministic backstop that retires any agent whose
     // child process actually died without emitting/synthesizing a ShimExit, so
     // the UI never sits forever on a green dot for a process that is gone.
-    reaper::spawn(
-        state.registry.clone(),
-        state.store.clone(),
-        state.swarm.clone(),
-    );
+    reaper::spawn(state.clone());
     info!("liveness reaper started");
 
     // Periodic retention: the boot-time prune above runs once; this keeps the
@@ -527,6 +524,11 @@ async fn main() -> Result<()> {
     } else {
         info!("auto-respawn: disabled (set SWARMX_AUTO_RESPAWN_ORCHESTRATORS=1 to enable)");
     }
+
+    // LiteLLM fallback catalog: load ~/.swarmx cache, then one-shot GitHub refresh
+    // (cc-switch-style). Failures keep embedded/disk; opt out with
+    // SWARMX_DISABLE_LITELLM_REFRESH=1.
+    routes::usage::spawn_litellm_pricing_refresh();
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state.registry.clone()))

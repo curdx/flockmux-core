@@ -1,14 +1,10 @@
 /**
  * Workspace-scoped blackboard key helpers.
  *
- * Multiple workspaces share one global blackboard namespace, so generic
- * keys like `project.summary` would silently overwrite each other when
- * scouts from different workspaces run in parallel. We append a
- * filesystem-derived slug per workspace so each room owns its own key.
- *
- * IMPORTANT: the slug algorithm here MUST match the shell expression
- * embedded in `roles/scout.md` (the scout writes the key from its own
- * cwd via `pwd | sed ...`). Keep both in sync — see scout.md step 2.
+ * Multiple workspaces share one global blackboard namespace. Current writes
+ * are namespaced `<workspace_id>/<thread_slug>/...` by the orchestrator
+ * (roles/orchestrator.md); the filesystem-derived `workspaceSlug` below is
+ * kept for LEGACY path-suffixed keys (Context.tsx still filters/strips them).
  */
 
 /** Turn an absolute filesystem path into a blackboard-safe slug.
@@ -20,9 +16,14 @@ export function workspaceSlug(path: string): string {
   return path.replace(/^\/+/, "").replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-/** Per-workspace key that scout writes its project digest to. */
-export function projectSummaryKey(path: string): string {
-  return `project.summary.${workspaceSlug(path)}`;
+/** CreateWizard 的「扫描完成」信号:orchestrator Phase A 把 Task Ledger 写到
+ *  `{workspace_id}/{thread_slug}/task.ledger.md`(roles/orchestrator.md 步骤 2;
+ *  该 key 同时是 Phase A 的跳过标记 —— 它存在 = Phase A 至少完成过一次)。
+ *  按 workspace_id 精确匹配:历史上听的是 `project.summary.*` 前缀(scout
+ *  时代的 key,写入方已随 scout 角色删除),既永远等不到(每次靠 60s 超时
+ *  进群)、又会因为不带 slug 精确匹配而被别的工作空间的写入误关。 */
+export function isScanDoneBlackboardPath(path: string, workspaceId: string): boolean {
+  return path.startsWith(`${workspaceId}/`) && path.endsWith("/task.ledger.md");
 }
 
 /** Split a filesystem path into its last segment (`name`) and everything
@@ -66,13 +67,6 @@ export function accentToCssVar(id: string | null | undefined): string {
   const found = ACCENT_OPTIONS.find((o) => o.id === id);
   return found?.cssVar ?? ACCENT_OPTIONS[0].cssVar;
 }
-
-/** Prefix every per-workspace key shares — used by the wizard to listen
- *  for "scout finished writing the summary" via the WS feed without
- *  having to know which slug the scout ended up using (matters when
- *  client-side path doesn't quite match server-side canonicalized cwd,
- *  e.g. /tmp vs /private/tmp on macOS). */
-export const PROJECT_SUMMARY_KEY_PREFIX = "project.summary.";
 
 /** Blackboard keys that fullstack-feature* spells write internally and
  *  read across roles. They live in the GLOBAL blackboard namespace (not

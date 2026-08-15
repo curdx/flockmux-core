@@ -60,8 +60,11 @@
 
 ---
 
-## 四、尚未处理(记录为后续簇)
+## 四、尚未处理 / closure(2026-08 优化审计核对)
 
-- **簇 H:** reaper 不回收自退出 agent → 泄漏 writer 线程 + master fd + fork-bomb 名额(#8,HIGH);外加 pty writer 线程不随子进程 EOF 退出。
-- **簇 A′:** 单 WakeCoordinator 内联 await 逐 agent HTTP 投递 → 一个 wedged 引擎全域阻塞所有唤醒(#1,HIGH)。
-- **簇 F/G + 零散:** reasonix 盲提交双回合(#6)+ 共享 `.mcp.json` 身份串号(#16);并行同角色 worker 撞 handoff key(#7);codex 污染全局 `~/.codex/config.toml`(#12);spawn_worker 超时+幂等(#14);only_undelivered(#20);thought-trace 事务(#19);handoff 新鲜度门读 op-log(#21);reaper 对被杀 agent 合成假 Error(#22)。
+> 核对基线: `reaper.rs` / `wake.rs::spawn_deliver_wake` / reasonix+zulu MCP 写盘。
+
+- **簇 H (reaper 自退出泄漏 #8):** **已关单。** `reaper::spawn` 在 `main` 启动; `sweep_once` 在 grace 后 `registry.remove` 回收 writer 线程 + master fd + live-agent 名额; 单测 `sweep_evicts_exited_slot_after_grace` 覆盖。进程账本见迁移 `0029_agent_shim_pid.sql`。
+- **簇 A′ (Wake 内联 await 全域阻塞 #1):** **已关单(缓解到位)。** `spawn_deliver_wake` 把 mailbox 写 + kick 放到独立 task; per-agent `kick_locks.try_lock` 单飞; `delivery_sem`(`MAX_CONCURRENT_KICKS`) 限并发。wedged 引擎只占自己的 lock + 一个 permit,不再阻塞协调器消费循环。
+- **簇 F reasonix/zulu 共享 MCP 身份串号 (#16):** **已关单。** 对齐 kimi: workspace 级 MCP 文件**不再**写入 `--agent-id` / `SWARMX_*` env;身份靠 spawn 注入的进程环境继承(`SWARMX_AGENT_ID` / `SWARMX_SERVER_URL`)。Shared 布局下 last-writer 文件内容相同,不再串号。
+- **仍开(零散):** reasonix 盲提交双回合(#6);并行同角色 worker 撞 handoff key(#7);codex 污染全局 `~/.codex/config.toml`(#12);spawn_worker 超时+幂等(#14);only_undelivered(#20);thought-trace 事务(#19);handoff 新鲜度门读 op-log(#21);reaper 对被杀 agent 合成假 Error(#22)。

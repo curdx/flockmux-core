@@ -40,7 +40,9 @@ import {
   Settings as SettingsIcon,
   Sun,
   SunMoon,
+  Swords,
   Terminal as TerminalIcon,
+  Users,
   Zap,
 } from "lucide-react";
 import { api, ApiError } from "../api/http";
@@ -91,15 +93,13 @@ const DEBUG_NAV = [
 
 const NAV = DEBUG_ENABLED ? [...BASE_NAV, ...DEBUG_NAV] : BASE_NAV;
 
-// Keep in sync with buildTabs() in routes/workspace/Shell.tsx — same order,
-// same ⌘1-4 mapping (index + 1). The "context" view was replaced by "ledger"
-// in the context→ledger migration; the palette wasn't updated, so ⌘ hints
-// were off-by-one (replays showed ⌘3 while ⌘3 actually opens the ledger) and
-// the ledger view was unreachable from ⌘K. Fixed here.
+// Keep in sync with buildTabs() in WorkspaceToolbar — same order / ⌘1-6.
 const WORKSPACE_VIEWS = [
   { id: "chat", labelKey: "chat.tabs.chat", icon: MessageSquare, suffix: "" },
   { id: "dag", labelKey: "chat.tabs.dag", icon: GitBranch, suffix: "/dag" },
   { id: "ledger", labelKey: "chat.tabs.ledger", icon: ClipboardList, suffix: "/ledger" },
+  { id: "fusion", labelKey: "chat.tabs.fusion", icon: Swords, suffix: "/fusion" },
+  { id: "consult", labelKey: "chat.tabs.consult", icon: Users, suffix: "/consult" },
   { id: "replays", labelKey: "chat.tabs.replays", icon: Play, suffix: "/replays" },
 ] as const;
 
@@ -243,9 +243,7 @@ export function CommandPalette() {
             <div className="flex items-center gap-2 px-3 py-2 text-xs text-status-danger">
               <AlertTriangle className="size-3.5 shrink-0" />
               <span className="flex-1">
-                {t("cmdk.listLoadFailed", {
-                  defaultValue: "工作区 / agent 列表加载失败",
-                })}
+                {t("cmdk.listLoadFailed")}
               </span>
               <button
                 type="button"
@@ -350,26 +348,29 @@ export function CommandPalette() {
                 onSelect={() => {
                   close();
                   setConfirm({
-                    title: t("cmdk.confirmWakeTitle", { role: a.role, defaultValue: "唤醒 agent？" }),
+                    title: t("cmdk.confirmWakeTitle", {
+                      role: a.role,
+                      defaultValue: "手动催一下 {{role}}？",
+                    }),
                     description: t("cmdk.confirmWakeDesc", {
                       id: a.agent_id,
                       defaultValue:
-                        "会向该 agent 投递一条手动唤醒消息并推动它继续处理当前工作。仅在确认它确实需要人工唤醒时使用。",
+                        "一般不用点——卡住时系统会自动催。只有它还在睡、自动催没用时再用。",
                     }),
-                    confirmLabel: t("cmdk.confirmWake", "唤醒"),
+                    confirmLabel: t("cmdk.confirmWake", "催一下"),
                     onConfirm: async () => {
                       try {
                         await api.wakeAgent(a.agent_id);
                         toast.success(
                           t("cmdk.wakeOk", {
                             role: a.role,
-                            defaultValue: "已唤醒 {{role}}",
+                            defaultValue: "已催促 {{role}}",
                           }),
                         );
                       } catch (e) {
                         toast.error(
                           t("cmdk.wakeFailed", {
-                            defaultValue: "唤醒失败",
+                            defaultValue: "催促失败",
                           }),
                           { description: (e as Error)?.message },
                         );

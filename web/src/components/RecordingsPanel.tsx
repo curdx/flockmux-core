@@ -94,9 +94,7 @@ export function RecordingsPanel({ refreshTick }: Props) {
           name="recording-agent-filter"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          placeholder={t("recordings.filterPlaceholder", {
-            defaultValue: "按 agent_id 过滤",
-          })}
+          placeholder={t("recordings.filterPlaceholder")}
           style={{ ...input, flex: 1 }}
           onKeyDown={(e) => {
             if (e.key === "Enter") refresh();

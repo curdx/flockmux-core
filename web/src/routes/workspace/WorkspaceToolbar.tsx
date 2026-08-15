@@ -1,16 +1,21 @@
 /**
- * Workspace chrome: the per-view tab bar (chat / dag / ledger / replays) with
- * its LIVE + unread-jump actions, plus the Outlet cross-fade wrapper. Extracted
+ * Workspace chrome: the per-view tab bar (chat + optional advanced views) with
+ * LIVE + unread-jump actions, plus the Outlet cross-fade wrapper. Extracted
  * from Shell.tsx so the layout route stays focused on data orchestration.
  *
- * `buildTabs` is exported because Shell registers the ⌘1-4 global shortcut that
+ * Default UI shows **chat only**; DAG / ledger / fusion / consult / replays
+ * sit behind an 「高级」disclosure so strangers aren't hit with a six-tab
+ * author console on first open (road-to-100 上手建议).
+ *
+ * `buildTabs` is exported because Shell registers the ⌘1-6 global shortcut that
  * navigates to these same tab targets — one definition, two consumers.
  */
 
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import {
+  ChevronDown,
   ClipboardList,
   GitBranch,
   GitMerge,
@@ -37,9 +42,11 @@ interface TabDef {
   to: string;
   labelKey: string;
   icon: typeof MessageSquare;
-  // ⌘1 / ⌘2 / ⌘3 / ⌘4 shortcut (1-based). Shell registers a global
+  // ⌘1 / ⌘2 / … shortcut (1-based). Shell registers a global
   // keydown handler that maps Meta/Ctrl + digit → navigate(tab.to).
   shortcut: number;
+  /** Hidden behind 「高级」 until the user expands or lands on the route. */
+  advanced?: boolean;
 }
 
 export function buildTabs(wsId: string, threadSlug?: string): TabDef[] {
@@ -49,11 +56,41 @@ export function buildTabs(wsId: string, threadSlug?: string): TabDef[] {
   const base = directionBase(wsId, threadSlug);
   return [
     { to: `${base}`, labelKey: "chat.tabs.chat", icon: MessageSquare, shortcut: 1 },
-    { to: `${base}/dag`, labelKey: "chat.tabs.dag", icon: GitBranch, shortcut: 2 },
-    { to: `${base}/ledger`, labelKey: "chat.tabs.ledger", icon: ClipboardList, shortcut: 3 },
-    { to: `${base}/fusion`, labelKey: "chat.tabs.fusion", icon: Swords, shortcut: 4 },
-    { to: `${base}/consult`, labelKey: "chat.tabs.consult", icon: Users, shortcut: 5 },
-    { to: `${base}/replays`, labelKey: "chat.tabs.replays", icon: Play, shortcut: 6 },
+    {
+      to: `${base}/dag`,
+      labelKey: "chat.tabs.dag",
+      icon: GitBranch,
+      shortcut: 2,
+      advanced: true,
+    },
+    {
+      to: `${base}/ledger`,
+      labelKey: "chat.tabs.ledger",
+      icon: ClipboardList,
+      shortcut: 3,
+      advanced: true,
+    },
+    {
+      to: `${base}/fusion`,
+      labelKey: "chat.tabs.fusion",
+      icon: Swords,
+      shortcut: 4,
+      advanced: true,
+    },
+    {
+      to: `${base}/consult`,
+      labelKey: "chat.tabs.consult",
+      icon: Users,
+      shortcut: 5,
+      advanced: true,
+    },
+    {
+      to: `${base}/replays`,
+      labelKey: "chat.tabs.replays",
+      icon: Play,
+      shortcut: 6,
+      advanced: true,
+    },
   ];
 }
 
@@ -79,6 +116,8 @@ export function WorkspaceToolbar({
 }) {
   const { t } = useTranslation();
   const tabs = buildTabs(workspace.id, threadSlug);
+  const primaryTabs = useMemo(() => tabs.filter((tab) => !tab.advanced), [tabs]);
+  const advancedTabs = useMemo(() => tabs.filter((tab) => tab.advanced), [tabs]);
   const platform = getClientPlatformInfo();
   const location = useLocation();
   const navigate = useNavigate();
@@ -88,15 +127,32 @@ export function WorkspaceToolbar({
   // Detect we're on chat by an exact path match against the chat tab's target.
   const chatTo = tabs[0].to;
   const onChatTab = location.pathname === chatTo;
+  const onAdvancedRoute = advancedTabs.some(
+    (tab) => location.pathname === tab.to || location.pathname.startsWith(`${tab.to}/`),
+  );
+  // Session-only expand — do NOT persist to localStorage. Persisting "1" once
+  // left strangers (and returning chat sessions) stuck with the six-tab author
+  // console forever (UX-003). Deep links / ⌘2-6 still auto-reveal; leaving
+  // those routes collapses again so chat stays a single primary surface.
+  const [userExpanded, setUserExpanded] = useState(false);
+  const wasOnAdvanced = useRef(onAdvancedRoute);
+  useEffect(() => {
+    if (wasOnAdvanced.current && !onAdvancedRoute) {
+      setUserExpanded(false);
+    }
+    wasOnAdvanced.current = onAdvancedRoute;
+  }, [onAdvancedRoute]);
+  const advancedOpen = userExpanded || onAdvancedRoute;
+  const visibleTabs = advancedOpen ? tabs : primaryTabs;
   // M4: bind the "LIVE" badge to the REAL socket connection, not just the
   // member count. After the WS drops (network blip / server restart) the REST
   // member snapshot lingers, so a count-only badge kept claiming "LIVE" over a
   // dead feed. Now it dims to an honest "离线" until the feed reconnects.
   const feedConnected = useSwarmFeedStatus() === "open";
 
-  // "合并到主线" is offered only for a non-main direction that actually has its
-  // own branch (isolated worktree, ready) — a shared/main direction has nothing
-  // to merge.
+  // "合并到主线" only when the direction has commits ahead of main. Showing
+  // it for ahead=0+behind>N (already merged / stale) opens a dead-end dialog
+  // that says「无需合并」while the sidebar still flashes ↓N — UX-028.
   const [mergeOpen, setMergeOpen] = useState(false);
   const activeThread = workspace.threads.find((th) => th.slug === threadSlug);
   const activeThreadLabel =
@@ -105,11 +161,14 @@ export function WorkspaceToolbar({
       : activeThread?.name?.trim() ||
         activeThread?.slug ||
         t("chat.directionUnnamed");
+  const ahead = activeThread?.ahead ?? 0;
+  const behind = activeThread?.behind ?? 0;
   const canMerge =
     !!activeThread &&
     activeThread.slug !== "main" &&
     activeThread.isolation === "worktree" &&
-    activeThread.state === "ready";
+    activeThread.state === "ready" &&
+    ahead > 0;
 
   return (
     <div className="shrink-0 border-b border-border-subtle">
@@ -138,7 +197,7 @@ export function WorkspaceToolbar({
         )}
       </div>
       <nav className="flex h-10 items-center gap-1 px-3">
-        {tabs.map((tab) => {
+        {visibleTabs.map((tab) => {
         const Icon = tab.icon;
         return (
           <NavLink
@@ -166,6 +225,31 @@ export function WorkspaceToolbar({
         );
         })}
 
+        <button
+          type="button"
+          onClick={() => setUserExpanded((v) => !v)}
+          aria-expanded={advancedOpen}
+          title={t("chat.tabs.advancedHint", {
+            defaultValue: "协作图、工作记录、竞赛、多模对比、录像",
+          })}
+          className={cn(
+            "relative flex min-h-8 shrink-0 items-center gap-1 px-2.5 py-2 text-xs transition-colors",
+            advancedOpen
+              ? "text-foreground-primary"
+              : "text-foreground-secondary hover:text-foreground-primary",
+          )}
+        >
+          <span className="hidden whitespace-nowrap lg:inline">
+            {t("chat.tabs.advanced", { defaultValue: "高级" })}
+          </span>
+          <ChevronDown
+            className={cn(
+              "size-3.5 shrink-0 transition-transform",
+              advancedOpen && "rotate-180",
+            )}
+          />
+        </button>
+
         <span className="flex-1" />
 
       {/* 合并到主线 — 只在「非 main + 已隔离 worktree 方向」出现。 */}
@@ -185,6 +269,8 @@ export function WorkspaceToolbar({
           <MergeDialog
             open={mergeOpen}
             onOpenChange={setMergeOpen}
+            ahead={ahead}
+            behind={behind}
             workspaceId={workspace.workspaceId}
             threadId={activeThread.id}
             threadName={activeThread.name || activeThread.slug}

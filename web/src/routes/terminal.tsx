@@ -216,7 +216,7 @@ export default function TerminalRoute() {
                 {error
                   ? t("terminal.backendDown", {
                       defaultValue:
-                        "连接不上后端 (127.0.0.1:7777)，无法打开终端。请确认 swarmx 服务在运行。",
+                        "暂时打不开终端。若顶部有「重启」请点一下，或重新打开应用。",
                     })
                   : t("terminal.disconnected", { defaultValue: "连接已断开" })}
               </span>
@@ -262,7 +262,7 @@ export default function TerminalRoute() {
                   {error
                     ? t("terminal.backendDown", {
                         defaultValue:
-                          "连接不上后端 (127.0.0.1:7777)，无法打开终端。请确认 swarmx 服务在运行。",
+                          "暂时打不开终端。若顶部有「重启」请点一下，或重新打开应用。",
                       })
                     : t("terminal.confirmDesc", {
                         workspace: activeWs?.name ?? t("common.all"),

@@ -1,24 +1,30 @@
-//! Per-CLI behavior adapters.
+//! Per-CLI **pre-spawn** adapters (honest scope — see CONTEXT.md `EngineAdapter`).
 //!
-//! swarmx drives several coding CLIs — claude, codex, opencode — through one
-//! spawn pipeline. Everything those CLIs DISAGREE on lives here, ONE
-//! self-contained module per CLI:
+//! swarmx drives several coding CLIs — claude, codex, opencode, reasonix, zulu,
+//! kimi — through one spawn pipeline. What lives here is ONLY what those CLIs
+//! disagree on **before** the process is up:
 //!   - where per-workspace trust is recorded,
 //!   - how the swarmx-swarm MCP server is injected,
-//!   - how the wake hook is installed,
-//!   - which argv / env a headless launch needs,
-//!   - how a turn's prompt is delivered (keystroke vs opencode's TUI HTTP API).
+//!   - how the wake / stop hook is installed,
+//!   - argv / env tweaks for the PTY launch,
+//!   - optional transcript session id pinning.
+//!
+//! What does **NOT** live here (do not pretend otherwise):
+//!   - live turn delivery (PTY paste / TUI HTTP / serve HTTP) →
+//!     [`crate::input_delivery`] (TurnDelivery);
+//!   - serve / TUI port allocation → [`crate::spawn`] matching
+//!     [`crate::plugins::InputDelivery`];
+//!   - reasonix / zulu / opencode drivers → `reasonix_serve` / `zulu_serve` /
+//!     `opencode_tui`.
 //!
 //! The GENERIC machinery (PTY pump, ready-plan dialog answerer, health scanner,
-//! model/effort overlay) lives in `spawn.rs` and never branches on a CLI id — it
-//! asks the adapter at each seam.
+//! model/effort overlay) lives in `spawn.rs` and asks this adapter only at the
+//! pre-spawn seams above.
 //!
-//! Adding a CLI is therefore additive and local: drop a `cli/<name>.rs`
-//! implementing [`CliAdapter`], add one arm to [`adapter_for`], and ship a
-//! `cli-plugins/<name>.toml`. If the new CLI reuses an existing family's config
-//! formats, the first two steps collapse to "nothing" — [`adapter_for`] already
-//! routes it. Two CLIs never share a function body by accident; they are
-//! dispatched as separate objects.
+//! Adding a CLI: drop a `cli/<name>.rs` implementing [`CliAdapter`], ensure
+//! [`adapter_for`] routes its formats, and ship a `cli-plugins/<name>.toml`.
+//! Live delivery knobs go in the plugin's `input_delivery` field + TurnDelivery,
+//! not in this trait.
 
 mod shared;
 
@@ -51,9 +57,12 @@ pub struct PreSpawnCtx {
     pub server_url: String,
 }
 
-/// One CLI's spawn behavior. Each method is a SEAM where CLIs differ; a default
-/// no-op means "this CLI doesn't need that seam". Implementors live in sibling
-/// modules ([`claude`], [`codex`], [`opencode`]) and never reference each other.
+/// One CLI's **pre-spawn** behavior. Each method is a SEAM where CLIs differ at
+/// launch time; a default no-op means "this CLI doesn't need that seam".
+/// Implementors live in sibling modules and never reference each other.
+///
+/// Not a full engine facade: turn delivery and serve drivers are outside this
+/// trait (see module docs).
 pub trait CliAdapter: Send + Sync {
     /// Stable id for logs (matches the canonical plugin id of this CLI family).
     fn name(&self) -> &'static str;

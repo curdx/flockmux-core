@@ -69,8 +69,13 @@ export interface WorkspaceShellData {
   /** Alive agents in the active direction (subset of `activeWs.members`). */
   threadMembers: AgentInfo[];
   /** Active-direction agents that exited without delivering their declared
-   *  handoff (`handoff_missing`). Empty in the healthy case. */
+   *  handoff (`handoff_missing` 或 `handoff_failed`). Empty in the healthy case. */
   handoffMissingAgents: AgentInfo[];
+  /** 「需要我」收件箱(NeedsYouBar)的输入:活着的成员 + 本工作空间已退出但
+   *  未交付 handoff 的 agent(`handoff_missing` / `handoff_failed`)。后者不在
+   *  members 里 —— 不补上,「worker 没交付就死了」永远到不了 deriveNeedsYou。
+   *  stalled 不用单独补:server 只对活着的 agent 置位,已在 members 里。 */
+  needsYouMembers: AgentInfo[];
   liveMessages: MessageRecord[];
   liveRead: LiveRead | null;
   /** Per-agent live state + latest activity, accumulated incrementally from
@@ -567,17 +572,36 @@ export function useWorkspaceShellData(
   );
 
   // Agents in THIS direction that exited without delivering their declared
-  // handoff (premature/silent handoff — neither success nor `.error` key on the
-  // blackboard; computed server-side as `handoff_missing`). These are gone from
-  // the alive lists, so we filter the full `agents` roster. The chat surfaces
-  // them so a finished-looking turn that silently dropped work doesn't mislead.
+  // handoff. Server 两种旗都算「没交」:
+  //   - handoff_missing — silent(无 `.error`)
+  //   - handoff_failed  — 写了 `<key>.error`(kill/崩溃常见路径)
+  // 只认 missing 会漏掉真实用户杀进程(UX-016)。已退出 agent 不在
+  // activeWs.members,必须从全量 agents 捞。
   const handoffMissingAgents = useMemo(
     () =>
       activeWs
-        ? agents.filter((a) => a.handoff_missing && agentInActiveThread(a))
+        ? agents.filter(
+            (a) =>
+              (a.handoff_missing || a.handoff_failed) && agentInActiveThread(a),
+          )
         : [],
     [agents, activeWs, agentInActiveThread],
   );
+
+  // 「需要我」收件箱的输入 = 活着的成员 + 本工作空间已退出但未交付 handoff 的
+  // agent(missing 或 failed)。不并进输入,「worker 没交付就死了」永远出不来。
+  const needsYouMembers = useMemo(() => {
+    if (!activeWs) return [];
+    const undelivered = agents.filter(
+      (a) =>
+        (a.handoff_missing || a.handoff_failed) &&
+        a.workspace_id === activeWs.workspaceId,
+    );
+    if (undelivered.length === 0) return activeWs.members;
+    const seen = new Set(activeWs.members.map((a) => a.agent_id));
+    const extra = undelivered.filter((a) => !seen.has(a.agent_id));
+    return [...activeWs.members, ...extra];
+  }, [agents, activeWs]);
 
   // Unread is scoped to the ACTIVE direction (not the whole workspace) so the
   // toolbar badge + per-member counts match the room the user is looking at —
@@ -657,6 +681,7 @@ export function useWorkspaceShellData(
     threadAgentIds,
     threadMembers,
     handoffMissingAgents,
+    needsYouMembers,
     liveMessages,
     liveRead,
     agentStateById,

@@ -61,7 +61,13 @@
 
 ---
 
-## 3. 方案 B —— ACP（后做，结构化升级）
+## 3. 方案 B —— ACP（已取消，实现已删除）
+
+> **已废止**：ACP 曾有完整实现（`acp.rs` codec + `Connection`、`acp_engine.rs`、
+> `Transport` 枚举），2026-06-17 在 commit `b60b2d2` 整体删除。原因：opencode
+> 改走 PTY + 官方 `/tui` HTTP 控制接口（方案 A 的落地形态）后，大 prompt 注入
+> 问题被 `/tui/*` API 直接解决，ACP 传输失去存在意义。下表仅作历史设计存档，
+> 其中引用的 `acp.rs`、`transport=acp` seam、`structured_args` 均已不存在。
 
 **思路**：swarmx 当 ACP client 驱动 `opencode acp`，**自掌 turn 循环** —— 唤醒问题直接消失、拿真 tool/permission/streaming 事件、不 tail 文件、不要插件。
 

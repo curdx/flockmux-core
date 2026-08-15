@@ -42,6 +42,11 @@ requires_explicit_billing_opt_in = false
 # guards. Strip the whole family by default; an explicit per-user plugin
 # overlay can re-enable it deliberately.
 blocked_env_prefixes = ["KIMI_MODEL_"]
+# No provider env forwarded at all: kimi authenticates via `kimi login` OAuth
+# under ~/.kimi-code/ (home_env passthrough), and the ambient KIMI_MODEL_*
+# API-key override family is blocked above. Empty declaration = no provider
+# keys (ANTHROPIC_/OPENAI_/DEEPSEEK_ included) reach this full-shell agent.
+provider_env_prefixes = []
 
 # No workspace trust gate in kimi.
 auto_trust_workspace = false

@@ -354,38 +354,32 @@ pub fn spawn_agent(
         }
     }
     // Provider config/creds the inner CLI authenticates with, matched by
-    // prefix so e.g. ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / OPENAI_BASE_URL
-    // pass through (a worker still authenticates), while unrelated *_TOKEN /
-    // *_KEY shell secrets do NOT. `or_insert` so explicit entries below (e.g.
-    // per-agent CODEX_HOME) always win over an inherited value.
+    // prefix so e.g. ANTHROPIC_BASE_URL / OPENAI_BASE_URL pass through to the
+    // CLI that declared them, while unrelated *_TOKEN / *_KEY shell secrets
+    // do NOT. `or_insert` so explicit entries below (e.g. per-agent
+    // CODEX_HOME) always win over an inherited value.
+    //
+    // SECURITY: each plugin declares ITS OWN provider prefixes
+    // (`provider_env_prefixes` in cli-plugins/<id>.toml) and only those are
+    // forwarded. The previous hard-coded ANTHROPIC_/OPENAI_/CLAUDE_/DEEPSEEK_
+    // list handed every provider's keys to every plugin — codex children got
+    // ANTHROPIC_API_KEY, claude children got DEEPSEEK_API_KEY — and these
+    // CLIs are full-shell agents, so an ambient foreign key is plaintext
+    // handed to the model. `blocked_env_prefixes` still intersects (claude
+    // declares ANTHROPIC_ but blocks it by default — the billing red line).
     for (k, v) in std::env::vars() {
-        if env_blocked(plugin, &k) {
+        if forward_provider_env(plugin, &k) {
+            env.entry(k).or_insert(v);
+        } else if provider_env_declared(plugin, &k) && env_blocked(plugin, &k) {
+            // A prefix this plugin DID declare but blocks by policy (claude's
+            // ANTHROPIC_ — the billing red line) is worth a debug line;
+            // undeclared vars are the normal case and stay silent.
             tracing::debug!(
                 agent = %agent_id,
                 cli = %plugin.id,
                 env = %k,
                 "provider env var blocked by plugin policy"
             );
-            continue;
-        }
-        // Claude Code runtime/nesting markers (CLAUDECODE, CLAUDE_CODE_*,
-        // CLAUDE_EFFORT) ALSO match the `CLAUDE_` provider prefix, but they are
-        // NOT provider creds — they're harness markers the outer Claude Code
-        // sets. If the swarmx server was itself launched from inside a Claude
-        // Code session (or these are exported globally), forwarding them makes
-        // the spawned `claude` believe it is a NESTED child session: it then
-        // refuses to write its own `~/.claude/projects/<cwd>/<id>.jsonl`
-        // transcript — which silently breaks usage/cost collection for the
-        // captain (the tailer never finds a file) and risks nested-session
-        // hangs. Strip them so every spawned claude is a clean top-level run.
-        if is_claude_code_nesting_marker(&k) {
-            continue;
-        }
-        if ["ANTHROPIC_", "OPENAI_", "CLAUDE_", "DEEPSEEK_"]
-            .iter()
-            .any(|p| k.starts_with(p))
-        {
-            env.entry(k).or_insert(v);
         }
     }
     // Identity env passed to the CLI. codex picks `SWARMX_AGENT_ID` /
@@ -541,13 +535,40 @@ fn env_blocked(plugin: &CliPlugin, key: &str) -> bool {
         .any(|p| !p.is_empty() && key.starts_with(p))
 }
 
-/// Claude Code's own harness/nesting markers, which a spawned `claude` must
-/// NOT inherit (see the call site in `build_command` for the full rationale:
-/// inheriting them flips claude into nested-child mode and suppresses its
-/// session transcript, breaking usage collection). These all happen to match
-/// the `CLAUDE_` provider-cred prefix, so they need an explicit exclusion.
-/// `CLAUDECODE` lacks the underscore and wouldn't match the prefix anyway, but
-/// is listed here as defense in case the prefix list changes.
+/// True iff `key` matches one of the prefixes the plugin itself declared in
+/// `provider_env_prefixes`. spawn forwards ONLY declared prefixes (see the
+/// security note at the call site): a full-shell agent must never inherit a
+/// provider key its own CLI doesn't authenticate with.
+fn provider_env_declared(plugin: &CliPlugin, key: &str) -> bool {
+    plugin
+        .provider_env_prefixes
+        .iter()
+        .any(|p| !p.is_empty() && key.starts_with(p))
+}
+
+/// The full forwarding decision for a provider-env candidate: declared by
+/// this plugin AND not blocked by it AND not a Claude Code nesting marker.
+/// Extracted as one function so the cross-plugin isolation matrix test
+/// exercises the exact gate the spawn loop applies.
+fn forward_provider_env(plugin: &CliPlugin, key: &str) -> bool {
+    provider_env_declared(plugin, key)
+        && !env_blocked(plugin, key)
+        && !is_claude_code_nesting_marker(key)
+}
+
+/// Claude Code's own harness/nesting markers (CLAUDECODE, CLAUDE_CODE_*,
+/// CLAUDE_EFFORT), which a spawned `claude` must NOT inherit. They are NOT
+/// provider creds — they're harness markers an OUTER Claude Code sets, but
+/// they happen to match the `CLAUDE_` provider prefix. If the swarmx server
+/// was itself launched from inside a Claude Code session (or these are
+/// exported globally), forwarding them makes the spawned `claude` believe it
+/// is a NESTED child session: it then refuses to write its own
+/// `~/.claude/projects/<cwd>/<id>.jsonl` transcript — which silently breaks
+/// usage/cost collection for the captain (the tailer never finds a file) and
+/// risks nested-session hangs. Strip them so every spawned claude is a clean
+/// top-level run. `CLAUDECODE` lacks the underscore and wouldn't match the
+/// prefix anyway, but is listed here as defense in case the prefix list
+/// changes.
 fn is_claude_code_nesting_marker(key: &str) -> bool {
     key == "CLAUDECODE" || key == "CLAUDE_EFFORT" || key.starts_with("CLAUDE_CODE")
 }
@@ -1331,6 +1352,7 @@ mod billing_policy_tests {
             billing_surface: BillingSurface::Unknown,
             requires_explicit_billing_opt_in: false,
             blocked_env_prefixes: Vec::new(),
+            provider_env_prefixes: Vec::new(),
             auto_trust_workspace: false,
             auto_dismiss_update: false,
             auto_inject_mcp: false,
@@ -1361,6 +1383,73 @@ mod billing_policy_tests {
         assert!(env_blocked(&p, "ANTHROPIC_API_KEY"));
         assert!(env_blocked(&p, "ANTHROPIC_BASE_URL"));
         assert!(!env_blocked(&p, "OPENAI_API_KEY"));
+    }
+
+    /// Spawn forwards a provider env var only when the plugin's own manifest
+    /// declares the prefix — unit-level pin of the per-plugin scoping before
+    /// the shipped-manifest matrix below.
+    #[test]
+    fn provider_env_requires_plugin_declaration() {
+        let mut p = minimal_plugin("reasonix");
+        // Undeclared: nothing crosses, even a prefix some OTHER plugin uses.
+        assert!(!forward_provider_env(&p, "DEEPSEEK_API_KEY"));
+        assert!(!forward_provider_env(&p, "OPENAI_API_KEY"));
+        // Declared: crosses.
+        p.provider_env_prefixes = vec!["DEEPSEEK_".into()];
+        assert!(forward_provider_env(&p, "DEEPSEEK_API_KEY"));
+        assert!(!forward_provider_env(&p, "ANTHROPIC_API_KEY"));
+        // Declared + blocked: the block still wins (the claude/ANTHROPIC_
+        // billing-red-line shape).
+        p.blocked_env_prefixes = vec!["DEEPSEEK_".into()];
+        assert!(!forward_provider_env(&p, "DEEPSEEK_API_KEY"));
+    }
+
+    /// SECURITY matrix over the compiled-in shipped manifests: every CLI here
+    /// is a full-shell agent, so a provider key in its env is plaintext handed
+    /// to the model. Pin that `ANTHROPIC_*` reaches NO child (claude declares
+    /// the prefix only to keep an explicit user opt-in reachable — the default
+    /// block wins), `DEEPSEEK_*` reaches reasonix ONLY, and `OPENAI_*` reaches
+    /// codex ONLY.
+    #[test]
+    fn provider_env_isolation_matrix_across_shipped_plugins() {
+        let reg = crate::plugins::PluginRegistry::builtin();
+        let get = |id: &str| reg.get(id).unwrap_or_else(|| panic!("{id} plugin present"));
+        let all = ["claude", "codex", "opencode", "reasonix", "zulu", "kimi"];
+
+        for id in all {
+            assert!(
+                !forward_provider_env(get(id), "ANTHROPIC_API_KEY"),
+                "ANTHROPIC_API_KEY must not enter the {id} child"
+            );
+            assert!(
+                !forward_provider_env(get(id), "ANTHROPIC_BASE_URL"),
+                "ANTHROPIC_BASE_URL must not enter the {id} child"
+            );
+        }
+        for id in all {
+            let expect = id == "reasonix";
+            assert_eq!(
+                forward_provider_env(get(id), "DEEPSEEK_API_KEY"),
+                expect,
+                "DEEPSEEK_API_KEY reaches reasonix only, not {id}"
+            );
+        }
+        for id in all {
+            let expect = id == "codex";
+            assert_eq!(
+                forward_provider_env(get(id), "OPENAI_API_KEY"),
+                expect,
+                "OPENAI_API_KEY reaches codex only, not {id}"
+            );
+        }
+        // claude keeps its own CLAUDE_ config family, minus the nesting
+        // markers (those flip a spawned claude into transcript-suppressing
+        // nested-child mode).
+        assert!(forward_provider_env(get("claude"), "CLAUDE_CONFIG_DIR"));
+        assert!(!forward_provider_env(
+            get("claude"),
+            "CLAUDE_CODE_ENTRYPOINT"
+        ));
     }
 
     #[test]

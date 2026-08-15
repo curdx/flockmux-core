@@ -14,10 +14,20 @@ default_args = ["--dangerously-bypass-approvals-and-sandbox"]
 home_env = "HOME"
 billing_surface = "cli-account"
 requires_explicit_billing_opt_in = false
-# Pre-spawn ensures ~/.codex/config.toml carries one global
-# `[mcp_servers.swarmx-swarm]` block. Per-spawn agent identity rides in
-# via the SWARMX_AGENT_ID env passthrough (codex spawns the MCP
-# subprocess with the parent's env restricted to env_vars whitelist).
+# Provider env forwarded at spawn: codex's own OpenAI family only
+# (OPENAI_API_KEY / OPENAI_BASE_URL), for users on API-key auth instead of
+# `codex login` OAuth. spawn.rs forwards ONLY declared prefixes —
+# ANTHROPIC_/DEEPSEEK_/etc. never reach the codex child (it is a full-shell
+# agent; an ambient foreign key would be plaintext handed to the model).
+provider_env_prefixes = ["OPENAI_"]
+# Pre-spawn writes a PER-AGENT CODEX_HOME (~/.swarmx/codex-home/<agent_id>/
+# config.toml) that inherits the user's ~/.codex MCP servers and adds this
+# agent's own [mcp_servers.swarmx-swarm] block; spawn then points the child at
+# it via the CODEX_HOME env var. The user's global ~/.codex/config.toml is NOT
+# mutated — a stale swarmx section left there by older versions is
+# self-healed away (see cli/codex.rs). Per-spawn agent identity rides in via
+# the SWARMX_AGENT_ID env passthrough (codex spawns the MCP subprocess with
+# the parent's env restricted to the env_vars whitelist).
 auto_inject_mcp = true
 # Codex prints "Update available! Press enter to continue" on startup which
 # blocks the headless PTY. Pre-spawn we set
@@ -43,7 +53,7 @@ auto_inject_stop_hook = true
 # these, NOT on `id`. spawn.rs also gates the `--dangerously-bypass-hook-trust`
 # probe on `stop_hook_format = "codex-hooks-json"`.
 trust_format     = "codex-toml"        # appended [projects."<ws>"] trust_level
-mcp_format       = "codex-global-toml" # global [mcp_servers.swarmx-swarm] in ~/.codex/config.toml
+mcp_format       = "codex-global-toml" # per-agent CODEX_HOME config (name is historical, see plugins.rs)
 stop_hook_format = "codex-hooks-json"  # <ws>/.codex/hooks.json (timeout seconds)
 stop_hook_timeout = 10                 # SECONDS (codex's hook schema unit; ms would be 2.7h)
 input_settle_ms = 300                  # codex's ratatui input poll attaches ~120-180ms after ready

@@ -223,17 +223,33 @@ impl PtyBridge {
                     if group > 0 && group != own_pgid {
                         // Graceful: ask the whole group to terminate.
                         libc::killpg(group, libc::SIGTERM);
-                        // Brief grace (~1s) for the CLI to flush; poll the
-                        // direct child without holding the lock across sleeps.
-                        let mut exited = false;
+                        // Brief grace (~1s) for the CLI to flush. Completion is
+                        // judged by the *process group* going empty — NOT by the
+                        // shim (direct child) exiting. The shim installs no
+                        // SIGTERM handler and dies instantly, so a shim-exit
+                        // check would skip the SIGKILL even when the real CLI
+                        // trapped SIGTERM and is still running inside the group
+                        // — orphaning it to keep burning API tokens.
+                        // killpg(group, 0) probes without signalling: ESRCH ==
+                        // group is empty. Any other outcome (0, EPERM) means
+                        // "still alive" — the safe direction. We also reap the
+                        // shim each pass: a zombie still counts as a group
+                        // member and would otherwise pin the group until the
+                        // final wait() below. The child lock is never held
+                        // across the sleep.
+                        let mut group_empty = false;
                         for _ in 0..20 {
-                            if matches!(self.child.lock().try_wait(), Ok(Some(_))) {
-                                exited = true;
+                            let _ = self.child.lock().try_wait();
+                            if libc::killpg(group, 0) != 0
+                                && std::io::Error::last_os_error().raw_os_error()
+                                    == Some(libc::ESRCH)
+                            {
+                                group_empty = true;
                                 break;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(50));
                         }
-                        if !exited {
+                        if !group_empty {
                             libc::killpg(group, libc::SIGKILL);
                         }
                     } else {
@@ -301,9 +317,18 @@ fn spawn_reader(
                         }
                     }
                     Err(err) => {
-                        // EIO on the master fd after slave closes is the
-                        // normal exit path on Linux; treat as EOF.
-                        warn!(?err, "pty reader: read error");
+                        // EIO on the master fd after the slave side closes is
+                        // the normal exit path on Linux — the child exited,
+                        // nothing is wrong. Anything else is a real error.
+                        #[cfg(unix)]
+                        let is_exit_eio = err.raw_os_error() == Some(libc::EIO);
+                        #[cfg(not(unix))]
+                        let is_exit_eio = false;
+                        if is_exit_eio {
+                            debug!(?err, "pty reader: EIO (child exited)");
+                        } else {
+                            warn!(?err, "pty reader: read error");
+                        }
                         break;
                     }
                 }
@@ -458,5 +483,89 @@ mod tests {
             panic!("expected empty-argv to be rejected, got Ok(_)")
         };
         assert!(err.to_string().contains("argv must not be empty"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_sigkills_group_survivor_after_shim_death() {
+        // Regression: the shim (direct child) installs no SIGTERM handler and
+        // dies instantly on the group SIGTERM, but the real CLI may trap it.
+        // kill() must judge grace completion by the *process group* going
+        // empty — not by the shim exiting — and SIGKILL the survivor.
+        //
+        // sh is the direct child (default SIGTERM disposition → dies). The
+        // backgrounded subshell traps/ignores SIGTERM; a non-interactive sh
+        // has no job control, so it stays in sh's process group. SIGHUP must
+        // be ignored too: sh is the session leader, and when it dies the
+        // kernel SIGHUPs the foreground process group — without that the
+        // survivor would die of SIGHUP and the test could not tell a
+        // missing SIGKILL apart from a delivered one.
+        let handles = PtyBridge::spawn(SpawnOpts {
+            argv: &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "(trap '' TERM HUP; echo SURVIVOR_READY; sleep 300) & wait".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+        })
+        .expect("spawn sh");
+        let PtyHandles { bridge, mut output_rx } = handles;
+
+        block_on(async move {
+            // SURVIVOR_READY prints only after the trap is installed, so the
+            // survivor is guaranteed SIGTERM-immune before we kill.
+            let mut got = Vec::new();
+            for _ in 0..50 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    output_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(chunk)) => got.extend_from_slice(&chunk),
+                    _ => break,
+                }
+                if got.windows(b"SURVIVOR_READY".len()).any(|w| w == b"SURVIVOR_READY") {
+                    break;
+                }
+            }
+            assert!(
+                got.windows(b"SURVIVOR_READY".len()).any(|w| w == b"SURVIVOR_READY"),
+                "survivor never became ready; got = {:?}",
+                String::from_utf8_lossy(&got)
+            );
+        });
+
+        // portable-pty setsid's the child, so the group id is the sh pid;
+        // resolve via getpgid anyway in case that ever changes.
+        let pid = bridge.pid().expect("sh pid") as libc::pid_t;
+        let pgid = unsafe { libc::getpgid(pid) };
+        assert!(pgid > 0, "getpgid failed for child {pid}");
+
+        bridge.kill();
+
+        // The SIGKILLed survivor is reaped asynchronously by init after the
+        // shim dies, so poll briefly for the group to drain instead of
+        // asserting on the first probe (a zombie still counts as a member).
+        // With the old shim-exit check this never drains within the timeout:
+        // no SIGKILL is sent and the survivor sleeps on for 300s.
+        let mut group_empty = false;
+        for _ in 0..60 {
+            let probe = unsafe { libc::killpg(pgid, 0) };
+            if probe != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                group_empty = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            group_empty,
+            "process group {pgid} still alive after kill(): SIGTERM-trapping survivor was orphaned"
+        );
     }
 }

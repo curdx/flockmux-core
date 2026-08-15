@@ -2,10 +2,10 @@
 id = "reviewer"
 name = "Code Reviewer"
 description = "审查代码改动的正确性与质量。"
-default_cli = "claude"
+default_cli = "codex"
 default_model_tier = "sonnet"
 when_to_use = "代码改动需要独立审查时选它；通常 consumes 上游实现者的产出。应与生产者用不同 CLI/模型以获得独立视角。"
-modality = "backend"
+modality = "review"
 risk = "normal"
 produces = ["done"]
 artifact_paths = []

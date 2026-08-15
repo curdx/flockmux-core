@@ -226,7 +226,7 @@ export default function ChatHome() {
               <p className="max-w-sm font-caption text-xs text-foreground-tertiary">
                 {t("home.backendUnreachableDesc", {
                   defaultValue:
-                    "swarmx 后端 (127.0.0.1:7777) 没有响应，所以读不到你的工作空间。请确认服务在运行，然后重试。",
+                    "服务还没准备好。若顶部有「重启」请点一下；开发时请确认后端已启动，然后重试。",
                 })}
               </p>
               <Button

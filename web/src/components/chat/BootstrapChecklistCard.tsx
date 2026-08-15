@@ -1,5 +1,5 @@
 /**
- * BootstrapChecklistCard — honest "队长正在上岗…" placeholder shown in an empty
+ * BootstrapChecklistCard — honest "规划正在准备…" placeholder shown in an empty
  * room while the orchestrator is starting up, replacing the bare "暂无消息".
  *
  * P0-5/P0-6 of the chat redesign (事实律): the diagnosed P0 bug was an empty
@@ -86,7 +86,7 @@ export function BootstrapChecklistCard({
       <div className="flex items-center gap-2">
         <Loader2 className="size-4 shrink-0 animate-spin text-state-wake" />
         <p className="font-heading text-sm font-semibold text-foreground">
-          {t("chat.bootstrap.cardTitle", "队长正在上岗…")}
+          {t("chat.bootstrap.cardTitle", "规划正在准备…")}
         </p>
         <span className="ml-auto rounded-full bg-surface-elevated px-2 py-0.5 font-caption text-[10px] font-semibold text-state-wake">
           {t("chat.bootstrap.badge", "启动中")}
@@ -109,9 +109,9 @@ export function BootstrapChecklistCard({
           {engineName
             ? t("chat.bootstrap.stepEngineNamed", {
                 name: engineName,
-                defaultValue: `正在启动 {{name}} 队长引擎…`,
+                defaultValue: `正在启动 {{name}} 规划引擎…`,
               })
-            : t("chat.bootstrap.stepEngine", "正在启动队长引擎…")}
+            : t("chat.bootstrap.stepEngine", "正在启动规划引擎…")}
           {engineState === "active" && timerLabel && (
             <span className="ml-1.5 font-mono text-[11px] text-foreground-tertiary">
               {timerLabel}
@@ -119,7 +119,7 @@ export function BootstrapChecklistCard({
           )}
         </Row>
         <Row state={awaitingState}>
-          {t("chat.bootstrap.stepFirstResponse", "等待队长第一次响应")}
+          {t("chat.bootstrap.stepFirstResponse", "等待规划第一次响应")}
           {awaitingState === "active" && timerLabel && (
             <span className="ml-1.5 font-mono text-[11px] text-foreground-tertiary">
               {timerLabel}

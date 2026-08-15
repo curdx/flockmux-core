@@ -22,6 +22,15 @@ requires_explicit_billing_opt_in = false
 # reaches Claude Code, it can prefer API billing over the user's interactive
 # Claude subscription login.
 blocked_env_prefixes = ["ANTHROPIC_"]
+# Provider env families this CLI may consume (spawn.rs forwards ONLY declared
+# prefixes, still intersected with blocked_env_prefixes above). claude's own
+# config family is CLAUDE_* (e.g. CLAUDE_CONFIG_DIR; the CLAUDE_CODE_* nesting
+# markers are stripped separately in spawn.rs). ANTHROPIC_ is declared so a
+# deliberate user opt-in (dropping the block via a plugin overlay) can still
+# pass an API key through — by default the block wins and NOTHING ANTHROPIC_*
+# reaches the child. No other provider's prefix is declared: OPENAI_/DEEPSEEK_
+# keys must never enter this full-shell agent.
+provider_env_prefixes = ["ANTHROPIC_", "CLAUDE_"]
 # Workspaces we create under ~/.swarmx/workspaces/ are trusted by
 # construction; pre-patch the per-project flag so claude doesn't prompt.
 auto_trust_workspace = true

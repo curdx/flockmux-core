@@ -37,6 +37,20 @@ pub struct SpawnAgentResponse {
     pub cli: String,
     pub role: String,
     pub workspace: String,
+    /// Set when the requested CLI wasn't installed and the server substituted
+    /// an installed fallback engine: the ORIGINALLY requested plugin id
+    /// (`cli` above then names the engine that actually spawned). None when
+    /// the requested engine itself spawned. Billing red line: the fallback
+    /// filter allows API-billed engines (e.g. reasonix), so the UI MUST
+    /// surface this instead of letting a paid engine run in disguise.
+    #[serde(default)]
+    pub fallback_from: Option<String>,
+    /// Billing surface of the engine that ACTUALLY spawned, as a kebab-case
+    /// token ("interactive-subscription" | "cli-account" | "api-key" | …;
+    /// mirrors swarmx-server's BillingSurface serde rename). Lets the UI say
+    /// "按 API 计费" on a fallback without hardcoding per-engine knowledge.
+    #[serde(default)]
+    pub billing_surface: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +208,18 @@ pub struct AgentInfo {
     /// (still-running) agents are never flagged — they may yet deliver.
     #[serde(default)]
     pub handoff_missing: bool,
+    /// True when the agent looks STALLED — alive (shim ready, not exited, not
+    /// killed) yet sitting on unread mailbox mail whose oldest message has
+    /// outlived a conservative threshold while showing no activity in that
+    /// same window (computed at list time in rest.rs; see
+    /// `Store::stalled_agents_with_unread`). This is the NeedsYou inbox's
+    /// "该醒没醒" (wake chain may be broken) signal, NOT the 0.3.0
+    /// "suspected-stuck" heuristic: it only fires when something is provably
+    /// WAITING for the agent, so an idle worker (no unread) or a busy one
+    /// (fresh activity) never matches. The UI words it honestly as
+    /// "可能卡住", never "卡住了".
+    #[serde(default)]
+    pub stalled: bool,
 }
 
 /// One tool-level activity row, served by `GET /api/agent/:id/activity`. Same
@@ -289,6 +315,16 @@ pub struct SpawnWorkerResponse {
     /// consumes 解析后的 minted 依赖 key 列表(已注册到 WakeCoordinator)。
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// 请求的发动机未安装、服务端改用已安装的 fallback 发动机时,填**最初请求的**
+    /// plugin id(此时 `cli` 是实际跑起来的发动机)。None = 没发生 fallback。
+    /// 计费红线:fallback 过滤器允许 API 计费的发动机(如 reasonix),调用方
+    /// (orchestrator LLM / UI)必须把这个变化如实告知用户。
+    #[serde(default)]
+    pub fallback_from: Option<String>,
+    /// 实际 spawn 的发动机的计费面(kebab-case token,镜像 swarmx-server
+    /// BillingSurface 的 serde 命名),如 "api-key" = 按 API key 计费。
+    #[serde(default)]
+    pub billing_surface: Option<String>,
 }
 
 // ── swarm REST DTOs (M3 #18) ─────────────────────────────────────────────
@@ -378,6 +414,55 @@ pub struct MarkReadRequest {
 pub struct MarkReadResponse {
     pub marked: Vec<i64>,
     pub at: i64,
+}
+
+/// One consumed wake's inline payload (B1 wake-latency fix).
+///
+/// History: the Stop hook used to be told only "you have N wakes — go list",
+/// so the captain burned 3–5 serial LLM round-trips (`swarm_list_messages` →
+/// `swarm_read_blackboard` → …) before it could say anything. `consume_wakes`
+/// already claims the rows atomically, so the server snapshots their content
+/// here for (nearly) free and `wake-check` can digest it straight into the
+/// continuation prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumeWakeItem {
+    /// Id of the consumed `kind="wake"` message.
+    pub id: i64,
+    pub from_agent: String,
+    pub sent_at: i64,
+    /// The wake mailbox note body, e.g. "共享区 `X` 有更新，请查看".
+    #[serde(default)]
+    pub body: String,
+    /// Blackboard key the wake points at (from the message's `meta.key`),
+    /// when the wake carries one.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Snapshot of that key's content at consume time. `None` when the wake
+    /// has no key / the key no longer exists / the response's total payload
+    /// budget was already spent — callers fall back to
+    /// `swarm_read_blackboard` for those.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// True when `content` (or `body`) was cut at the per-entry cap: the
+    /// prefix is a teaser, read the key in full via `swarm_read_blackboard`.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// `POST /api/message/consume_wakes` response. `wakes` is additive —
+/// `#[serde(default)]` keeps pre-B1 clients (which read only `count`)
+/// deserializing fine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumeWakesResponse {
+    pub to: String,
+    pub count: i64,
+    pub ids: Vec<i64>,
+    /// Inline payload snapshots for (a bounded prefix of) the consumed wakes,
+    /// oldest-first. May be shorter than `ids` — or empty — under the
+    /// response's caps or when enrichment fails soft; `ids`/`count` are
+    /// always the full consumed set.
+    #[serde(default)]
+    pub wakes: Vec<ConsumeWakeItem>,
 }
 
 /// One row from `GET /api/blackboard-history/*path`. `content` is omitted by
@@ -521,6 +606,16 @@ pub struct RunSpellAgent {
     pub role: String,
     pub cli: String,
     pub agent_id: String,
+    /// Set when this agent's requested CLI wasn't installed and the server
+    /// substituted an installed fallback engine (then `cli` is the engine that
+    /// actually spawned). None = no fallback. Same billing-red-line contract
+    /// as `SpawnAgentResponse::fallback_from`: the UI must surface it loudly.
+    #[serde(default)]
+    pub fallback_from: Option<String>,
+    /// Billing surface of the engine that actually spawned (kebab-case token,
+    /// e.g. "api-key" = billed per API key).
+    #[serde(default)]
+    pub billing_surface: Option<String>,
 }
 
 // ── workspaces (Step 1 of workspace-as-first-class refactor) ─────────────
@@ -757,10 +852,12 @@ pub struct FusionContestantDiff {
     /// True if the contestant never got an isolated worktree (degraded to
     /// shared) — its work isn't separable, surfaced so the judge/UI is honest.
     pub degraded: bool,
-    /// Objective check outcome, present only when the batch carried a check_cmd
-    /// and the auto-judge ran it in this contestant's worktree. None = no gate
-    /// was run (pure-diff judging). Some(true) = check passed, Some(false) =
-    /// failed (objectively out before the LLM ever deliberates).
+    /// Objective check outcome, present when the batch carried a check_cmd and
+    /// the judge stage ran it in this contestant's worktree. Both auto AND
+    /// manual judging run the gate (manual used to skip it, silently ignoring
+    /// a check_cmd the create form had accepted). None = no gate was run
+    /// (pure-diff judging). Some(true) = check passed, Some(false) = failed
+    /// (objectively out before any deliberation).
     #[serde(default)]
     pub check_passed: Option<bool>,
     /// Tail of the check command's combined stdout/stderr (truncated), so the

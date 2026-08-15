@@ -24,7 +24,7 @@
 
 ## 一句话定位
 
-swarmx 是一个浏览器仪表盘：它把你已有的 `claude` / `codex` / `opencode` / `reasonix` CLI 二进制**原封不动**地跑在 PTY 里，通过共享收件箱（mailbox）和黑板（blackboard）让它们互相协作，完成同一个任务。它不是又一个 LLM wrapper，你的 OAuth、限流、套餐限制行为与在终端里直接敲 `claude` 完全一致。
+swarmx 是一个浏览器仪表盘：它把你已有的 `claude` / `codex` / `opencode` / `reasonix` / `zulu` / `kimi` CLI 二进制**原封不动**地跑在 PTY 里，通过共享收件箱（mailbox）和黑板（blackboard）让它们互相协作，完成同一个任务。它不是又一个 LLM wrapper，你的 OAuth、限流、套餐限制行为与在终端里直接敲 `claude` 完全一致。
 
 ---
 
@@ -49,8 +49,8 @@ axum HTTP/WS 服务 (127.0.0.1:7777)
   │     ▼
   │   PTY (portable-pty, OS 内核 pseudoterminal)
   │     │
-  │     └─► swarmx-shim  (仅约 70 行)
-  │               └─► 真实 CLI (claude / codex / opencode / reasonix)
+  │     └─► swarmx-shim  (仅约 95 行)
+  │               └─► 真实 CLI (claude / codex / opencode / reasonix / zulu / kimi)
   │                         │
   │                         └─► swarmx-mcp (stdio JSON-RPC, 另一进程)
   │                                   │  工具调用: swarm_send_message
@@ -77,22 +77,23 @@ swarmx 只有三层，没有更多：
 ┌─────────────────────────────────────────────────────────┐
 │  MCP 层 (最上层)                                         │
 │  swarmx-mcp: stdio JSON-RPC server                       │
-│  向 LLM 暴露 10 个 swarm 工具:                           │
+│  向 LLM 暴露 11 个 swarm 工具:                           │
 │    swarm_send_message  swarm_list_messages               │
 │    swarm_search_messages  swarm_list_agents              │
 │    swarm_list_blackboard  swarm_read_blackboard          │
 │    swarm_write_blackboard  swarm_spawn_worker            │
 │    swarm_list_roles  swarm_name_thread                   │
+│    swarm_fusion_consult                                  │
 ├─────────────────────────────────────────────────────────┤
 │  shim 层 (中间)                                          │
-│  swarmx-shim: ~70 行，execvp 真实 CLI                    │
+│  swarmx-shim: ~95 行，execvp 真实 CLI                    │
 │  发 OSC 序列:                                            │
 │    \x1b]633;A\x07          → ShimReady (子进程已启动)   │
 │    \x1b]633;D;<code>\x07   → ShimExit (退出码)          │
 ├─────────────────────────────────────────────────────────┤
 │  PTY 层 (最底层)                                         │
 │  未经修改的真实 CLI 二进制:                               │
-│    claude / codex / opencode / reasonix                  │
+│    claude / codex / opencode / reasonix / zulu / kimi    │
 │  OAuth、限流、套餐与你在终端里直接使用完全一致           │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -134,9 +135,9 @@ WebSocket 帧 schema + REST DTO，供 server 与各 client 共享。三个模块
 
 SQLite + FTS5 持久层。特点：
 - 连接池（r2d2）+ WAL 模式 + busy_timeout；所有 API 均为 `async`（通过 `spawn_blocking`）。
-- 25 个渐进迁移（`migrations/0001_init.sql` … `0025_message_perf_indexes.sql`），每次迁移在 `BEGIN IMMEDIATE` 事务中运行。
+- 29 个渐进迁移（`migrations/0001_init.sql` … `0029_agent_shim_pid.sql`），每次迁移在 `BEGIN IMMEDIATE` 事务中运行。
 - **版本守卫**：数据库版本 > 二进制最高版本时拒绝启动，防止旧二进制写坏新 schema。
-- 主要表：`agents`、`messages`（FTS5 全文搜索）、`blackboard_ops`、`pty_recordings`、`workspaces`、`threads`、`workers`、`cron_jobs`、`goals`、`thought_traces`、`agent_usage`、`agent_activities`。
+- 主要表：`agents`、`messages`（FTS5 全文搜索）、`blackboard_ops`、`pty_recordings`、`workspaces`、`threads`、`workers`、`cron_jobs`、`goals`、`thought_traces`、`agent_usage`、`agent_activities`、`fusion_batches`。
 
 ### swarmx-pty
 `crates/swarmx-pty/src/lib.rs`
@@ -150,7 +151,7 @@ SQLite + FTS5 持久层。特点：
 ### swarmx-shim
 `crates/swarmx-shim/src/main.rs`
 
-约 70 行。执行流程：
+约 95 行。执行流程：
 1. 向 stdout flush `\x1b]633;A\x07`（OSC_READY）。
 2. `Command::new(target).spawn()`，继承 PTY 的 stdio。
 3. `child.wait()`，退出时 flush `\x1b]633;D;<code>\x07`（OSC_EXIT）。
@@ -175,7 +176,7 @@ asciicast v2 写入器。每个 PTY 对应一个 `Recorder`，拥有 `.cast` 文
 两种运行模式（同一二进制）：
 
 **默认模式（stdio JSON-RPC MCP server）**  
-每个 agent spawn 时，server 在其 MCP 配置里注入 `swarmx-mcp --agent-id <id>` 的入口。CLI 通过 stdio 与之通信，发 `tools/list` 和 `tools/call`。10 个工具（`tools.rs`）通过 HTTP 调用 `swarmx-server` REST API，并把结果格式化为对 LLM 友好的文本。
+每个 agent spawn 时，server 在其 MCP 配置里注入 `swarmx-mcp --agent-id <id>` 的入口。CLI 通过 stdio 与之通信，发 `tools/list` 和 `tools/call`。11 个工具（`tools.rs`）通过 HTTP 调用 `swarmx-server` REST API，并把结果格式化为对 LLM 友好的文本。
 
 **`wake-check` 子命令（Stop hook）**  
 由 CLI 的 Stop hook 在每次回合结束时调用。流程：
@@ -200,7 +201,7 @@ axum HTTP/WS 网关，是整个系统的大脑。主要模块：
 | `routes/pty_ws.rs` / `terminal_ws.rs` | PTY WebSocket 桥（双向字节流） |
 | `routes/ws_swarm.rs` | `/ws/swarm` 事件 SSE/WS 流 |
 | `spawn.rs` | `spawn_agent()` 核心流程 |
-| `cli/` | per-CLI 适配器（`claude.rs`、`codex.rs`、`opencode.rs`、`reasonix.rs`） |
+| `cli/` | per-CLI 适配器（`claude.rs`、`codex.rs`、`opencode.rs`、`reasonix.rs`、`zulu.rs`、`kimi.rs`） |
 | `wake.rs` | `WakeCoordinator` 后台任务 |
 | `spells.rs` | spell 注册表（builtin + overlay） |
 | `roles.rs` | role 注册表（builtin + overlay） |
@@ -209,7 +210,8 @@ axum HTTP/WS 网关，是整个系统的大脑。主要模块：
 | `registry.rs` | 内存中的 `AgentSlot` 映射（live agents） |
 | `opencode_tui.rs` | opencode TUI HTTP 控制接口驱动 |
 | `reasonix_serve.rs` | reasonix HTTP+SSE 驱动 |
-| `billing.rs` | 计费/用量追踪 |
+| `zulu_serve.rs` | zulu HTTP+SSE 驱动（每 agent 一个 `zulu serve`，隔离 HOME） |
+| `billing.rs` | BillingSurface 红线（禁静默 SDK/API）；**用量估价在 `routes/usage.rs`** |
 | `cron.rs` | 定时任务调度 |
 | `worktree.rs` | git worktree 隔离助手 |
 | `transcript.rs` | Claude transcript JSONL 追踪器（Activity view） |
@@ -269,15 +271,15 @@ Stop hook 解决"正在停的 agent"的问题，但解决不了"已经停下来�
 
 ## 各引擎差异
 
-| 特性 | claude | codex | opencode | reasonix |
-|---|---|---|---|---|
-| 启动方式 | PTY (shim → claude) | PTY (shim → codex) | PTY (shim → opencode TUI) | HTTP/SSE (`reasonix serve`) |
-| 提示注入 | 键击注入 (Ctrl-U+回车) | 键击注入 | `/tui/submit-prompt` HTTP | `POST /submit` HTTP |
-| Stop hook | `swarmx-mcp wake-check` | `swarmx-mcp wake-check` | opencode wake plugin (JS) | 无（SSE turn_done 驱动） |
-| MCP 注入格式 | `~/.claude.json` local scope | `~/.codex/config.toml` global | `~/.config/opencode/` JSON | reasonix 自己的 MCP JSON |
-| Trust 格式 | `claude-json` (hasTrustDialogAccepted) | `codex-toml` | N/A | N/A |
-| bootstrap 特殊处理 | 无 | 无 | 重试直到 TUI 实际提交（冷启动慢） | 等 serve 绑端口后提交 |
-| asciicast 录制 | ✓ PTY 字节流 | ✓ PTY 字节流 | ✓ PTY 字节流 | 无（Activity 通过 REST 镜像） |
+| 特性 | claude | codex | opencode | reasonix | zulu | kimi |
+|---|---|---|---|---|---|---|
+| 启动方式 | PTY (shim → claude) | PTY (shim → codex) | PTY (shim → opencode TUI) | HTTP/SSE (`reasonix serve`) | HTTP/SSE (`zulu serve`，每 agent 隔离 HOME) | PTY (shim → kimi) |
+| 提示注入 | 键击注入 (Ctrl-U+回车) | 键击注入 | `/tui/submit-prompt` HTTP | `POST /submit` HTTP | `POST /session` HTTP（每回合一条新 SSE 流） | 键击注入 |
+| Stop hook | `swarmx-mcp wake-check` | `swarmx-mcp wake-check` | opencode wake plugin (JS) | 无（SSE turn_done 驱动） | 无（SSE Completed 驱动） | `swarmx-mcp wake-check --hook-format kimi`（用户级 `config.toml`，exit 2 = block） |
+| MCP 注入格式 | `~/.claude.json` local scope | `~/.codex/config.toml` global | `~/.config/opencode/` JSON | `<ws>/.mcp.json`（无嵌入身份，靠进程 env） | `<ws>/.comate/mcp.json`（无嵌入身份，靠进程 env） | `<ws>/.kimi-code/mcp.json`（deep-merge 用户级，无嵌入身份） |
+| Trust 格式 | `claude-json` (hasTrustDialogAccepted) | `codex-toml` | N/A | N/A | N/A | N/A（无 trust 门槛） |
+| bootstrap 特殊处理 | 无 | 无 | 重试直到 TUI 实际提交（冷启动慢） | 等 serve 绑端口后提交 | 等 serve 绑端口后提交（serve 是机器级单例，故每 agent 独立 HOME） | 无 |
+| asciicast 录制 | ✓ PTY 字节流 | ✓ PTY 字节流 | ✓ PTY 字节流 | 无（Activity 通过 REST 镜像） | 无（Activity 通过 REST 镜像） | ✓ PTY 字节流 |
 
 ### opencode 的特殊路径
 
@@ -299,6 +301,8 @@ reasonix 无 TUI，改为 HTTP+SSE：`reasonix_serve.rs` 里一个长生命周�
 5. 镜像 `tool_dispatch` / `tool_result` 事件到 `POST /api/agent/:id/activity`（UI Activity 标签）。
 
 已停止的 reasonix agent 的 wake 由 `WakeCoordinator` 通过 `wake_if_idle()` 直接 submit，两路都走 `consume_and_submit()` 保证原子性。
+
+bootstrap / wake 的引擎分支统一经 `input_delivery::LiveDelivery::classify`（zulu → reasonix → opencode → keystroke），避免 `rest.rs` 与 `wake.rs` 各自重排优先级。
 
 ---
 
@@ -384,7 +388,7 @@ Tauri 打包后：
 |---|---|
 | `spells/init.md` | `server/src/spells.rs` 的 `SpellRegistry::builtin()` |
 | `roles/*.md`（8 个） | `server/src/roles.rs` 的 `RoleRegistry::builtin()` |
-| `cli-plugins/*.toml`（4 个） | `server/src/plugins.rs` 的 `PluginRegistry::builtin()` |
+| `cli-plugins/*.toml`（6 个） | `server/src/plugins.rs` 的 `PluginRegistry::builtin()` |
 
 这些文件也存在于磁盘，但只作为**开发期 overlay**（通过 `SWARMX_*_DIR` 或 `CARGO_MANIFEST_DIR` 相对路径）。打包后 overlay 找不到也没关系，builtin 就是生效内容。
 
@@ -462,7 +466,7 @@ WS /ws/pty/<agent_id>
 
 ### 8. claude 的 MCP 初始化
 
-claude 在启动时读取 `~/.claude.json` 的 MCP 条目，启动 `swarmx-mcp --agent-id <id>` 子进程（stdio JSON-RPC）。现在 claude 拥有了 10 个 swarm 工具。
+claude 在启动时读取 `~/.claude.json` 的 MCP 条目，启动 `swarmx-mcp --agent-id <id>` 子进程（stdio JSON-RPC）。现在 claude 拥有了 11 个 swarm 工具。
 
 ### 9. 回合结束触发 wake-check
 
@@ -523,20 +527,15 @@ swarmx-mcp wake-check
 
 ## 待确认 / TODO
 
-以下几点在撰写时无法从代码中 100% 确认，需要人工核对：
+> 2026-08 优化审计:迁移计数已对齐 `0029`;深审簇 H / A′ / #16 的 closure 见 `docs/deep-review-2026-07-09.md` §四。结构化运输层边界见 `docs/design/codex-app-server-opt-in.md`。
 
-1. **`swarmx-cli` 的 `swarmx up` 具体行为**：是否真的会打开浏览器？还是只启动 server？`crates/swarmx-cli/src/main.rs` 未完整阅读，内容需对照代码验证。
+仍建议按需人工核对(非阻塞):
 
-2. **blackboard 路径格式**：文档里写的是 `<workspace_id>/<thread_id>/<key>`，但实际代码中 key 格式的精确规范（是否 thread_id 一定存在？main thread 的前缀是什么？）建议对照 `routes/swarm.rs` 和 `path_safe.rs` 核实。
-
-3. **`swarm_name_thread` 的 git worktree 隔离流程**：文档说"在 git 项目上自动启动文件隔离（私有 git worktree）"，具体是何时触发、通过 `worktree.rs` 的哪个函数、是同步还是后台任务，建议核实 `routes/workspaces.rs` 中的 PATCH handler。
-
-4. **codex 的 Stop hook 格式**：`claude.toml` 里有详细说明，`codex.toml` 的 stop hook 配置格式（`hooks.json`）可能有差异，建议读 `cli/codex.rs` 的 `pre_spawn` 确认。
-
-5. **`swarmx-server doctor` 子命令**：文档未展开，但实际已实现（`main.rs` 的 `run_doctor()`），可以作为一个独立小节补充。
-
-6. **数据保留（Retention）的精确策略**：哪些行"已消费"可以删，哪些"load-bearing"不能删，可从 `store.rs` 的 `prune_expired()` 函数精确补充。
-
-7. **`SWARMX_AUTO_RESPAWN_ORCHESTRATORS` 的详细逻辑**：`progress.ledger.md` 含 `all_done` 时跳过，否则重拉。但 thread_id 解析（主 direction 还是全部 thread？）建议从 `auto_respawn_orchestrators()` 核实。
-
-8. **用量计费（`billing.rs`）**：其具体追踪什么（token 数？费率来源？）和 `agent_usage` 表的字段含义，本文档未覆盖，可单独写一节。
+1. **`swarmx-cli` 的 `swarmx up`**:是否打开浏览器 vs 只起 server — 对照 `crates/swarmx-cli/src/main.rs`。
+2. **blackboard 路径格式**与 typed handoff mint 的精确前缀 — 对照 `handoff-protocol.md` + `routes/swarm.rs`。
+3. **`swarm_name_thread` worktree 隔离**触发时机 — `worktree.rs` / `routes/workspaces.rs` PATCH。
+4. **codex Stop hook**(`hooks.json` + hook-trust 探测) — `cli/codex.rs`。
+5. **`swarmx-server doctor`** — `main.rs` `run_doctor()` 可单开一节。
+6. **Retention** — `store.rs` `prune_expired()`。
+7. **`SWARMX_AUTO_RESPAWN_ORCHESTRATORS`** — `auto_respawn_orchestrators()`。
+8. **用量估价** — `routes/usage.rs` + LiteLLM 快照 + `agent_usage`（刮取现仅 Claude/Codex/Kimi；价目 matching 与刷新见 `docs/research/usage-pricing-vs-cc-switch-2026-08.md`）。**BillingSurface 红线**仍在 `billing.rs`，勿混。

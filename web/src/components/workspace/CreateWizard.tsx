@@ -7,19 +7,14 @@
  *
  * 提交后的事：
  *   1. 调 `runSpell("init", workspace_dir=dirs[0])` — init spell 启动一个
- *      scout agent 进目录扫一眼、写 `project.summary.<slug>` 黑板（per-
- *      workspace 命名，见 lib/workspace.ts）+ 给 user 发开场白。
- *   2. spawn 完成后立刻 listAgents 拿到 scout 的 canonical workspace 路径
- *      （macOS /tmp → /private/tmp 这类符号链接需要 canonical 才能让 chat
- *      sidebar 算出同样的 slug），用它写 `workspace.name.<slug>` = 用户起
- *      的名字。
- *   3. wizard 切 loading 视图，订阅 /ws/swarm，看到 path 以
- *      `project.summary.` 开头的事件就关闭 wizard 进群。
- *   4. 超时 / 用户跳过 → 也直接关闭进群，scout 在后台继续跑（黑板和它发给
- *      user 的开场白会自然出现在 chat 里）。
- *
- * 用户在 chat 输入第一条消息时由 ChatRoute 检测「workspace 仅有 scout 且
- * project.summary.<slug> 已存在」→ 改走 auto-dispatch 而非普通 sendMessage。
+ *      orchestrator（规划；scout 角色已删，Magentic-One 单接待员模型），
+ *      进目录做 Phase A 扫描、写黑板 + 给 user 发开场白。
+ *   2. wizard 切 loading 视图，订阅 /ws/swarm，看到本工作空间的
+ *      `{workspace_id}/{thread_slug}/task.ledger.md` 黑板写入（orchestrator
+ *      Phase A 的完成标记，见 roles/orchestrator.md 步骤 2）就关闭 wizard
+ *      进群。
+ *   3. 超时 / 用户跳过 → 也直接关闭进群，orchestrator 在后台继续跑（黑板
+ *      和它发给 user 的开场白会自然出现在 chat 里）。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -41,8 +36,9 @@ import type { CliPluginInfo, SpellInfo, SwarmEvent, Workspace } from "../../api/
 import { useSwarmFeed } from "../../hooks/useSwarmFeed";
 import {
   ACCENT_OPTIONS,
-  PROJECT_SUMMARY_KEY_PREFIX,
+  isScanDoneBlackboardPath,
 } from "../../lib/workspace";
+import { notifySpawnFallbacks } from "../../lib/engineFallback";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -64,7 +60,7 @@ import {
 import { cn } from "@/lib/cn";
 
 const INIT_SPELL = "init";
-const SCOUT_TIMEOUT_MS = 60_000;
+const SCAN_TIMEOUT_MS = 60_000;
 // Sentinel for "use the orchestrator role's default_cli" — Radix Select can't
 // take an empty-string value, so we map this to `captain_cli: undefined`.
 const CAPTAIN_DEFAULT = "__default__";
@@ -202,7 +198,7 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
   const [pathChecks, setPathChecks] = useState<Record<number, PathValidationState>>({});
   // In-flight guard: submit() awaits validation + createWorkspace + runSpell
   // before `scan` flips canSubmit false, so a double-click would fire two full
-  // create flows → two workspaces + two scouts. The ref blocks re-entry
+  // create flows → two workspaces + two orchestrators. The ref blocks re-entry
   // synchronously; isSubmitting drives the button disabled state. Mirrors
   // Shell.tsx::creatingDirRef.
   const submittingRef = useRef(false);
@@ -234,13 +230,14 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
     onEvent: (ev: SwarmEvent) => {
       const cur = scanRef.current;
       if (!cur) return;
-      // 用 prefix 匹配（不精确匹配 slug）— wizard 用用户填的原始 path 算 slug，
-      // 但 scout 写黑板用的是 server canonicalize 过的 cwd（macOS /tmp ↔
-      // /private/tmp 不一致），slug 对不上。同一时刻只有一个 scout 在跑，
-      // 看到任何 project.summary.* 写入就当成本次的完成信号。
+      // 完成信号 = 本工作空间的 orchestrator 写完 Phase A 的 Task Ledger
+      // (`<workspace_id>/<thread_slug>/task.ledger.md`)。按 workspace_id 精确
+      // 匹配:历史上听的是 `project.summary.*` 前缀(scout 时代的 key,写入方
+      // 已随 scout 角色删除,wizard 每次只能干等 60s 超时),而且不带 workspace
+      // 限定的前缀匹配会让别的工作空间的写入误关本次 wizard。
       if (
         ev.type === "blackboard_changed" &&
-        ev.path.startsWith(PROJECT_SUMMARY_KEY_PREFIX) &&
+        isScanDoneBlackboardPath(ev.path, cur.workspace.id) &&
         ev.at >= cur.startedAt
       ) {
         finishScan.current();
@@ -262,7 +259,7 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
       .catch(() => {});
   }, [open]);
 
-  // scan 超时兜底：scout 因为 LLM 不可用 / 目录权限等问题没有写黑板，60s
+  // scan 超时兜底：orchestrator 因为 LLM 不可用 / 目录权限等问题没有写黑板，60s
   // 后也直接进群，让用户能看到失败状态、自己处理。
   useEffect(() => {
     if (!scan) return;
@@ -270,7 +267,7 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
       if (scanRef.current?.startedAt === scan.startedAt) {
         finishScan.current();
       }
-    }, SCOUT_TIMEOUT_MS);
+    }, SCAN_TIMEOUT_MS);
     return () => window.clearTimeout(timer);
   }, [scan]);
 
@@ -292,6 +289,34 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
   const canSubmit =
     name.trim().length > 0 && mainPath.length > 0 && !scan && !invalidPath && !checkingPath;
   const hasInitSpell = spells.some((s) => s.name === INIT_SPELL);
+  // Tell the user WHY Start is grey — a silent disabled button is the #1
+  // "is this broken?" moment in the create flow.
+  const submitBlockReason = useMemo(() => {
+    if (scan || isSubmitting) return null;
+    if (!name.trim()) return t("wizard.needName", "先起个名字");
+    if (!mainPath) return t("wizard.needPath", "先填项目路径");
+    if (checkingPath) return t("wizard.checkingPath", "正在检查路径…");
+    if (invalidPath) {
+      if (!advancedOpen && attachedErrorCount > 0) {
+        return t(
+          "wizard.fixAttached",
+          "附加目录有问题——展开「高级」修正，或收起以忽略",
+        );
+      }
+      return t("wizard.pathInvalid", "路径无效或目录还不存在");
+    }
+    return null;
+  }, [
+    scan,
+    isSubmitting,
+    name,
+    mainPath,
+    checkingPath,
+    invalidPath,
+    advancedOpen,
+    attachedErrorCount,
+    t,
+  ]);
 
   const validatePath = useCallback(
     async (path: string): Promise<PathValidationState> => {
@@ -353,7 +378,7 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
     if (!canSubmit) return;
     // Synchronous re-entry guard — a second click during the await window
     // (validation → createWorkspace → runSpell) would otherwise spawn a second
-    // workspace + scout before `scan` flips canSubmit false.
+    // workspace + orchestrator before `scan` flips canSubmit false.
     if (submittingRef.current) return;
     submittingRef.current = true;
     setIsSubmitting(true);
@@ -403,10 +428,10 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
         );
       }
       // workspace-as-first-class refactor: workspace is created in the
-      // DB BEFORE the init spell launches. The scout that init spawns
-      // inherits the workspace_id via the spell-runner's reverse-lookup
-      // (rest.rs::run_spell with workspace_id). Name + accent are
-      // workspace table columns now, no blackboard writes needed.
+      // DB BEFORE the init spell launches. The orchestrator that init spawns
+      // (scout 角色已删) inherits the workspace_id via the spell-runner's
+      // reverse-lookup (rest.rs::run_spell with workspace_id). Name + accent
+      // are workspace table columns now, no blackboard writes needed.
       // Create the bare workspace first (cwd = primary). The tree of roots is
       // then materialised with follow-up POSTs in topological order: peer
       // projects first (so we learn their server ids), then dependency/tool
@@ -453,13 +478,18 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
       // it back to the parent for routing into the new chat URL — without
       // this the parent only knew "something was created, refresh."
       setScan({ startedAt, workspace: created });
-      await api.runSpell({
+      const spellResp = await api.runSpell({
         name: INIT_SPELL,
         task: wsName,
         workspace_dir: mainPath,
         workspace_id: created.id,
         captain_cli: captainCli === CAPTAIN_DEFAULT ? undefined : captainCli,
       });
+      // Billing red line: if the chosen captain engine wasn't installed, the
+      // server silently spawned an installed fallback — possibly an API-billed
+      // one (e.g. reasonix). Announce the substitution instead of letting a
+      // paid engine run in disguise.
+      notifySpawnFallbacks(t, spellResp.agents);
     } catch (e) {
       setScan(null);
       // Roll back a half-created workspace: if createWorkspace succeeded but
@@ -499,8 +529,8 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
         // 禁掉 backdrop / outside click 关闭 — 用户填了一半路径，不小心点空白
         // 全部清空体验巨差。ESC + ✕ + 取消 三个显式入口仍然能关。
         onInteractOutside={(e) => e.preventDefault()}
-        // 扫描中禁 ESC，避免误触关了 wizard 但 scout 仍在后台跑。loading 视图
-        // 有 "直接进群" 按钮显式离开。
+        // 扫描中禁 ESC，避免误触关了 wizard 但 orchestrator 仍在后台跑。loading
+        // 视图有 "直接进群" 按钮显式离开。
         onEscapeKeyDown={(e) => {
           if (scan) e.preventDefault();
         }}
@@ -580,43 +610,6 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
                     })}
                   </div>
                 </div>
-              </div>
-              {/* Captain engine: which CLI runs the orchestrator. Default =
-                  the orchestrator role's default_cli (claude). All engines
-                  (claude/codex/opencode) run over PTY. */}
-              <div className="flex flex-col gap-1">
-                <Label
-                  htmlFor="wizard-captain"
-                  className="font-caption text-[10px] text-foreground-tertiary"
-                >
-                  {t("wizard.captainEngine", "队长引擎")}
-                </Label>
-                <Select value={captainCli} onValueChange={setCaptainCli}>
-                  <SelectTrigger
-                    id="wizard-captain"
-                    size="sm"
-                    className="h-9 w-[220px] text-sm"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={CAPTAIN_DEFAULT}>
-                      {t("wizard.captainDefault", "默认（Claude）")}
-                    </SelectItem>
-                    {plugins.map((p) => (
-                      <SelectItem
-                        key={p.id}
-                        value={p.id}
-                        disabled={p.installed === false}
-                      >
-                        {p.display_name}
-                        {p.installed === false
-                          ? t("wizard.captainNotInstalled", "（未安装）")
-                          : ""}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
               </div>
             </section>
 
@@ -834,7 +827,24 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
                 })}
                 <button
                   type="button"
-                  onClick={() => setAdvancedOpen((x) => !x)}
+                  onClick={() =>
+                    setAdvancedOpen((wasOpen) => {
+                      if (wasOpen) {
+                        // Collapsing: drop unfinished / broken attached rows so
+                        // they can't silently grey out Start with no visible
+                        // error (errors live inside the collapsed section).
+                        setDirs((prev) =>
+                          prev.filter(
+                            (d) =>
+                              d.id === 0 ||
+                              (d.path.trim() &&
+                                pathChecks[d.id]?.state === "ok"),
+                          ),
+                        );
+                      }
+                      return !wasOpen;
+                    })
+                  }
                   className="flex items-center gap-3 rounded-lg border border-border-subtle bg-surface-primary px-3.5 py-3 text-left transition-colors hover:bg-surface-tertiary"
                   aria-expanded={advancedOpen}
                 >
@@ -874,6 +884,43 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
                   )}
                 </button>
                 {advancedOpen && (
+                  <>
+                    {/* Captain engine lives under Advanced — most users just
+                        want Start; default = orchestrator role's default_cli. */}
+                    <div className="flex flex-col gap-1 rounded-lg border border-border-subtle bg-surface-elevated px-3.5 py-3">
+                      <Label
+                        htmlFor="wizard-captain"
+                        className="font-caption text-[10px] text-foreground-tertiary"
+                      >
+                        {t("wizard.captainEngine", "规划用引擎")}
+                      </Label>
+                      <Select value={captainCli} onValueChange={setCaptainCli}>
+                        <SelectTrigger
+                          id="wizard-captain"
+                          size="sm"
+                          className="h-9 w-full max-w-[280px] text-sm"
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={CAPTAIN_DEFAULT}>
+                            {t("wizard.captainDefault", "默认（Claude）")}
+                          </SelectItem>
+                          {plugins.map((p) => (
+                            <SelectItem
+                              key={p.id}
+                              value={p.id}
+                              disabled={p.installed === false}
+                            >
+                              {p.display_name}
+                              {p.installed === false
+                                ? t("wizard.captainNotInstalled", "（未安装）")
+                                : ""}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
                   <Button
                     type="button"
                     variant="outline"
@@ -895,8 +942,17 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
                     </span>
                     {t("wizard.addDir")}
                   </Button>
+                  </>
                 )}
               </div>
+              <details className="group">
+                <summary className="cursor-pointer font-caption text-[11px] text-foreground-tertiary hover:text-foreground-secondary">
+                  {t("wizard.gitInitSummary", "关于版本控制（可选了解）")}
+                </summary>
+                <p className="mt-1.5 font-caption text-[11px] leading-relaxed text-foreground-tertiary">
+                  {t("wizard.gitInitNotice")}
+                </p>
+              </details>
             </section>
           </div>
         )}
@@ -910,7 +966,11 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
             分隔线。用普通 div + 我们自己的 border-t / bg / padding 即可。 */}
         <div className="flex shrink-0 flex-col gap-3 border-t border-border-subtle bg-surface-elevated px-4 py-4 sm:flex-row sm:items-center sm:px-6">
           <span className="font-caption text-[11px] text-foreground-tertiary">
-            {scan ? t("wizard.scanningFootHint") : t("wizard.defaultInfo")}
+            {scan
+              ? t("wizard.scanningFootHint")
+              : submitBlockReason
+                ? submitBlockReason
+                : t("wizard.defaultInfo")}
           </span>
           <span className="hidden flex-1 sm:block" />
           {scan ? (
@@ -922,7 +982,28 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
               <Button variant="outline" onClick={onClose}>
                 {t("wizard.cancel")}
               </Button>
-              <Button onClick={submit} disabled={!canSubmit || isSubmitting}>
+              <Button
+                onClick={() => {
+                  // Path may have been created on disk after a failed check —
+                  // re-validate once so Start isn't stuck on a stale "不存在".
+                  if (!canSubmit && (invalidPath || checkingPath)) {
+                    for (const d of cleanDirs) {
+                      void validatePath(d.path).then((res) => {
+                        setPathChecks((prev) => ({ ...prev, [d.id]: res }));
+                        if (res.state === "ok") setError(null);
+                      });
+                    }
+                    return;
+                  }
+                  void submit();
+                }}
+                disabled={
+                  isSubmitting ||
+                  checkingPath ||
+                  (!canSubmit && !invalidPath)
+                }
+                title={submitBlockReason ?? undefined}
+              >
                 {isSubmitting ? (
                   <Loader2 className="size-3.5 animate-spin" />
                 ) : (
@@ -973,7 +1054,7 @@ function ScanView({
         {hint}
       </p>
       {/* 进度条 + 实时秒数。进度条是基于平均时长的"心理安抚条"，不精确
-       *  跟后端 scout 真实进度挂钩 (后端没暴露阶段事件)。 */}
+       *  跟后端 orchestrator 真实进度挂钩 (后端没暴露阶段事件)。 */}
       <div className="flex w-full max-w-[320px] flex-col gap-1.5">
         <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-tertiary">
           <div

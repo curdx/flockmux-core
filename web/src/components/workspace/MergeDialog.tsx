@@ -32,6 +32,9 @@ interface Props {
   threadId: string;
   /** Direction display name, for the dialog title. */
   threadName: string;
+  /** Optional divergence counts — refine empty-diff copy when behind-only. */
+  ahead?: number;
+  behind?: number;
   /** Clean up this direction (delete worktree + branch + card, nav to main).
    *  Offered after a clean merge so the merged-and-done direction doesn't linger. */
   onCleanup: (threadId: string) => void;
@@ -61,6 +64,8 @@ export function MergeDialog({
   workspaceId,
   threadId,
   threadName,
+  ahead = 0,
+  behind = 0,
   onCleanup,
 }: Props) {
   const { t } = useTranslation();
@@ -110,8 +115,11 @@ export function MergeDialog({
 
   const files = diff?.files ?? [];
   const base = diff?.base ?? "main";
-  const noChanges = !loading && files.length === 0;
-  const blocked = !!diff?.base_dirty || noChanges;
+  // base_dirty 时 diff 可能为空(服务端拒算)——≠「方向没改动」。撒谎「无需合并」
+  // 会让用户以为合完了(UX-015)。
+  const baseDirty = !!diff?.base_dirty;
+  const trulyNoChanges = !loading && files.length === 0 && !baseDirty;
+  const blocked = baseDirty || trulyNoChanges;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -180,15 +188,24 @@ export function MergeDialog({
               <DialogDescription>
                 {loading
                   ? t("merge.loading")
-                  : noChanges
-                    ? t("merge.noChanges")
-                    : t("merge.intro", { count: files.length, base })}
+                  : baseDirty && files.length === 0
+                    ? t("merge.dirtyBlocksPreview", { base })
+                    : trulyNoChanges && behind > 0 && ahead === 0
+                      ? t("merge.behindOnly", {
+                          behind,
+                          base,
+                          defaultValue:
+                            "没有领先 {{base}} 的改动可合并；这个方向还落后主线 {{behind}} 个提交（↓{{behind}} 不是「待合并」）。",
+                        })
+                      : trulyNoChanges
+                        ? t("merge.noChanges")
+                        : t("merge.intro", { count: files.length, base })}
               </DialogDescription>
             </DialogHeader>
 
             {!loading && files.length > 0 && <FileList files={files} />}
 
-            {diff?.base_dirty && (
+            {baseDirty && (
               <p className="flex items-start gap-1.5 rounded-md bg-state-warning/10 px-2.5 py-2 font-caption text-[11px] text-state-warning">
                 <AlertTriangle className="mt-px size-3.5 shrink-0" />
                 {t("merge.baseDirty", { base })}

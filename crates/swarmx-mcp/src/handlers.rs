@@ -2,7 +2,7 @@
 //!   - `initialize`                  — handshake; returns protocol version + caps
 //!   - `notifications/initialized`   — no response (notification)
 //!   - `tools/list`                  — array of tool descriptors
-//!   - `tools/call`                  — invoke one of the eight swarm_* tools
+//!   - `tools/call`                  — invoke one of the eleven swarm_* tools
 //!
 //! Anything else returns METHOD_NOT_FOUND. We never panic on bad params —
 //! claude treats a closed stdio as a server crash and stops trying to use it.

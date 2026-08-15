@@ -17,9 +17,10 @@
 //!
 //! v1 deliberately uses process governance only (no OS sandbox); the design
 //! note (docs/w2-1-verification-gate-design-2026-06-15.md) tracks the v2
-//! Seatbelt/bubblewrap path. The verify command is declared by the
-//! ORCHESTRATOR at spawn time (not the worker), and allowlist-validated before
-//! it is ever persisted, so a repo-borne prompt injection can't smuggle one in.
+//! Seatbelt/bubblewrap path. The verify command is declared per-role via the
+//! manifest's `done_checks` (builtin or a project's `.swarmx/roles/` overlay)
+//! — never by the worker — and allowlist-validated at spawn time before it is
+//! ever persisted, so a repo-borne prompt injection can't smuggle one in.
 
 use std::path::Path;
 use std::process::Command;
@@ -140,6 +141,12 @@ pub struct VerifyOutcome {
 /// timeboxed own-process-group child with a minimal env, and truncates output.
 /// Never panics.
 pub async fn run_verify(cmd: &str, cwd: &Path) -> VerifyOutcome {
+    run_verify_with_timeout(cmd, cwd, VERIFY_TIMEOUT).await
+}
+
+/// Test seam: same as [`run_verify`] but with a caller-chosen timeout, so the
+/// killpg timebox is exercised in milliseconds instead of the real 600s.
+async fn run_verify_with_timeout(cmd: &str, cwd: &Path, timeout: Duration) -> VerifyOutcome {
     let argv = match validate_verify_cmd(cmd) {
         Ok(v) => v,
         Err(e) => {
@@ -153,7 +160,7 @@ pub async fn run_verify(cmd: &str, cwd: &Path) -> VerifyOutcome {
     let _permit = verify_semaphore().acquire().await;
     let cwd = cwd.to_path_buf();
     let cmd_disp = cmd.trim().to_string();
-    let res = tokio::task::spawn_blocking(move || exec_timeboxed(&argv, &cwd))
+    let res = tokio::task::spawn_blocking(move || exec_timeboxed(&argv, &cwd, timeout))
         .await
         .unwrap_or_else(|e| ExecResult {
             code: None,
@@ -188,7 +195,7 @@ struct ExecResult {
 }
 
 #[cfg(unix)]
-fn exec_timeboxed(argv: &[String], cwd: &Path) -> ExecResult {
+fn exec_timeboxed(argv: &[String], cwd: &Path, timeout: Duration) -> ExecResult {
     use std::os::unix::process::CommandExt;
     let mut c = Command::new(&argv[0]);
     c.args(&argv[1..]).current_dir(cwd);
@@ -229,7 +236,7 @@ fn exec_timeboxed(argv: &[String], cwd: &Path) -> ExecResult {
         // child) and reaps it.
         let _ = tx.send(child.wait_with_output());
     });
-    match rx.recv_timeout(VERIFY_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(Ok(output)) => {
             let _ = waiter.join();
             let mut s = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -259,22 +266,42 @@ fn exec_timeboxed(argv: &[String], cwd: &Path) -> ExecResult {
             let _ = waiter.join();
             ExecResult {
                 code: None,
-                out: format!("timed out after {VERIFY_TIMEOUT:?}; process group killed"),
+                out: format!("timed out after {timeout:?}; process group killed"),
             }
         }
     }
 }
 
 #[cfg(not(unix))]
-fn exec_timeboxed(argv: &[String], cwd: &Path) -> ExecResult {
-    // Non-unix: no process-group killpg; a plain timeboxed run. (swarmx's
-    // agent runtime is unix-focused; this keeps the crate compiling elsewhere.)
+fn exec_timeboxed(argv: &[String], cwd: &Path, timeout: Duration) -> ExecResult {
+    // Non-unix: no process-group killpg. Same timebox semantics via a waiter
+    // thread + recv_timeout; on timeout the best available tree kill is
+    // `taskkill /T /F` on Windows (kills the child tree by pid). On other
+    // non-unix targets there is no portable kill-by-pid in std, so the child
+    // is left to finish on its own and we simply stop waiting — the gate
+    // still fails loud and never blocks on the hang. (swarmx's agent runtime
+    // is unix-focused; this keeps the crate compiling elsewhere.)
     let mut c = crate::runtime_path::tool_command(&argv[0]);
     c.args(&argv[1..])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null());
-    match c.output() {
-        Ok(o) => {
+    let child = match c.spawn() {
+        Ok(ch) => ch,
+        Err(e) => {
+            return ExecResult {
+                code: None,
+                out: format!("spawn failed: {e}"),
+            }
+        }
+    };
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(o)) => {
+            let _ = waiter.join();
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&o.stderr));
             ExecResult {
@@ -282,10 +309,33 @@ fn exec_timeboxed(argv: &[String], cwd: &Path) -> ExecResult {
                 out: s,
             }
         }
-        Err(e) => ExecResult {
-            code: None,
-            out: format!("spawn failed: {e}"),
-        },
+        Ok(Err(e)) => {
+            let _ = waiter.join();
+            ExecResult {
+                code: None,
+                out: format!("wait failed: {e}"),
+            }
+        }
+        Err(_) => {
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .output();
+                let _ = waiter.join();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = pid;
+                // No kill available: detach (drop the JoinHandle) rather than
+                // block the gate on the runaway child.
+                drop(waiter);
+            }
+            ExecResult {
+                code: None,
+                out: format!("timed out after {timeout:?}; child killed where supported"),
+            }
+        }
     }
 }
 
@@ -364,5 +414,86 @@ mod tests {
             validate_verify_cmd("cargo test --workspace").unwrap(),
             vec!["cargo", "test", "--workspace"]
         );
+    }
+
+    // ── executor: real exit codes, timebox, fail-loud rejection ──────────
+
+    #[tokio::test]
+    async fn run_verify_rejects_non_allowlisted_without_spawning() {
+        // The security boundary end-to-end: a rejected command never reaches
+        // exec and reports passed=false with a human-readable reason.
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_verify("curl http://evil.example", dir.path()).await;
+        assert!(!out.passed);
+        assert_eq!(out.exit_code, None);
+        assert!(out.detail.contains("rejected"), "got: {}", out.detail);
+    }
+
+    #[tokio::test]
+    async fn run_verify_reports_real_exit_code() {
+        // `cargo test` in an empty dir fails fast (no Cargo.toml, exit 101):
+        // a real allowlisted exec judged by its real non-zero exit code.
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_verify("cargo test", dir.path()).await;
+        assert!(!out.passed, "empty dir cannot pass `cargo test`");
+        assert!(out.exit_code.is_some_and(|c| c != 0));
+        assert!(out.detail.contains("FAILED"), "got: {}", out.detail);
+        // The failure detail tells the worker what to do next (re-deliver).
+        assert!(out.detail.contains("re-write your handoff key"));
+    }
+
+    #[tokio::test]
+    async fn run_verify_passes_on_exit_zero() {
+        // node is a CI/dev-machine given (harness-check runs on it) and is
+        // allowlisted with plain args; `--version` exits 0 immediately.
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_verify("node --version", dir.path()).await;
+        assert!(out.passed, "got: {}", out.detail);
+        assert_eq!(out.exit_code, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_timeboxed_returns_child_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let ok = exec_timeboxed(&argv("exit 0"), dir.path(), Duration::from_secs(10));
+        assert_eq!(ok.code, Some(0));
+        let bad = exec_timeboxed(&argv("exit 3"), dir.path(), Duration::from_secs(10));
+        assert_eq!(bad.code, Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_timeboxed_timeout_killpgs_the_child() {
+        // A hung check must not wedge the gate: with a 100ms timebox the
+        // `sleep 30` child is SIGTERM/SIGKILLed (whole process group) and the
+        // run returns promptly with code=None + a fail-loud message.
+        let dir = tempfile::tempdir().unwrap();
+        let argv = vec!["sleep".to_string(), "30".to_string()];
+        let start = std::time::Instant::now();
+        let res = exec_timeboxed(&argv, dir.path(), Duration::from_millis(100));
+        assert!(res.code.is_none(), "timeout yields no exit code");
+        assert!(res.out.contains("timed out"), "got: {}", res.out);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "killpg timebox must return promptly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_verify_timeout_is_a_failed_check() {
+        // Through the full pipeline (validate → semaphore → exec): a timeout
+        // is a failed check with evidence, never a silent pass. `make` is
+        // allowlisted with plain args; a `sleep`-recipe Makefile makes the
+        // check genuinely hang until the timebox killpgs it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "hang:\n\tsleep 30\n").unwrap();
+        let out = run_verify_with_timeout("make hang", dir.path(), Duration::from_millis(100)).await;
+        assert!(!out.passed);
+        assert_eq!(out.exit_code, None);
+        assert!(out.detail.contains("did not complete"), "got: {}", out.detail);
     }
 }

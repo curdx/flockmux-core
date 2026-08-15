@@ -10,7 +10,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
-import { api, ApiError } from "../api/http";
+import { api, ApiError, networkErrorCopy } from "../api/http";
 import { HTTP_BASE } from "../lib/apiBase";
 import type { BlackboardEntry, BlackboardHistoryEntry } from "../api/types";
 import {
@@ -28,10 +28,10 @@ async function deleteBlackboard(path: string): Promise<void> {
   try {
     res = await fetch(url, { method: "DELETE" });
   } catch (e) {
-    const friendly = i18n.t("blackboard.connectFail", {
-      defaultValue: "连接不上本地服务（127.0.0.1:7777），请确认 swarmx 正在运行",
-    });
-    throw new ApiError(0, friendly, `${friendly}（DELETE ${url}：${(e as Error)?.message ?? e}）`);
+    const friendly = networkErrorCopy();
+    // eslint-disable-next-line no-console
+    console.warn("[swarmx] network error DELETE blackboard:", e);
+    throw new ApiError(0, friendly, friendly);
   }
   if (!res.ok) {
     const raw = await res.text().catch(() => "");

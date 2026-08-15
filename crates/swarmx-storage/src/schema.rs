@@ -1,7 +1,11 @@
 //! Migration runner. Migrations live in `MIGRATIONS` (version, sql) and are
-//! applied in ascending order; each runs inside `BEGIN IMMEDIATE` so a
-//! concurrent reader cannot observe a half-applied schema (SQLite WAL allows
-//! readers during writes, and our triggers + FTS5 are not atomic-without-tx).
+//! applied in ascending order; each runs inside `BEGIN IMMEDIATE` so the write
+//! lock is taken up front — `busy_timeout` applies at BEGIN — instead of a
+//! DEFERRED transaction failing mid-batch on a WAL lock upgrade
+//! (SQLITE_BUSY_SNAPSHOT cannot be retried without rolling back). The
+//! transaction itself is what keeps a concurrent reader from ever observing a
+//! half-applied schema (SQLite WAL allows readers during writes, and our
+//! triggers + FTS5 are not atomic-without-tx).
 //!
 //! `run_migrations` refuses to start when the database's recorded version is
 //! HIGHER than the newest migration this binary knows about: an older binary
@@ -42,6 +46,7 @@ const MIGRATION_0025: &str =
 const MIGRATION_0026: &str = include_str!("../migrations/0026_fusion_batches.sql");
 const MIGRATION_0027: &str = include_str!("../migrations/0027_fusion_winner.sql");
 const MIGRATION_0028: &str = include_str!("../migrations/0028_fusion_check_cmd.sql");
+const MIGRATION_0029: &str = include_str!("../migrations/0029_agent_shim_pid.sql");
 
 /// Every migration in apply order. Append new entries here — nothing else needs
 /// to change; `latest_migration()` and the upper-bound guard derive from this.
@@ -74,6 +79,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (26, MIGRATION_0026),
     (27, MIGRATION_0027),
     (28, MIGRATION_0028),
+    (29, MIGRATION_0029),
 ];
 
 /// Highest migration version this binary can apply.
@@ -123,7 +129,11 @@ pub(crate) fn current_version(conn: &Connection) -> Result<i64> {
 }
 
 fn apply(conn: &mut Connection, version: i64, sql: &str) -> Result<()> {
-    let tx = conn.transaction()?;
+    // BEGIN IMMEDIATE (not the DEFERRED default): take the write lock before
+    // running any statement so a competing writer fails us at BEGIN — where
+    // busy_timeout still applies — not mid-batch. Same behavior store.rs uses
+    // for its multi-write transactions.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // execute_batch handles the multi-statement migration in one call.
     tx.execute_batch(sql)
         .with_context(|| format!("execute migration {version}"))?;

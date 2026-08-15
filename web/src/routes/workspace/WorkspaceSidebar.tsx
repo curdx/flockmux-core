@@ -116,10 +116,23 @@ function AheadBehind({
   const a = ahead ?? 0;
   const b = behind ?? 0;
   if (a === 0 && b === 0) return null;
+  // behind-only ≠「待合并」——tooltip 说清楚，避免小白点「合并到主线」撞墙
+  const tip =
+    a === 0 && b > 0
+      ? t("chat.directionBehindOnly", {
+          behind: b,
+          defaultValue: "落后主线 {{behind}} 个提交（主线更新了；不是待合并）",
+        })
+      : a > 0 && b === 0
+        ? t("chat.directionAheadOnly", {
+            ahead: a,
+            defaultValue: "领先主线 {{ahead}} 个提交，可合并到主线",
+          })
+        : t("chat.directionAheadBehind", { ahead: a, behind: b });
   return (
     <span
       className="flex shrink-0 items-center gap-1 font-mono text-[9px] leading-tight text-foreground-tertiary"
-      title={t("chat.directionAheadBehind", { ahead: a, behind: b })}
+      title={tip}
     >
       {a > 0 && <span className="text-state-success">↑{a}</span>}
       {b > 0 && <span className="text-state-warning">↓{b}</span>}

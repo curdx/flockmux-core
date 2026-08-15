@@ -21,6 +21,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }
+swarmx-protocol = { path = "../swarmx-protocol" }
 
 [dev-dependencies]
 axum.workspace = true

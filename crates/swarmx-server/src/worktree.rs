@@ -156,6 +156,15 @@ pub fn git_init_with_commit(dir: &Path) -> Result<()> {
     }
 
     // 3) stage everything. Empty dir is fine (commit --allow-empty below).
+    //    A first commit on a REAL user project would otherwise sweep
+    //    node_modules/target/dist (hundreds of MB of build artifacts) into git
+    //    when the dir has no .gitignore — silently, with no prompt. Exclude the
+    //    usual heavyweight artifact dirs via the repo-LOCAL info/exclude (never
+    //    the user's tracked .gitignore) before the full stage; info/exclude only
+    //    hides UNTRACKED files, so anything the user deliberately tracks later
+    //    is unaffected. The common-dir exclude also covers every direction
+    //    worktree spawned from this repo.
+    ignore_paths_locally(dir, &["node_modules/", "target/", "dist/"]);
     let add = git(dir, &["add", "-A"]).context("git add -A")?;
     if !add.status_ok {
         return Err(anyhow!("git add failed: {}", add.stderr.trim()));
@@ -737,6 +746,44 @@ mod tests {
         // No divergence (fresh branch off base) → (0, 0).
         git(&repo, &["branch", "fresh", &base]).unwrap();
         assert_eq!(ahead_behind(&repo, &base, "fresh"), Some((0, 0)));
+    }
+
+    // The first commit on a non-git project dir must NOT sweep heavyweight
+    // build artifacts (node_modules/target/dist) into git — they're excluded
+    // via the repo-local info/exclude before the full `git add -A`.
+    #[test]
+    fn init_with_commit_excludes_heavy_artifact_dirs() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return; // no git → skip
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(proj.join("node_modules/dep")).unwrap();
+        std::fs::create_dir_all(proj.join("target/debug")).unwrap();
+        std::fs::create_dir_all(proj.join("dist")).unwrap();
+        std::fs::write(proj.join("README.md"), b"hi").unwrap();
+        std::fs::write(proj.join("node_modules/dep/index.js"), b"x").unwrap();
+        std::fs::write(proj.join("target/debug/app"), b"x").unwrap();
+        std::fs::write(proj.join("dist/bundle.js"), b"x").unwrap();
+
+        git_init_with_commit(&proj).expect("init+commit");
+
+        let tracked = git(&proj, &["ls-files"]).unwrap();
+        assert!(tracked.status_ok);
+        assert!(
+            tracked.stdout.contains("README.md"),
+            "real source file committed: {}",
+            tracked.stdout
+        );
+        for heavy in ["node_modules/", "target/", "dist/"] {
+            assert!(
+                !tracked.stdout.contains(heavy),
+                "{heavy} must not be committed: {}",
+                tracked.stdout
+            );
+        }
+        let exclude = std::fs::read_to_string(proj.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains("node_modules/"), "exclude written");
     }
 
     #[test]

@@ -37,7 +37,7 @@ fs2 = "0.4"
 libc = "0.2"
 # Loopback HTTP client for driving opencode's TUI control API (/tui/*). Same
 # pin/feature set as swarmx-mcp; http:// only, so no TLS features needed.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

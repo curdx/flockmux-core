@@ -22,10 +22,22 @@ const TARGET_BYTES = 16 * 1024;
 const MAX_OUTPUT_CHARS = 1500;
 const MAX_LINES = 6;
 
+/** PTY wake injections are instructions TO the agent — noise in a user-facing
+ *  thumbnail (same rationale as notifBody dropping wake bodies). */
+const WAKE_NOISE =
+  /操作员唤醒|请先查收邮箱|请检查共享区|Operator wake|check your (mail|inbox)|swarm_send_message\(to=["']user["']/i;
+
 type Preview = string[];
+
+/** Bump when filter rules change so in-memory thumbs aren't stale across HMR. */
+const CACHE_VER = "v2";
 
 const cache = new Map<string, Preview>();
 const inflight = new Map<string, Promise<Preview>>();
+
+function cacheKey(id: string): string {
+  return `${CACHE_VER}:${id}`;
+}
 
 async function fetchHead(url: string): Promise<string> {
   const ctrl = new AbortController();
@@ -67,6 +79,14 @@ function stripAnsi(s: string): string {
     .replace(/\r/g, "");
 }
 
+/** Exported for unit tests — keep wake/injection lines out of thumbs. */
+export function filterPreviewLines(rawLines: string[]): Preview {
+  return rawLines
+    .map((l) => l.trimEnd())
+    .filter((l) => l.length > 0 && !WAKE_NOISE.test(l))
+    .slice(0, MAX_LINES);
+}
+
 function parsePreview(text: string): Preview {
   const lines = text.split("\n");
   if (lines.length < 2) return [];
@@ -85,32 +105,36 @@ function parsePreview(text: string): Preview {
       break;
     }
   }
-  return stripAnsi(out)
-    .split("\n")
-    .map((l) => l.trimEnd())
-    .filter((l) => l.length > 0)
-    .slice(0, MAX_LINES);
+  const stripped = stripAnsi(out).split("\n");
+  return filterPreviewLines(stripped);
 }
 
 export function getCachedCastPreview(id: string): Preview | undefined {
-  return cache.get(id);
+  return cache.get(cacheKey(id));
+}
+
+/** Drop cached thumbs so filter changes apply without a full reload. */
+export function clearCastPreviewCache(): void {
+  cache.clear();
+  inflight.clear();
 }
 
 export async function loadCastPreview(url: string, id: string): Promise<Preview> {
-  const cached = cache.get(id);
+  const key = cacheKey(id);
+  const cached = cache.get(key);
   if (cached) return cached;
-  const ongoing = inflight.get(id);
+  const ongoing = inflight.get(key);
   if (ongoing) return ongoing;
   const p = (async () => {
     try {
       const text = await fetchHead(url);
       const preview = parsePreview(text);
-      cache.set(id, preview);
+      cache.set(key, preview);
       return preview;
     } finally {
-      inflight.delete(id);
+      inflight.delete(key);
     }
   })();
-  inflight.set(id, p);
+  inflight.set(key, p);
   return p;
 }

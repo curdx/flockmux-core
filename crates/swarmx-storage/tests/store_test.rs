@@ -1541,6 +1541,64 @@ async fn mark_orphan_recordings_finalized_only_live_rows() {
     assert_eq!(done.last_seq, Some(7));
 }
 
+// ── shim pid/pgid ledger + orphan process candidates (migration 0029) ───────
+
+#[tokio::test]
+async fn record_agent_shim_pid_first_write_wins() {
+    let (_dir, store) = fresh_store().await;
+    store.record_agent_spawn(spawn_agent_row("p-1")).await.unwrap();
+
+    // First record lands; a second one must not clobber it.
+    assert!(store.record_agent_shim_pid("p-1".into(), 4242, Some(4242)).await.unwrap());
+    assert!(!store.record_agent_shim_pid("p-1".into(), 9999, Some(9999)).await.unwrap());
+    // Unknown agent id → nothing written (the reaper retries next sweep).
+    assert!(!store.record_agent_shim_pid("nope".into(), 1, None).await.unwrap());
+
+    // Read back via the orphan-candidate query: mark killed inside the window
+    // and confirm the ORIGINAL pid survived.
+    store.record_agent_kill("p-1".into(), ts(100)).await.unwrap();
+    let cands = store.orphaned_agent_processes(ts(50)).await.unwrap();
+    assert_eq!(cands.len(), 1);
+    assert_eq!(cands[0].id, "p-1");
+    assert_eq!(cands[0].shim_pid, 4242);
+    assert_eq!(cands[0].shim_pgid, Some(4242));
+}
+
+#[tokio::test]
+async fn orphaned_agent_processes_selects_only_boot_settled_rows_with_pid() {
+    let (_dir, store) = fresh_store().await;
+    for id in ["no-pid", "in-window", "old-kill", "shim-exited", "still-alive"] {
+        store.record_agent_spawn(spawn_agent_row(id)).await.unwrap();
+    }
+    // Every row except "no-pid" gets a process identity.
+    for id in ["in-window", "old-kill", "shim-exited", "still-alive"] {
+        assert!(store.record_agent_shim_pid(id.into(), 7777, None).await.unwrap());
+    }
+    // "shim-exited": the pump recorded the shim's death before the kill.
+    store.record_shim_exit("shim-exited".into(), 1, ts(40)).await.unwrap();
+    // Settle the kills: in-window vs long-past, plus the never-killed row.
+    store.record_agent_kill("no-pid".into(), ts(100)).await.unwrap();
+    store.record_agent_kill("in-window".into(), ts(100)).await.unwrap();
+    store.record_agent_kill("shim-exited".into(), ts(100)).await.unwrap();
+    store.record_agent_kill("old-kill".into(), ts(10)).await.unwrap();
+
+    let cands = store.orphaned_agent_processes(ts(50)).await.unwrap();
+    let ids: Vec<&str> = cands.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["in-window"],
+        "only a pid-carrying, no-shim-exit row killed inside the window qualifies"
+    );
+
+    // A wider window picks up the old kill too — the caller's window is the
+    // only thing standing between us and a recycled pid from an old session.
+    // (All rows share spawned_at = ts(0), so compare as a set, not a sequence.)
+    let cands = store.orphaned_agent_processes(ts(0)).await.unwrap();
+    let mut ids: Vec<&str> = cands.iter().map(|c| c.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["in-window", "old-kill"]);
+}
+
 // ── retention / prune (F5) ──────────────────────────────────────────────────
 
 fn bb(path: &str, content: &str, at: i64) -> NewBlackboardOp {
@@ -2371,6 +2429,138 @@ async fn agent_silent_since_ready_reflects_signs_of_life() {
     assert!(
         !store.agent_silent_since_ready("h-7".into()).await.unwrap(),
         "token usage alone must read as alive"
+    );
+}
+
+// ── stalled = alive + old unread mail + no activity (NeedsYou 「该醒没醒」) ──
+// Zero-false-positive is the design bar (0.3.0 cried wolf on a working codex):
+// idle-but-waiting workers (no unread) and busy workers (fresh activity) must
+// NEVER match. Times below: NOW=1_700_001_000_000, SILENCE=600s →
+// cutoff=1_700_000_400_000; "old" = 1_700_000_300_000 (older than cutoff),
+// "fresh" = 1_700_000_900_000 (newer than cutoff).
+
+#[tokio::test]
+async fn stalled_agents_with_unread_requires_old_unread_and_silence() {
+    const NOW: i64 = 1_700_001_000_000;
+    const SILENCE: i64 = 600_000;
+    const OLD: i64 = 1_700_000_300_000; // waited 700s > SILENCE
+    const FRESH: i64 = 1_700_000_900_000; // waited 100s < SILENCE
+    let (_dir, store) = fresh_store().await;
+    let mail = |to: &str, sent_at: i64| NewMessage {
+        from_agent: "orchestrator".into(),
+        to_agent: to.into(),
+        kind: "note".into(),
+        body: "ping".into(),
+        sent_at,
+        in_reply_to: None,
+        meta: None,
+    };
+
+    // s-1: alive + old unread + no activity ever → STALLED (the target case:
+    // something is waiting for it and it has shown no sign of life).
+    store.record_agent_spawn(spawn_agent_row("s-1")).await.unwrap();
+    store.record_shim_ready("s-1".into(), OLD).await.unwrap();
+    store.insert_message(mail("s-1", OLD)).await.unwrap();
+
+    // s-2: alive + old unread BUT recent activity → NOT stalled (it is
+    // working; the mail just hasn't been picked up yet this turn).
+    store.record_agent_spawn(spawn_agent_row("s-2")).await.unwrap();
+    store.record_shim_ready("s-2".into(), OLD).await.unwrap();
+    store.insert_message(mail("s-2", OLD)).await.unwrap();
+    store.touch_agent_activity("s-2".into(), FRESH).await.unwrap();
+
+    // s-3: alive + silent, but the unread mail is too FRESH → NOT stalled
+    // (the wake chain is allowed this much slack before we suspect it).
+    store.record_agent_spawn(spawn_agent_row("s-3")).await.unwrap();
+    store.record_shim_ready("s-3".into(), OLD).await.unwrap();
+    store.insert_message(mail("s-3", FRESH)).await.unwrap();
+
+    // s-4: alive + silent + NO unread at all → NOT stalled (an idle worker
+    // waiting for work is the healthy case, not a stuck one).
+    store.record_agent_spawn(spawn_agent_row("s-4")).await.unwrap();
+    store.record_shim_ready("s-4".into(), OLD).await.unwrap();
+
+    // s-5: old unread existed but was READ → NOT stalled.
+    store.record_agent_spawn(spawn_agent_row("s-5")).await.unwrap();
+    store.record_shim_ready("s-5".into(), OLD).await.unwrap();
+    let m = store.insert_message(mail("s-5", OLD)).await.unwrap();
+    store.mark_read(vec![m.id], "s-5".into(), NOW).await.unwrap();
+
+    let stalled = store
+        .stalled_agents_with_unread(
+            vec!["s-1".into(), "s-2".into(), "s-3".into(), "s-4".into(), "s-5".into()],
+            NOW,
+            SILENCE,
+        )
+        .await
+        .unwrap();
+    assert!(
+        stalled.contains("s-1"),
+        "alive + old unread + silent must flag"
+    );
+    assert!(!stalled.contains("s-2"), "recent activity must clear it");
+    assert!(!stalled.contains("s-3"), "fresh unread must not flag");
+    assert!(!stalled.contains("s-4"), "no unread must not flag");
+    assert!(!stalled.contains("s-5"), "read mail must not flag");
+    assert_eq!(stalled.len(), 1);
+}
+
+#[tokio::test]
+async fn stalled_agents_with_unread_never_flags_the_dead_or_unborn() {
+    const NOW: i64 = 1_700_001_000_000;
+    const SILENCE: i64 = 600_000;
+    const OLD: i64 = 1_700_000_300_000;
+    let (_dir, store) = fresh_store().await;
+    let mail = |to: &str| NewMessage {
+        from_agent: "orchestrator".into(),
+        to_agent: to.into(),
+        kind: "note".into(),
+        body: "ping".into(),
+        sent_at: OLD,
+        in_reply_to: None,
+        meta: None,
+    };
+
+    // s-6: killed after the mail arrived → NOT stalled (dead agents are the
+    // handoff_missing / error lanes' business, never "stuck").
+    store.record_agent_spawn(spawn_agent_row("s-6")).await.unwrap();
+    store.record_shim_ready("s-6".into(), OLD).await.unwrap();
+    store.insert_message(mail("s-6")).await.unwrap();
+    store.record_agent_kill("s-6".into(), NOW).await.unwrap();
+
+    // s-7: shim exited → NOT stalled, same reasoning.
+    store.record_agent_spawn(spawn_agent_row("s-7")).await.unwrap();
+    store.record_shim_ready("s-7".into(), OLD).await.unwrap();
+    store.insert_message(mail("s-7")).await.unwrap();
+    store.record_shim_exit("s-7".into(), 0, NOW).await.unwrap();
+
+    // s-8: never shim-ready (still starting) → NOT stalled; the
+    // first-response watchdog owns that window.
+    store.record_agent_spawn(spawn_agent_row("s-8")).await.unwrap();
+    store.insert_message(mail("s-8")).await.unwrap();
+
+    let stalled = store
+        .stalled_agents_with_unread(
+            vec![
+                "s-6".into(),
+                "s-7".into(),
+                "s-8".into(),
+                "no-such-agent".into(),
+            ],
+            NOW,
+            SILENCE,
+        )
+        .await
+        .unwrap();
+    assert!(stalled.is_empty(), "dead/starting/unknown must never flag");
+
+    // Empty input short-circuits without touching the db.
+    assert!(
+        store
+            .stalled_agents_with_unread(Vec::new(), NOW, SILENCE)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 

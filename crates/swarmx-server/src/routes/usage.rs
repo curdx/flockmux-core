@@ -31,13 +31,15 @@ struct Rate {
     cache_write: f64,
 }
 
-/// Embedded LiteLLM pricing snapshot (USD per 1M tokens), refreshed via
-/// `scripts/update-litellm-pricing.mjs`. This is the FALLBACK rate source: the
-/// hand-maintained `default_pricing_rules()` below stay the editable primary
-/// layer (and a user's pricing.json overrides everything), but any model id no
-/// rule matches falls through to this table — so a brand-new model auto-prices
-/// instead of showing tokens-only. Same source ccusage uses.
+/// Embedded LiteLLM pricing snapshot (USD per 1M tokens), shipped via
+/// `scripts/update-litellm-pricing.mjs`. Runtime may overlay a fresher table
+/// fetched from upstream (cc-switch-style: at most once per process; failures
+/// keep the embedded/disk copy). Primary editable rules still win on match.
 const LITELLM_PRICING_JSON: &str = include_str!("../../resources/litellm_pricing.json");
+
+/// Upstream catalog (USD **per token**). Slimmed to our per-1M shape on refresh.
+const LITELLM_UPSTREAM_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct LiteLlmEntry {
@@ -49,16 +51,228 @@ struct LiteLlmEntry {
     context_window: Option<u32>,
 }
 
-fn litellm_table() -> &'static std::collections::HashMap<String, LiteLlmEntry> {
-    static TABLE: std::sync::OnceLock<std::collections::HashMap<String, LiteLlmEntry>> =
-        std::sync::OnceLock::new();
-    TABLE.get_or_init(|| match serde_json::from_str(LITELLM_PRICING_JSON) {
-        Ok(map) => map,
-        Err(err) => {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LitellmOrigin {
+    Embedded,
+    Disk,
+    Refreshed,
+}
+
+impl LitellmOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Disk => "disk",
+            Self::Refreshed => "refreshed",
+        }
+    }
+}
+
+struct LitellmState {
+    table: std::collections::HashMap<String, LiteLlmEntry>,
+    origin: LitellmOrigin,
+}
+
+fn litellm_state() -> &'static parking_lot::RwLock<LitellmState> {
+    static STATE: std::sync::OnceLock<parking_lot::RwLock<LitellmState>> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| {
+        let table = parse_slim_litellm_json(LITELLM_PRICING_JSON).unwrap_or_else(|err| {
             tracing::error!(?err, "embedded litellm_pricing.json failed to parse; fallback pricing disabled");
             std::collections::HashMap::new()
-        }
+        });
+        parking_lot::RwLock::new(LitellmState {
+            table,
+            origin: LitellmOrigin::Embedded,
+        })
     })
+}
+
+fn parse_slim_litellm_json(
+    raw: &str,
+) -> Result<std::collections::HashMap<String, LiteLlmEntry>, serde_json::Error> {
+    serde_json::from_str(raw)
+}
+
+fn litellm_cache_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(home).join(".swarmx").join("litellm_pricing.json");
+    }
+    PathBuf::from(".swarmx/litellm_pricing.json")
+}
+
+fn litellm_refresh_disabled() -> bool {
+    crate::billing::env_truthy("SWARMX_DISABLE_LITELLM_REFRESH")
+}
+
+/// Load disk cache (if any) over the embedded table, then spawn a one-shot
+/// upstream refresh. Safe to call once at process start.
+pub fn spawn_litellm_pricing_refresh() {
+    // Overlay last successful refresh so cold start is fresh even offline.
+    let path = litellm_cache_path();
+    if let Ok(txt) = std::fs::read_to_string(&path) {
+        match parse_slim_litellm_json(&txt) {
+            Ok(table) if table.len() > 1000 => {
+                let n = table.len();
+                let mut g = litellm_state().write();
+                g.table = table;
+                g.origin = LitellmOrigin::Disk;
+                tracing::info!(models = n, path = %path.display(), "litellm pricing loaded from disk cache");
+            }
+            Ok(table) => {
+                tracing::warn!(
+                    models = table.len(),
+                    path = %path.display(),
+                    "litellm disk cache too small; keeping embedded"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(?err, path = %path.display(), "litellm disk cache parse failed; keeping embedded");
+            }
+        }
+    }
+
+    if litellm_refresh_disabled() {
+        tracing::info!("litellm pricing auto-refresh disabled (SWARMX_DISABLE_LITELLM_REFRESH)");
+        return;
+    }
+
+    tokio::spawn(async {
+        match refresh_litellm_pricing_once().await {
+            Ok(n) => tracing::info!(models = n, "litellm pricing refreshed from upstream"),
+            Err(err) => tracing::warn!(
+                ?err,
+                "litellm pricing refresh failed; continuing with {}",
+                litellm_state().read().origin.as_str()
+            ),
+        }
+    });
+}
+
+async fn refresh_litellm_pricing_once() -> anyhow::Result<usize> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent(concat!("swarmx-server/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let raw: serde_json::Value = client.get(LITELLM_UPSTREAM_URL).send().await?.error_for_status()?.json().await?;
+    let table = slim_litellm_catalog(&raw);
+    let n = table.len();
+    if n < 1000 {
+        anyhow::bail!("upstream catalog too small ({n} models)");
+    }
+    save_litellm_disk_cache(&table)?;
+    {
+        let mut g = litellm_state().write();
+        g.table = table;
+        g.origin = LitellmOrigin::Refreshed;
+    }
+    Ok(n)
+}
+
+fn save_litellm_disk_cache(
+    table: &std::collections::HashMap<String, LiteLlmEntry>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let path = litellm_cache_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Compact, stable: one model per line, sorted — same spirit as the update script.
+    let mut keys: Vec<&String> = table.keys().collect();
+    keys.sort();
+    let mut body = String::from("{\n");
+    for (i, k) in keys.iter().enumerate() {
+        let e = &table[*k];
+        let entry = serde_json::json!({
+            "input": e.input,
+            "output": e.output,
+            "cache_read": e.cache_read,
+            "cache_write": e.cache_write,
+            "context_window": e.context_window,
+        });
+        // Drop null context_window for smaller diffs / match script shape loosely.
+        let mut obj = entry.as_object().cloned().unwrap_or_default();
+        if obj.get("context_window").is_some_and(|v| v.is_null()) {
+            obj.remove("context_window");
+        }
+        body.push_str(&format!(
+            "{}:{}",
+            serde_json::to_string(k)?,
+            serde_json::Value::Object(obj)
+        ));
+        if i + 1 < keys.len() {
+            body.push(',');
+        }
+        body.push('\n');
+    }
+    body.push_str("}\n");
+    let tmp = path.with_extension(crate::models_config::unique_tmp_ext());
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all().ok();
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Convert BerriAI upstream (USD per token) → our slim map (USD per 1M tokens).
+fn slim_litellm_catalog(raw: &serde_json::Value) -> std::collections::HashMap<String, LiteLlmEntry> {
+    const M: f64 = 1_000_000.0;
+    let round6 = |n: f64| (n * 1_000_000.0).round() / 1_000_000.0;
+    let mut out = std::collections::HashMap::new();
+    let Some(obj) = raw.as_object() else {
+        return out;
+    };
+    for (name, spec) in obj {
+        if name == "sample_spec" || !spec.is_object() {
+            continue;
+        }
+        let Some(input_per_tok) = spec.get("input_cost_per_token").and_then(|v| v.as_f64()) else {
+            continue;
+        };
+        if !input_per_tok.is_finite() {
+            continue;
+        }
+        let output_per_tok = spec
+            .get("output_cost_per_token")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let cache_read_per_tok = spec
+            .get("cache_read_input_token_cost")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let cache_write_per_tok = spec
+            .get("cache_creation_input_token_cost")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let context_window = spec
+            .get("max_input_tokens")
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n > 0)
+            .map(|n| n as u32);
+        out.insert(
+            name.to_ascii_lowercase(),
+            LiteLlmEntry {
+                input: round6(input_per_tok * M),
+                output: round6(output_per_tok * M),
+                cache_read: round6(cache_read_per_tok * M),
+                cache_write: round6(cache_write_per_tok * M),
+                context_window,
+            },
+        );
+    }
+    out
+}
+
+fn litellm_table_len() -> usize {
+    litellm_state().read().table.len()
+}
+
+fn litellm_origin() -> LitellmOrigin {
+    litellm_state().read().origin
 }
 
 /// Normalise a model id toward a LiteLLM key: lowercase, drop a provider prefix
@@ -76,14 +290,15 @@ fn normalize_model(model: &str) -> String {
     m.trim().to_string()
 }
 
-/// Look a model up in the embedded LiteLLM table: exact lowercase first, then
-/// the normalised form. None for models LiteLLM doesn't know either.
-fn litellm_lookup(model: &str) -> Option<&'static LiteLlmEntry> {
-    let table = litellm_table();
+/// Look a model up in the live LiteLLM table: exact lowercase first, then the
+/// normalised form. None for models the catalog doesn't know.
+fn litellm_lookup(model: &str) -> Option<LiteLlmEntry> {
+    let g = litellm_state().read();
     let lower = model.trim().to_ascii_lowercase();
-    table
+    g.table
         .get(&lower)
-        .or_else(|| table.get(&normalize_model(model)))
+        .or_else(|| g.table.get(&normalize_model(model)))
+        .copied()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -103,12 +318,41 @@ pub struct PricingUpdate {
 }
 
 fn default_pricing_rules() -> Vec<PricingRule> {
+    // Editable PRIMARY layer (shown in /usage). Matching is longest-needle-wins
+    // (see `best_rule_match`) so specific ids beat short aliases. Prefer concrete
+    // model markers over bare family names — a naked "opus" used to price every
+    // current Opus id at the legacy $15/$75 band.
+    //
+    // Rates = published API list USD / 1M tokens (estimate only; subscription
+    // spend is not a cash invoice). Unknown ids fall through to the LiteLLM
+    // snapshot (auto-refreshed once per process from LiteLLM upstream; see
+    // `spawn_litellm_pricing_refresh`). Or refresh the embed with
+    // `scripts/update-litellm-pricing.mjs` at release time.
     vec![
         PricingRule {
             id: "anthropic-opus".into(),
             provider: "Anthropic".into(),
-            label: "Claude Opus".into(),
-            matchers: vec!["opus".into()],
+            label: "Claude Opus (current)".into(),
+            matchers: vec![
+                "opus-4-8".into(),
+                "opus-4-7".into(),
+                "opus-4-6".into(),
+            ],
+            context_window: Some(1_000_000),
+            rates_usd_per_mtok: Rate {
+                input: 5.0,
+                output: 25.0,
+                cache_read: 0.5,
+                cache_write: 6.25,
+            },
+            note: "Current Opus list band. 1M-context markers ([1m]/-1m) force a 1M window."
+                .into(),
+        },
+        PricingRule {
+            id: "anthropic-opus-legacy".into(),
+            provider: "Anthropic".into(),
+            label: "Claude Opus (legacy)".into(),
+            matchers: vec!["opus-4-1".into(), "claude-3-opus".into()],
             context_window: Some(200_000),
             rates_usd_per_mtok: Rate {
                 input: 15.0,
@@ -116,22 +360,21 @@ fn default_pricing_rules() -> Vec<PricingRule> {
                 cache_read: 1.5,
                 cache_write: 18.75,
             },
-            note: "Claude 1M-context variants are detected from model ids containing [1m] or -1m."
-                .into(),
+            note: "Legacy Opus list band. Longer matchers beat current-band ids.".into(),
         },
         PricingRule {
             id: "anthropic-sonnet".into(),
             provider: "Anthropic".into(),
             label: "Claude Sonnet".into(),
-            matchers: vec!["sonnet".into()],
-            context_window: Some(200_000),
+            matchers: vec!["sonnet-4-6".into(), "sonnet".into()],
+            context_window: Some(1_000_000),
             rates_usd_per_mtok: Rate {
                 input: 3.0,
                 output: 15.0,
                 cache_read: 0.3,
                 cache_write: 3.75,
             },
-            note: "Claude 1M-context variants are detected from model ids containing [1m] or -1m."
+            note: "Sonnet list band; sonnet-4-6 wins over bare sonnet when both match."
                 .into(),
         },
         PricingRule {
@@ -141,26 +384,47 @@ fn default_pricing_rules() -> Vec<PricingRule> {
             matchers: vec!["haiku".into()],
             context_window: Some(200_000),
             rates_usd_per_mtok: Rate {
-                input: 0.8,
-                output: 4.0,
-                cache_read: 0.08,
-                cache_write: 1.0,
+                input: 1.0,
+                output: 5.0,
+                cache_read: 0.1,
+                cache_write: 1.25,
             },
             note: String::new(),
+        },
+        PricingRule {
+            id: "openai-gpt52".into(),
+            provider: "OpenAI".into(),
+            label: "GPT-5.2".into(),
+            matchers: vec!["gpt-5.2".into(), "gpt5.2".into()],
+            context_window: Some(272_000),
+            rates_usd_per_mtok: Rate {
+                input: 1.75,
+                output: 14.0,
+                cache_read: 0.175,
+                cache_write: 0.0,
+            },
+            note: "Longer than gpt-5 so 5.2 is not mispriced as base gpt-5.".into(),
         },
         PricingRule {
             id: "openai-codex-gpt5".into(),
             provider: "OpenAI".into(),
             label: "GPT-5 / Codex family".into(),
-            matchers: vec!["gpt-5".into(), "gpt5".into(), "codex".into(), "o4".into()],
+            matchers: vec![
+                "gpt-5.1".into(),
+                "gpt5.1".into(),
+                "gpt-5".into(),
+                "gpt5".into(),
+                "codex".into(),
+                "o4".into(),
+            ],
             context_window: Some(272_000),
             rates_usd_per_mtok: Rate {
                 input: 1.25,
                 output: 10.0,
                 cache_read: 0.125,
-                cache_write: 1.25,
+                cache_write: 0.0,
             },
-            note: "Approximation for codex CLI token_count model ids.".into(),
+            note: "Approximation for gpt-5.1 / gpt-5 / codex CLI model ids.".into(),
         },
         PricingRule {
             id: "deepseek".into(),
@@ -169,20 +433,38 @@ fn default_pricing_rules() -> Vec<PricingRule> {
             matchers: vec!["deepseek".into()],
             context_window: Some(1_000_000),
             rates_usd_per_mtok: Rate {
-                // Approximate, from DeepSeek's published V3.x API rates — V4
-                // (deepseek-v4-flash / -pro, used by reasonix) prices are not yet
-                // officially confirmed. Cache-hit input is ~1/4 of cache-miss,
-                // which is reasonix's whole cost story. Adjust when V4 rates land.
-                input: 0.27,
-                output: 1.10,
-                cache_read: 0.07,
-                cache_write: 0.27,
+                // Alias for reasonix-style ids; exact `deepseek/…` keys prefer
+                // LiteLLM when no longer primary needle wins (same length → first).
+                input: 0.28,
+                output: 0.42,
+                cache_read: 0.028,
+                cache_write: 0.0,
             },
-            note: "Approximate (DeepSeek V3.x rates); V4 pricing unconfirmed. \
-                   Matches deepseek-v4-flash / deepseek-v4-pro via 'deepseek'."
+            note: "Approximate alias; prefer LiteLLM for provider-prefixed ids when editable rules are cleared."
                 .into(),
         },
     ]
+}
+
+/// Longest matching needle across all rules wins. Ties keep the first rule that
+/// achieved that length (stable, editable-table order). Empty needles ignored.
+fn best_rule_match<'a>(model: &str, rules: &'a [PricingRule]) -> Option<&'a PricingRule> {
+    let m = model.to_ascii_lowercase();
+    let mut best: Option<(&'a PricingRule, usize)> = None;
+    for rule in rules {
+        for needle in &rule.matchers {
+            let n = needle.to_ascii_lowercase();
+            if n.is_empty() || !m.contains(&n) {
+                continue;
+            }
+            let len = n.len();
+            match best {
+                Some((_, best_len)) if len <= best_len => {}
+                _ => best = Some((rule, len)),
+            }
+        }
+    }
+    best.map(|(rule, _)| rule)
 }
 
 fn pricing_config_path() -> PathBuf {
@@ -262,17 +544,12 @@ fn save_pricing_rules(rules: &[PricingRule]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Best-effort rate lookup. Primary layer: model-name substring against the
+/// Best-effort rate lookup. Primary layer: longest substring match against the
 /// (user-editable) pricing rules. Fallback: exact/normalised match in the
 /// embedded LiteLLM snapshot. Returns None only when neither knows the model
 /// (cost contribution = 0, `priced` flips false).
 fn rate_for(model: &str, rules: &[PricingRule]) -> Option<Rate> {
-    let m = model.to_ascii_lowercase();
-    if let Some(rule) = rules.iter().find(|rule| {
-        rule.matchers
-            .iter()
-            .any(|needle| !needle.is_empty() && m.contains(&needle.to_ascii_lowercase()))
-    }) {
+    if let Some(rule) = best_rule_match(model, rules) {
         return Some(rule.rates_usd_per_mtok);
     }
     litellm_lookup(model).map(|e| Rate {
@@ -283,25 +560,14 @@ fn rate_for(model: &str, rules: &[PricingRule]) -> Option<Rate> {
     })
 }
 
-/// Best-effort context-window size (tokens) by model-name substring. Surfaced
-/// in the Usage table so the operator can eyeball headroom. Returns None for
-/// unknown models (UI shows "—"). Provider-aware where it matters (codex via
-/// OAuth caps lower than the model's nominal window).
+/// Best-effort context-window size (tokens). Surfaced in the Usage table so the
+/// operator can eyeball headroom. Returns None for unknown models (UI shows "—").
 fn context_window_for(model: &str, rules: &[PricingRule]) -> Option<u32> {
     let m = model.to_ascii_lowercase();
     if (m.contains("opus") || m.contains("sonnet")) && (m.contains("[1m]") || m.contains("-1m")) {
-        // 1M-context betas exist; the safe default for claude opus/sonnet is 200k.
         return Some(1_000_000);
     }
-    if let Some(cw) = rules
-        .iter()
-        .find(|rule| {
-            rule.matchers
-                .iter()
-                .any(|needle| m.contains(&needle.to_ascii_lowercase()))
-        })
-        .and_then(|rule| rule.context_window)
-    {
+    if let Some(cw) = best_rule_match(model, rules).and_then(|rule| rule.context_window) {
         return Some(cw);
     }
     litellm_lookup(model).and_then(|e| e.context_window)
@@ -442,11 +708,14 @@ pub async fn usage_pricing_get() -> impl IntoResponse {
         "source": source,
         "path": pricing_config_path(),
         "rules": rules,
-        // Models no rule matches fall through to this embedded LiteLLM snapshot
-        // (refresh: scripts/update-litellm-pricing.mjs) so new models still price.
+        // Models no rule matches fall through to the LiteLLM catalog (embedded
+        // at build, optionally refreshed once per process from GitHub).
         "fallback": {
             "source": "litellm",
-            "models": litellm_table().len(),
+            "origin": litellm_origin().as_str(),
+            "models": litellm_table_len(),
+            "auto_refresh": !litellm_refresh_disabled(),
+            "cache_path": litellm_cache_path(),
         },
     }))
 }
@@ -489,10 +758,34 @@ mod tests {
         // If include_str! or the JSON shape broke, this drops to 0 and every
         // fallback price silently disappears — guard against that.
         assert!(
-            litellm_table().len() > 1000,
+            litellm_table_len() > 1000,
             "embedded snapshot should hold the full table, got {}",
-            litellm_table().len()
+            litellm_table_len()
         );
+    }
+
+    #[test]
+    fn slim_litellm_catalog_converts_per_token_to_per_mtok() {
+        let raw = serde_json::json!({
+            "sample_spec": {"ignore": true},
+            "claude-opus-4-8": {
+                "input_cost_per_token": 0.000005,
+                "output_cost_per_token": 0.000025,
+                "cache_read_input_token_cost": 0.0000005,
+                "cache_creation_input_token_cost": 0.00000625,
+                "max_input_tokens": 1_000_000
+            },
+            "embed-only": { "input_cost_per_token": null }
+        });
+        let map = slim_litellm_catalog(&raw);
+        let e = map.get("claude-opus-4-8").expect("slimmed");
+        assert_eq!(e.input, 5.0);
+        assert_eq!(e.output, 25.0);
+        assert_eq!(e.cache_read, 0.5);
+        assert_eq!(e.cache_write, 6.25);
+        assert_eq!(e.context_window, Some(1_000_000));
+        assert!(!map.contains_key("embed-only"));
+        assert!(!map.contains_key("sample_spec"));
     }
 
     #[test]
@@ -518,7 +811,7 @@ mod tests {
         // reject it even beside a real matcher (regression: "one empty matcher
         // prices all models").
         let mut rules = default_pricing_rules();
-        rules[0].matchers = vec!["".into(), "opus".into()];
+        rules[0].matchers = vec!["".into(), "opus-4-8".into()];
         assert!(validate_pricing_rules(&rules).is_err());
         rules[0].matchers = vec!["   ".into()]; // whitespace-only is empty too
         assert!(validate_pricing_rules(&rules).is_err());
@@ -529,8 +822,8 @@ mod tests {
     #[test]
     fn rate_for_ignores_empty_needle() {
         // Defense-in-depth: even if an empty needle slipped past validation it
-        // must not become a catch-all. One opus rule whose only matcher is "" —
-        // an unknown model must stay unpriced, not silently inherit opus rates.
+        // must not become a catch-all. One rule whose only matcher is "" —
+        // an unknown model must stay unpriced, not silently inherit rates.
         let mut rules = default_pricing_rules();
         rules.truncate(1);
         rules[0].matchers = vec!["".into()];
@@ -549,18 +842,48 @@ mod tests {
 
     #[test]
     fn primary_rules_win_over_litellm_fallback() {
-        // opus hits the hand-maintained substring rule; the [1m] marker must not
-        // knock it down to the fallback.
+        // Current Opus hits the hand-maintained rule; [1m] must not knock it
+        // off the primary layer into a different band.
         let rules = default_pricing_rules();
         let r = rate_for("claude-opus-4-8[1m]", &rules).expect("opus priced");
-        assert_eq!(r.input, 15.0);
-        assert_eq!(r.output, 75.0);
+        assert_eq!(r.input, 5.0);
+        assert_eq!(r.output, 25.0);
+    }
+
+    #[test]
+    fn longest_matcher_keeps_legacy_opus_and_gpt52_distinct() {
+        let rules = default_pricing_rules();
+        let legacy = rate_for("claude-opus-4-1", &rules).expect("legacy opus");
+        assert_eq!(legacy.input, 15.0);
+        assert_eq!(legacy.output, 75.0);
+
+        let current = rate_for("claude-opus-4-8", &rules).expect("current opus");
+        assert_eq!(current.input, 5.0);
+        assert_eq!(current.output, 25.0);
+
+        let g52 = rate_for("gpt-5.2-codex", &rules).expect("gpt-5.2");
+        assert_eq!(g52.input, 1.75);
+        assert_eq!(g52.output, 14.0);
+
+        let g5 = rate_for("gpt-5-codex", &rules).expect("gpt-5");
+        assert_eq!(g5.input, 1.25);
+        assert_eq!(g5.output, 10.0);
+    }
+
+    #[test]
+    fn unlisted_opus_id_uses_litellm_or_stays_unpriced() {
+        // No bare "opus" catch-all: ids the primary table doesn't name must not
+        // inherit a wrong family band.
+        let rules = default_pricing_rules();
+        let dated = rate_for("claude-opus-4-20250514", &rules).expect("snapshot has dated opus-4");
+        assert_eq!(dated.input, 15.0);
+        assert_eq!(dated.output, 75.0);
+        assert!(rate_for("my-custom-opus-fork", &rules).is_none());
     }
 
     #[test]
     fn litellm_fallback_prices_models_no_rule_covers() {
-        // gemini matches none of opus/sonnet/haiku/gpt-5/codex/o4 — before the
-        // fallback it was tokens-only; now it prices and surfaces a window.
+        // gemini matches none of the primary needles — fallback prices it.
         let rules = default_pricing_rules();
         let r = rate_for("gemini-2.5-pro", &rules).expect("gemini priced via fallback");
         assert!(r.input > 0.0 && r.output > 0.0);

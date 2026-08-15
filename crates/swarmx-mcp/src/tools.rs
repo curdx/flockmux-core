@@ -1,4 +1,4 @@
-//! The eight swarm tools exposed over MCP. Each one is a thin wrapper that
+//! The eleven swarm tools exposed over MCP. Each one is a thin wrapper that
 //! formats inputs, calls the matching swarmx-server REST endpoint, and
 //! folds the response into a human-readable `text` content block.
 //!
@@ -101,7 +101,7 @@ pub fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "swarm_search_messages",
-            "description": "Full-text search across all swarm messages (FTS5, porter-stemmed). Use this to find prior discussion of a topic before duplicating work.",
+            "description": "Full-text search across all swarm messages (porter-stemmed FTS for Latin text, substring match for CJK — Chinese queries hit too). Use this to find prior discussion of a topic before duplicating work.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -132,7 +132,7 @@ pub fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "swarm_read_blackboard",
-            "description": "Read the current content of a blackboard path. Returns NOT_FOUND if the path has never been written.",
+            "description": "Read the current content of a blackboard path. If the path has never been written you get a 'nothing written yet' note (NOT an error — the dependency may just not be ready); call swarm_list_blackboard to see which paths exist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -524,11 +524,19 @@ async fn search_messages(ctx: &ToolContext, args: &Value) -> Result<String, Stri
     if rows.is_empty() {
         return Ok(format!("No messages match query '{q}'."));
     }
-    let mut out = format!("Found {} message(s) matching '{q}':\n", rows.len());
+    // The server's search branch ignores our `limit` query param (its SQL
+    // hardcodes LIMIT 200 — see swarmx-server routes/swarm.rs), so rows.len()
+    // is the MATCH count, not what we print. Report the shown count too —
+    // "Found 180" followed by 5 lines read as truncated output.
+    let shown = rows.len().min(limit.max(0) as usize);
+    let mut out = format!(
+        "Found {} message(s) matching '{q}' (showing {shown}):\n",
+        rows.len()
+    );
     // Search doesn't mark anything read; pass an empty set so every row
     // shows its persisted-state flag (✓ for read, ★ for still-unread).
     let empty: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for (i, m) in rows.iter().take(limit as usize).enumerate() {
+    for (i, m) in rows.iter().take(shown).enumerate() {
         let id = m.get("id").and_then(|v| v.as_i64()).unwrap_or(-1);
         let is_unread = m.get("read_at").map(|v| v.is_null()).unwrap_or(true);
         // For search output, ★ means "still unread" (persisted state),
@@ -739,8 +747,15 @@ async fn read_blackboard(ctx: &ToolContext, args: &Value) -> Result<String, Stri
         .send()
         .await
         .map_err(|e| format!("swarmx-server unreachable at {url}: {e}"))?;
+    // 404 here is a NORMAL state — the dependency hasn't been written yet —
+    // not a tool failure. Surfacing isError=true made agents treat "not
+    // written yet" as a hard error and abort/retry instead of checking what
+    // does exist. Return plain text that points at swarm_list_blackboard.
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(format!("blackboard path not found: {path}"));
+        return Ok(format!(
+            "Nothing written at blackboard path '{path}' yet. \
+             Call swarm_list_blackboard to see which paths exist."
+        ));
     }
     if !resp.status().is_success() {
         return Err(http_err_text(resp).await);
@@ -1128,12 +1143,23 @@ mod tests {
             }))
             .route("/api/blackboard/*path", get({
                 |Path(path): Path<String>| async move {
-                    Json(json!({
-                        "path": path,
-                        "content": "hello blackboard",
-                        "sha256": "deadbeefcafe1234",
-                        "at": 2
-                    }))
+                    // "missing.md" stands in for a never-written path so tests
+                    // can exercise the 404 branch.
+                    if path == "missing.md" {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            Json(json!({"error": "not found"})),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(json!({
+                            "path": path,
+                            "content": "hello blackboard",
+                            "sha256": "deadbeefcafe1234",
+                            "at": 2
+                        })),
+                    )
                 }
             }).put({
                 |Path(path): Path<String>, Json(body): Json<Value>| async move {
@@ -1261,6 +1287,52 @@ mod tests {
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("hello blackboard"));
         assert!(text.contains("blackboard:tasks.md"));
+    }
+
+    #[tokio::test]
+    async fn read_blackboard_missing_path_is_not_an_error() {
+        // "Not written yet" is a normal state (the dependency may just not be
+        // ready), so the tool answers isError=false and points at
+        // swarm_list_blackboard — an error result made agents abort instead of
+        // discovering what does exist.
+        let (addr, _) = start_stub().await;
+        let ctx = ctx_for(addr, "claude-aaa");
+        let out = call_tool(&ctx, "swarm_read_blackboard", &json!({
+            "path": "missing.md"
+        })).await;
+        assert_eq!(out["isError"], json!(false));
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("missing.md"), "got: {text}");
+        assert!(text.contains("swarm_list_blackboard"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn search_messages_header_reports_shown_count() {
+        // The server caps search at LIMIT 200 and ignores the `limit` param,
+        // so the header must say how many matches we actually print — a small
+        // limit otherwise read as "Found 180" followed by 5 lines.
+        let (addr, state) = start_stub().await;
+        seed_messages(&state, (1..=3).map(|i| json!({
+            "id": i,
+            "from_agent": "codex-bbb",
+            "to_agent": "claude-aaa",
+            "kind": "note",
+            "body": format!("hit {i}"),
+            "sent_at": 1700,
+            "delivered_at": 1700,
+            "read_at": 1700,
+            "in_reply_to": Value::Null,
+        })).collect()).await;
+        let ctx = ctx_for(addr, "claude-aaa");
+        let out = call_tool(&ctx, "swarm_search_messages", &json!({
+            "q": "hit", "limit": 2
+        })).await;
+        assert_eq!(out["isError"], json!(false));
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Found 3 message(s) matching 'hit' (showing 2)"),
+            "got: {text}"
+        );
     }
 
     #[tokio::test]

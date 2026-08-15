@@ -11,6 +11,16 @@ when_to_use = "做后端逻辑 / API / 数据库 / 系统集成 / shell-heavy �
 modality = "backend"
 risk = "normal"
 produces = ["done"]
+# W2-1 verify gate — OPT-IN, default off (empty = delivery accepted on the
+# handoff write alone, as before). Uncomment to have the server objectively
+# re-run these checks in the worker's cwd when it writes its handoff key,
+# BEFORE the completion is accepted: a failed check bounces the delivery
+# back to the worker with the output tail so it fixes and re-delivers.
+# Single allowlisted argv commands only (never a shell; `&&`/pipes/redirects
+# are rejected at spawn time). Allowed: cargo test/build/check/clippy/fmt,
+# npm/pnpm/yarn/bun test|build|ci|run|lint, go test/build/vet, python -m …,
+# pytest, make, node, deno, tsc, eslint, vitest, jest, ruff, mypy.
+# done_checks = ["cargo test"]
 artifact_paths = ["crates/**", "src/**", "server/**", "api/**"]
 system_prompt_template = """
 You are the BACKEND engineer. Implement the server-side change described

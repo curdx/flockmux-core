@@ -18,7 +18,10 @@
 //!   1. **Mailbox write** (source of truth): `Swarm::send_message` posts
 //!      a `kind="wake"` note from `"system"` to the agent. Even if the
 //!      PTY kick below fails, the next time the agent stops, wake-check
-//!      will see this unread note and force it to keep going. Idempotent.
+//!      will see this unread note and force it to keep going. On a
+//!      successful kick the note is instead consumed at delivery time,
+//!      so the trailing wake-check sees 0 and noops — one wake = ONE
+//!      turn, not two (see `kick_agent`). Idempotent.
 //!
 //!   2. **PTY kick** (belt-and-suspenders): byte-blast `\x15<short>\r`
 //!      into the agent's PTY input channel. Ctrl-U clears any residual
@@ -32,6 +35,7 @@
 //! (`agent_id: None`) wake everyone subscribed.
 
 use anyhow::{anyhow, Result};
+#[allow(unused_imports)] // used by wake tests' live_pty_slot signatures
 use bytes::Bytes;
 use swarmx_protocol::ws_swarm::SwarmEvent;
 use swarmx_swarm::{NewMessage, Swarm};
@@ -91,8 +95,28 @@ pub struct ExitKey {
     /// run on the same workspace and must NOT short-circuit the
     /// .error synthesis.
     pub spawned_at_ms: i64,
+    /// W2-1 verify gate (opt-in): objective checks the server runs in the
+    /// agent's cwd when it writes `handoff_signal`, BEFORE the completion is
+    /// accepted (auto-kill). Empty (the default) = no gate — the legacy
+    /// "handoff write == done" behaviour is unchanged. Populated at spawn
+    /// time from the role's `done_checks`, already allowlist-validated.
+    pub verify_cmds: Vec<String>,
+    /// Consecutive verify-gate failures already bounced back to this worker.
+    /// In-memory only (dies with the registration on kill/exit, resets on
+    /// restart) — it exists purely to bound the fix loop's token burn; see
+    /// `MAX_VERIFY_BOUNCES`.
+    pub verify_attempts: u32,
 }
 pub type ExitKeys = Arc<RwLock<HashMap<String, ExitKey>>>;
+
+/// W2-1 dead-loop guardrail (the design doc marks this 必抄): how many times
+/// a failed verify gate bounces the delivery back to the worker for a fix
+/// before the server stops bouncing. Precedents: Claude Code force-allows
+/// after 8 consecutive hook blocks, Codex caps its fix loop at 3; the W2-1
+/// design doc picks 2. Past the cap the worker is told to escalate (write
+/// `<key>.error` / report to the orchestrator) — the server never silently
+/// marks failed work done, and never loops forever burning tokens.
+const MAX_VERIFY_BOUNCES: u32 = 2;
 
 /// Recognises blackboard keys that should fan-out to wake the base
 /// key's subscribers in addition to their literal name. Today only
@@ -148,12 +172,17 @@ pub async fn unregister_wake_subs(subs: &WakeSubs, agent_id: &str) {
 /// Insert this agent's expected handoff_signal + spawn time. No-op when
 /// the signal is empty (inline-only roles, planner, etc.). Called from
 /// `run_spell` alongside `register_wake_subs`.
+///
+/// `verify_cmds` is the W2-1 verify gate: the role's `done_checks`, already
+/// allowlist-validated at spawn time. Pass an empty Vec (the spell path
+/// does) for the legacy no-gate behaviour.
 pub async fn register_exit_key(
     keys: &ExitKeys,
     agent_id: String,
     role: String,
     handoff_signal: String,
     spawned_at_ms: i64,
+    verify_cmds: Vec<String>,
 ) {
     if handoff_signal.is_empty() {
         return;
@@ -165,6 +194,8 @@ pub async fn register_exit_key(
             role,
             handoff_signal,
             spawned_at_ms,
+            verify_cmds,
+            verify_attempts: 0,
         },
     );
 }
@@ -274,122 +305,45 @@ pub fn agents_to_rewake(
     out
 }
 
-/// Injects `\x15<short text>\r` into an agent's PTY input. Matches the
-/// existing pattern in `rest.rs::run_spell` spell bootstrap injection
-/// (parking_lot guard held briefly to clone the sender, sender held
-/// across `await`). Best-effort: caller logs failures.
-pub async fn inject_wake_kick(registry: &Registry, agent_id: &str, key: &str) -> Result<()> {
-    // Standard "key updated, please check" text. For TTL nudges where
-    // the agent is the *producer* of the overdue key (not a subscriber),
-    // the caller should use `inject_with_kick_text` directly so the
-    // message reads as "you're blocking <waiter>" instead.
+/// Blackboard-key wake kick (auto path). Routes through
+/// [`crate::input_delivery::deliver_wake_turn`] — every engine including
+/// reasonix. Callers that need a custom body use `inject_with_kick_text`.
+#[allow(dead_code)] // exercised by unit tests; kick_agent calls TurnDelivery directly
+pub async fn inject_wake_kick(
+    registry: &Registry,
+    server_url: &str,
+    agent_id: &str,
+    key: &str,
+) -> Result<()> {
     let kick_text = format!("共享区 `{key}` 有更新，请查看");
-    inject_with_kick_text(registry, agent_id, &kick_text, key).await
+    inject_with_kick_text(registry, server_url, agent_id, &kick_text, key, None).await
 }
 
-/// Body of the PTY-kick. Split out so the TTL nudge path can pass a
-/// message that reflects "you're stuck producing X" instead of the
-/// regular "X updated; please check" — the latter is misleading when
-/// X is the recipient's OWN handoff signal.
-///
-/// `key_for_log` is the blackboard key this kick is about, used only
-/// for the structured log fields so downstream tail / grep / dashboard
-/// pipelines stay searchable by key name regardless of the message body.
+/// Wake kick with a custom body. All engines (incl. reasonix) go through
+/// TurnDelivery — there is no longer a "reasonix must not be handled here"
+/// Err path. `reasonix_body` is forwarded when Some (manual / verify);
+/// None uses the generic reasonix wake recipe.
+#[allow(dead_code)] // thin wrapper over TurnDelivery; keep for call-site clarity / tests
 pub async fn inject_with_kick_text(
     registry: &Registry,
+    server_url: &str,
     agent_id: &str,
     kick_text: &str,
     key_for_log: &str,
+    reasonix_body: Option<&str>,
 ) -> Result<()> {
-    let slot = registry
-        .get(agent_id)
-        .ok_or_else(|| anyhow!("no registry slot for `{agent_id}` — agent may have exited"))?;
-    // opencode is driven over its TUI's `/tui/*` HTTP control API, not keystrokes:
-    // deliver the wake by POSTing it as a fresh turn. (claude/codex fall through
-    // to the keystroke path below.) Read the port under the lock, then drop the
-    // guard before awaiting the HTTP call.
-    let tui_port = slot.lock().tui_http_port();
-    if let Some(port) = tui_port {
-        crate::opencode_tui::deliver_turn(port, kick_text)
-            .await
-            .map_err(|e| anyhow!("opencode TUI wake delivery failed: {e:#}"))?;
-        tracing::debug!(agent = %agent_id, key = %key_for_log, port, "wake delivered over opencode TUI HTTP");
-        return Ok(());
-    }
-    // zulu (Comate): route the kick through its serve driver — wake_if_idle
-    // consumes the mailbox wake the caller wrote and runs a turn if idle. Its
-    // per-turn-SSE model owns turns, so a direct submit here would race the
-    // driver. Checked before reasonix (zulu also sets serve_http_port).
-    let zulu = slot.lock().zulu();
-    if let Some(conv) = zulu {
-        let submitted = crate::zulu_serve::wake_if_idle(conv, agent_id, registry).await?;
-        tracing::debug!(agent = %agent_id, key = %key_for_log, submitted, "wake delivered over zulu serve HTTP");
-        return Ok(());
-    }
-    // NOTE: reasonix is intentionally NOT handled here. Both callers route it
-    // away first — the manual path (`deliver_manual_wake`) and the auto path
-    // (`kick_agent`) each deliver reasonix via `reasonix_serve::wake_if_idle`,
-    // which atomically couples consume with submit (no net-loss on a failed
-    // /submit). A blind `deliver_turn` here would reintroduce that net-loss, so
-    // a reasonix agent must never reach this function.
-    let input_tx = {
-        let guard = slot.lock();
-        match guard.pty_input() {
-            Some(tx) => tx,
-            None => {
-                tracing::warn!(agent = %agent_id, key = %key_for_log, "wake dropped: agent has no live PTY input");
-                return Ok(());
-            }
-        }
-    };
-
-    // M6g (2026-05-24): removed the "skip-if-mid-stream" PTY quiet
-    // gate that lived here previously. It was added in M6d-6 to avoid
-    // polluting an in-flight turn during the TTL-nudge era. With TTL
-    // gone (M6e), the only PTY injects are real BlackboardChanged
-    // wakes — those signal "an agent you depend_on wrote a key", and
-    // the agent receiving them should process them next turn regardless
-    // of when they arrive. Worse: the quiet gate had a fatal edge case
-    // (e2e #7, 2026-05-24): if PTY output just stopped within the
-    // 2-second window because the AGENT JUST FINISHED a turn (not
-    // because it's still streaming), the gate would skip the inject
-    // — but then there's no new turn to trigger wake-check, so the
-    // mailbox wake gets stranded indefinitely. The gate fundamentally
-    // couldn't distinguish "still streaming" from "just stopped".
-    // The simpler, correct behaviour is to always inject; claude/codex's
-    // input buffer handles concurrent writes correctly during turn
-    // boundaries (they were already designed for keyboard input racing
-    // turn transitions).
-    let _ = key_for_log; // kept in signature for log call sites if needed later
-
-    // Why three separate writes with a delay before the final `\r`:
-    //   The naive `format!("\x15…\r")` blob worked on Claude Code's TUI
-    //   but failed on Codex CLI's Ratatui. Codex 0.130+ has bracketed-
-    //   paste detection: a single chunk containing both text AND a
-    //   terminating `\r` is treated as a paste with embedded newline
-    //   — codex inserts the line into the input buffer but does NOT
-    //   submit. The user (we) then had to send a SECOND `\r` to
-    //   actually fire the agent. Confirmed in M6c-7 clean-e2e run on
-    //   2026-05-23: BE codex sat at `>blackboard 'design.approved'
-    //   updated; please check` for 16 minutes after the wake until a
-    //   manual `\r` via websocat unstuck it.
-    //
-    //   Splitting the writes — body, sleep ~150ms, then `\r` alone —
-    //   exits paste mode between the two, so the `\r` is seen as a
-    //   typed keystroke and submits the buffer. This mirrors what
-    //   `rest.rs` spell-bootstrap inject already does (see the
-    //   "PTY paste send" path), which is why bootstrap injection has
-    //   always worked for codex but wake injection did not.
-    let body = format!("\x15{kick_text}");
-    input_tx
-        .send(Bytes::from(body))
-        .await
-        .map_err(|e| anyhow!("PTY input_tx send (body) failed: {e}"))?;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    input_tx
-        .send(Bytes::from_static(b"\r"))
-        .await
-        .map_err(|e| anyhow!("PTY input_tx send (submit \\r) failed: {e}"))
+    crate::input_delivery::deliver_wake_turn(
+        registry,
+        agent_id,
+        kick_text,
+        key_for_log,
+        crate::input_delivery::WakeTurnCtx {
+            server_url,
+            reasonix_body,
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 /// M6e: operator-triggered manual wake. Same delivery shape as the
@@ -409,11 +363,43 @@ pub async fn deliver_manual_wake(
     server_url: &str,
     target: &str,
 ) -> Result<()> {
-    let now = now_ms();
     let body =
         "操作员唤醒——请先查收邮箱里的新消息（可能是用户的新指令），再检查共享区，然后继续。\
          如果读到需要回复用户的消息，必须调用 swarm_send_message(to=\"user\", kind=\"reply\", body=...) \
          把回复发回 swarmx 聊天；不要只在你自己的 final answer 里结束。";
+    // Operator-initiated wake → keep it visible in the feed (a real
+    // intervention worth recording), distinct from the high-volume
+    // auto blackboard wakes the UI filters out.
+    let meta = serde_json::json!({ "subtype": "wake", "reason": "manual" });
+    deliver_wake_with_body(swarm, registry, server_url, target, body, meta, "manual wake").await
+}
+
+/// Shared delivery engine behind `deliver_manual_wake` and the W2-1 verify
+/// gate's bounce-back: mailbox `kind="wake"` row (source of truth) +
+/// engine-routed kick. Every branch that successfully starts a turn also
+/// consumes the wake row(s) it delivered, so the trailing Stop hook
+/// (wake-check) sees count=0 and noops — one wake = ONE turn, not two
+/// (mirrors `kick_agent`'s per-engine consume semantics).
+///
+/// Mailbox is the source of truth; if it fails we bail (sending a PTY
+/// kick with no context would be misleading). The kick itself is
+/// best-effort — failure usually means the agent has exited, in which
+/// case the mailbox entry is also moot but we've already returned Ok
+/// (caller wanted a fire-and-forget signal, not a delivery guarantee).
+///
+/// `label` distinguishes the caller in log lines ("manual wake" / "verify
+/// bounce").
+#[allow(clippy::too_many_arguments)]
+async fn deliver_wake_with_body(
+    swarm: &Swarm,
+    registry: &Registry,
+    server_url: &str,
+    target: &str,
+    body: &str,
+    meta: serde_json::Value,
+    label: &str,
+) -> Result<()> {
+    let now = now_ms();
     let msg = NewMessage {
         from_agent: "system".into(),
         to_agent: target.into(),
@@ -421,56 +407,30 @@ pub async fn deliver_manual_wake(
         body: body.into(),
         sent_at: now,
         in_reply_to: None,
-        // Operator-initiated wake → keep it visible in the feed (a real
-        // intervention worth recording), distinct from the high-volume
-        // auto blackboard wakes the UI filters out.
-        meta: Some(serde_json::json!({ "subtype": "wake", "reason": "manual" })),
+        meta: Some(meta),
     };
     swarm
         .send_message(msg)
         .await
-        .map_err(|e| anyhow!("manual wake mailbox send failed: {e}"))?;
-    // Single-flight the kick against the SHARED global lock so a manual wake and
+        .map_err(|e| anyhow!("{label} mailbox send failed: {e}"))?;
+    // Single-flight the kick against the SHARED global lock so this wake and
     // a BlackboardChanged auto-kick can't concurrently kick the same agent
     // (opencode double `deliver_turn` / interleaved PTY inject). If a kick is
     // already in flight, skip: the mailbox note we wrote above is covered by that
     // kick's turn / the engine's post-turn drain / the next Stop hook.
     let lock = kick_lock_for(target);
     let Ok(_kick) = lock.try_lock() else {
-        tracing::debug!(target, "manual wake coalesced with an in-flight kick (mailbox delivered)");
+        tracing::debug!(target, label, "wake coalesced with an in-flight kick (mailbox delivered)");
         return Ok(());
     };
-    let (tui_port, serve_port, is_zulu) = match registry.get(target) {
-        Some(slot) => {
-            let g = slot.lock();
-            (g.tui_http_port(), g.serve_http_port(), g.zulu().is_some())
-        }
-        None => (None, None, false),
+
+    // Pre-consume for opencode so swarmx-wake.js does not double-kick after
+    // deliver_turn. Reasonix/zulu consume atomically inside wake_if_idle.
+    let channel_hint = match registry.get(target) {
+        Some(slot) => crate::input_delivery::LiveDelivery::classify(&slot.lock()).kind_name(),
+        None => "",
     };
-    // reasonix (serve_http_port set but NOT zulu — zulu also sets it): route
-    // through the SAME atomic path the auto kick uses. wake_if_idle COUPLES the
-    // consume with the submit and its None-branch refuses to consume when serve is
-    // unreachable, so a failed /submit never net-loses the wake. This is the #6
-    // fix done right: pre-consuming then doing a blind deliver_turn would mark the
-    // wake read and then drop it on a transient submit failure (the documented
-    // reasonix net-loss). Delivers the generic wake_reason recipe, whose intent ==
-    // the operator body ("check mailbox/blackboard, reply via swarm_send_message");
-    // the operator note stays in message history regardless.
-    if !is_zulu {
-        if let Some(port) = serve_port {
-            match crate::reasonix_serve::wake_if_idle(port, server_url, target, Some(body)).await {
-                Ok(submitted) => tracing::debug!(target, submitted, "manual wake routed via reasonix serve"),
-                Err(err) => tracing::debug!(?err, target, "manual wake reasonix delivery failed (mailbox delivered)"),
-            }
-            tracing::info!(target, "manual wake delivered");
-            return Ok(());
-        }
-    }
-    // opencode: pre-consume so its swarmx-wake.js plugin (session.idle) doesn't
-    // fire a SECOND turn after the deliver_turn below. Same residual as the auto
-    // path — a failed deliver_turn after consume is a rare best-effort miss; the
-    // operator note stays in message history.
-    if tui_port.is_some() {
+    if channel_hint == "opencode-tui-http" {
         match swarm.store().consume_wakes(target.to_string(), now).await {
             Ok(ids) if !ids.is_empty() => swarm.publish_event(SwarmEvent::MessageRead {
                 ids,
@@ -480,16 +440,53 @@ pub async fn deliver_manual_wake(
             _ => {}
         }
     }
-    // opencode / zulu / PTY: deliver the operator `body` (zulu's branch uses
-    // wake_if_idle internally; claude/codex inject keystrokes).
-    if let Err(err) = inject_with_kick_text(registry, target, body, "manual-wake").await {
-        tracing::debug!(
-            ?err,
-            target,
-            "manual wake inject failed (mailbox delivered, will catch on next Stop)"
-        );
+
+    match crate::input_delivery::deliver_wake_turn(
+        registry,
+        target,
+        body,
+        label,
+        crate::input_delivery::WakeTurnCtx {
+            server_url,
+            reasonix_body: Some(body),
+        },
+    )
+    .await
+    {
+        Ok(crate::input_delivery::WakeChannel::Keystroke) => {
+            // PTY inject started a turn — consume wake rows so Stop hook noops.
+            match swarm.store().consume_wakes(target.to_string(), now).await {
+                Ok(ids) if !ids.is_empty() => {
+                    swarm.publish_event(SwarmEvent::MessageRead {
+                        ids,
+                        to_agent: target.to_string(),
+                        at: now,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        target,
+                        label,
+                        "wake post-inject consume_wakes failed; Stop hook may double-kick"
+                    );
+                }
+            }
+        }
+        Ok(ch) => {
+            tracing::debug!(target, label, channel = ?ch, "wake delivered via TurnDelivery");
+        }
+        Err(err) => {
+            tracing::debug!(
+                ?err,
+                target,
+                label,
+                "wake inject failed (mailbox delivered, will catch on next Stop)"
+            );
+        }
     }
-    tracing::info!(target, "manual wake delivered");
+    tracing::info!(target, label, "wake delivered");
     Ok(())
 }
 
@@ -714,28 +711,63 @@ impl WakeCoordinator {
     /// Race safety: we re-check the registry on the delayed tick.
     /// The agent may have been manually killed in the meantime, or its
     /// exit_keys entry may have been claimed by `handle_agent_exit`.
+    ///
+    /// W2-1 verify gate (opt-in): when the worker's role declared
+    /// `done_checks`, the kill is held until every check passes in the
+    /// worker's cwd — a failed check bounces the delivery back to the
+    /// worker instead of accepting "done" (see `verify_gate_before_kill`).
     async fn maybe_auto_kill_on_handoff(&self, path: &str, writer: Option<&str>) {
         // Capture (agent_id, role_label) pairs so the farewell message
         // can sign off with the worker's role instead of an opaque UUID.
         // Only the agent that WROTE its own handoff_signal is reaped (F13):
         // a sibling sharing the same signal string must not be killed when
-        // this one finishes. See `select_autokill_targets`.
-        let targets: Vec<(String, String)> = {
+        // this one finishes. See `select_autokill_targets`. The verify
+        // commands ride along from the same registration snapshot.
+        let targets: Vec<(String, String, Vec<String>)> = {
             let map = self.exit_keys.read().await;
             select_autokill_targets(&map, path, writer)
+                .into_iter()
+                .map(|(aid, role)| {
+                    let cmds = map
+                        .get(&aid)
+                        .map(|ek| ek.verify_cmds.clone())
+                        .unwrap_or_default();
+                    (aid, role, cmds)
+                })
+                .collect()
         };
         if targets.is_empty() {
             return;
         }
-        for (agent_id, role) in targets {
+        for (agent_id, role, verify_cmds) in targets {
             let registry = self.registry.clone();
             let swarm = self.swarm.clone();
             let subs = self.subs.clone();
             let exit_keys = self.exit_keys.clone();
             let store = self.store.clone();
+            let server_url = self.server_url.clone();
             let sig = path.to_string();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(AUTO_KILL_GRACE_MS)).await;
+                // W2-1 verify gate: grade what the worker PRODUCED, not what
+                // it claims. Fail-closed ordering — the farewell + kill below
+                // only run once the gate says pass; a failed check keeps the
+                // worker alive and bounces the finding back to it.
+                if !verify_cmds.is_empty()
+                    && !verify_gate_before_kill(
+                        &swarm,
+                        &registry,
+                        &exit_keys,
+                        &server_url,
+                        &agent_id,
+                        &role,
+                        &sig,
+                        &verify_cmds,
+                    )
+                    .await
+                {
+                    return;
+                }
                 // Re-check: agent might already be gone.
                 let slot = match registry.remove(&agent_id) {
                     Some(s) => s,
@@ -894,28 +926,34 @@ impl WakeCoordinator {
                     error_key,
                     "agent exited without producing signal; wrote .error fallback"
                 );
+                // NO explicit wake dispatch on this path. The write's own
+                // BlackboardChanged broadcast already fans out through
+                // `base_key_aliases` (`<signal>.error` → `<signal>`), so the
+                // coordinator loop wakes every depends_on=`<signal>` subscriber
+                // — plus any literal `.error` subscribers, with writer="system"
+                // so nobody is wrongly excluded. Dispatching directly here as
+                // well (the pre-dedup code did) delivered TWO identical mailbox
+                // rows to every downstream: one from the fan-out, one explicit.
             }
             Err(err) => {
                 tracing::warn!(?err, agent_id, error_key, "failed to write .error fallback");
-                // Don't bail — still try to wake subscribers below so
-                // they at least get a mailbox note describing the
-                // upstream failure, even if the .error file is missing.
+                // The write failed BEFORE anything was broadcast (only an fs
+                // failure returns Err — an op-log failure still broadcasts, see
+                // F6 in `Swarm::write_blackboard`), so the fan-out above never
+                // fires. Wake subscribers of the ORIGINAL signal directly:
+                // depends_on lists keys like "frontend.done", not
+                // "frontend.done.error" — they at least get a mailbox note
+                // describing the upstream failure, even if the .error file is
+                // missing.
+                let writer = Some(agent_id.to_string());
+                let targets = {
+                    let map = self.subs.read().await;
+                    select_targets(&map, &signal, writer.as_deref())
+                };
+                for target in targets {
+                    self.spawn_deliver_wake(target, error_key.clone());
+                }
             }
-        }
-
-        // Critical: explicitly wake subscribers of the ORIGINAL signal,
-        // not of the .error key. depends_on lists keys like
-        // "frontend.done", not "frontend.error" — without this direct
-        // dispatch, the .error write alone would not unblock anyone
-        // (the BlackboardChanged broadcast for `<role>.error` matches
-        // nobody's subscription).
-        let writer = Some(agent_id.to_string());
-        let targets = {
-            let map = self.subs.read().await;
-            select_targets(&map, &signal, writer.as_deref())
-        };
-        for target in targets {
-            self.spawn_deliver_wake(target, error_key.clone());
         }
     }
 
@@ -1012,6 +1050,127 @@ impl WakeCoordinator {
     }
 }
 
+/// W2-1 verify gate, run after a worker writes its `handoff_signal` and
+/// before the auto-kill accepts the completion. Returns `true` when the kill
+/// should proceed (every declared check passed), `false` when the worker
+/// stays alive — a check failed and the finding was bounced back through the
+/// existing wake machinery (mailbox `kind="wake"` row + engine-routed kick).
+///
+/// The checks run in the worker's own cwd (its registry `workspace`) and are
+/// judged by real exit code via `verify::run_verify` (strict allowlist, argv
+/// exec, no shell, killpg timebox, output tail). This closes the "the agent
+/// lied about running the tests" hole: a handoff write only proves the worker
+/// SAYS it finished. First failure decides (hard gate; later checks don't
+/// run). The bounce tells the worker to fix and RE-WRITE the same handoff
+/// key, which re-triggers this gate; `ExitKey.verify_attempts` caps the loop
+/// at `MAX_VERIFY_BOUNCES`, after which the server stops bouncing and tells
+/// the worker to escalate — fail-loud, never a silent accept.
+///
+/// Note: the premature handoff key itself stays on the blackboard (the swarm
+/// blackboard has no delete), so dependents may already have been woken by
+/// the write; they are woken again when the verified re-write lands. Deleting
+/// the unverified key + a persisted `verifying` task status are tracked as
+/// phase-3 work in docs/w2-1-verification-gate-design-2026-06-15.md.
+#[allow(clippy::too_many_arguments)]
+async fn verify_gate_before_kill(
+    swarm: &Arc<Swarm>,
+    registry: &Registry,
+    exit_keys: &ExitKeys,
+    server_url: &str,
+    agent_id: &str,
+    role: &str,
+    signal: &str,
+    verify_cmds: &[String],
+) -> bool {
+    // The worker's cwd at spawn time is where its work — and therefore its
+    // verification — lives.
+    let cwd = match registry.get(agent_id) {
+        Some(s) => std::path::PathBuf::from(s.lock().workspace.clone()),
+        // Agent already gone (killed / exited during the grace window); the
+        // exit path (`handle_agent_exit`) owns the failure semantics now.
+        None => return false,
+    };
+    for cmd in verify_cmds {
+        let outcome = crate::verify::run_verify(cmd, &cwd).await;
+        if outcome.passed {
+            tracing::info!(
+                agent = %agent_id,
+                role = %role,
+                handoff = %signal,
+                cmd = %cmd,
+                exit_code = ?outcome.exit_code,
+                "verify gate: check passed"
+            );
+            continue;
+        }
+        // Bounce bookkeeping lives in ExitKey so it dies with the
+        // registration (kill/exit) — no cross-run residue.
+        let attempts = {
+            let mut m = exit_keys.write().await;
+            match m.get_mut(agent_id) {
+                Some(ek) => {
+                    ek.verify_attempts += 1;
+                    ek.verify_attempts
+                }
+                // Unregistered mid-verify (killed/exited) — don't kill here
+                // either; the owner of that unregister drives what happens.
+                None => return false,
+            }
+        };
+        let gave_up = attempts > MAX_VERIFY_BOUNCES;
+        tracing::warn!(
+            agent = %agent_id,
+            role = %role,
+            handoff = %signal,
+            cmd = %cmd,
+            attempt = attempts,
+            gave_up,
+            "verify gate FAILED — completion not accepted, bouncing back to worker"
+        );
+        let body = if gave_up {
+            format!(
+                "VERIFY GATE: your handoff `{signal}` is still failing its objective check after \
+                 {MAX_VERIFY_BOUNCES} fix bounces, so the server stops bouncing here (token-burn \
+                 guardrail) — the delivery is still NOT accepted. Latest failure:\n\
+                 {}\n\
+                 Either fix the underlying problem and re-write `{signal}` via \
+                 swarm_write_blackboard, or write `{signal}.error` and report the blocker to the \
+                 orchestrator.",
+                outcome.detail
+            )
+        } else {
+            format!(
+                "VERIFY GATE: your handoff `{signal}` was NOT accepted — an objective check run \
+                 in your working directory failed. Do not stop; fix it and deliver again.\n\
+                 {}\n\
+                 After fixing, re-write `{signal}` via swarm_write_blackboard — the server \
+                 re-runs the gate. If the check is genuinely unsatisfiable, write \
+                 `{signal}.error` instead so dependents fail loud. (bounce \
+                 {attempts}/{MAX_VERIFY_BOUNCES})",
+                outcome.detail
+            )
+        };
+        let meta = serde_json::json!({
+            "subtype": "wake",
+            // NOT "blackboard" → the UI keeps this visible in the feed; a
+            // rejected delivery is a real event, not coordination plumbing.
+            "reason": "verify",
+            "key": signal,
+            "attempt": attempts,
+        });
+        if let Err(e) =
+            deliver_wake_with_body(swarm, registry, server_url, agent_id, &body, meta, "verify bounce")
+                .await
+        {
+            // Fail-loud even here: the row failed to persist, so the ONLY
+            // record of the bounce is this log line.
+            tracing::warn!(?e, agent = %agent_id, "verify gate: bounce delivery failed");
+        }
+        return false;
+    }
+    true
+}
+
 /// Write the wake mailbox note (source of truth) for `(target, key)`. Returns
 /// `false` when the agent is paused (auto-wakes are swallowed, mailbox NOT
 /// written) or the write failed — in both cases the caller skips the kick.
@@ -1060,6 +1219,9 @@ async fn write_wake_mailbox(swarm: &Arc<Swarm>, registry: &Registry, target: &st
 /// is unconditional so two concurrent kicks would double-submit, and two PTY
 /// injects would interleave bytes. The mailbox row was already written, so a
 /// failed kick is tolerable — the next Stop hook / post-turn drain sees it.
+/// Every engine branch that successfully starts a turn also consumes the wake
+/// rows it delivered, so the trailing Stop hook noops instead of blocking a
+/// second, duplicate turn.
 async fn kick_agent(
     swarm: &Arc<Swarm>,
     registry: &Registry,
@@ -1069,52 +1231,22 @@ async fn kick_agent(
     key: &str,
 ) {
     let now = now_ms();
-    // zulu (Comate): its own per-turn-SSE driver owns turns. Route here BEFORE
-    // the reasonix serve_port check (zulu also sets serve_http_port).
-    // wake_if_idle atomically consumes + runs a turn only when idle; a mid-turn
-    // wake is picked up by the driver's post-turn drain.
-    let zulu = registry.get(target).and_then(|s| s.lock().zulu());
-    if let Some(conv) = zulu {
-        match crate::zulu_serve::wake_if_idle(conv, target, registry).await {
-            Ok(submitted) => {
-                tracing::info!(target, key, submitted, "zulu wake routed via serve HTTP")
-            }
-            Err(err) => tracing::warn!(?err, target, key, "zulu serve wake delivery failed"),
+    let delivery = match registry.get(target) {
+        Some(slot) => crate::input_delivery::LiveDelivery::classify(&slot.lock()),
+        None => {
+            tracing::debug!(target, key, "wake kick skipped: agent gone");
+            // Reap stale subscription so we don't churn on every future write.
+            unregister_wake_subs(subs, target).await;
+            return;
         }
-        return;
-    }
+    };
 
-    // reasonix is driven over `reasonix serve` HTTP — no PTY to kick. If idle,
-    // atomically consume the wake we just wrote and submit; if mid-turn, leave
-    // the mailbox entry for the SSE driver's `turn_done` path (which consumes the
-    // SAME atomic mailbox, so the wake is delivered exactly once).
-    let serve_port = registry.get(target).and_then(|s| s.lock().serve_http_port());
-    if let Some(port) = serve_port {
-        match crate::reasonix_serve::wake_if_idle(port, server_url, target, None).await {
-            Ok(submitted) => {
-                tracing::info!(target, key, port, submitted, "reasonix wake routed via serve HTTP")
-            }
-            Err(err) => tracing::warn!(?err, target, key, "reasonix serve wake delivery failed"),
-        }
-        return;
-    }
-
-    // opencode is driven over its TUI HTTP API AND runs swarmx-wake.js, which
-    // consumes pending wakes on every `session.idle` and starts its OWN turn. A
-    // blind `deliver_turn` does NOT consume the mailbox wake we just wrote, so the
-    // plugin sees it on the trailing `session.idle` and fires a SECOND redundant
-    // turn. Atomically pre-consume so the plugin sees count=0; the single
-    // deliver_turn below is then the only turn.
-    let tui_port = registry.get(target).and_then(|s| s.lock().tui_http_port());
-    if let Some(port) = tui_port {
-        // Greedy consume returns EVERY unread wake row for this agent, not just
-        // this key's — including sibling rows a concurrent delivery just wrote
-        // whose own kick was single-flighted away. So the turn we submit must be
-        // GENERIC (cover all depends_on), like reasonix/zulu's wake_reason — a
-        // single-key message would strand those swept sibling wakes (their row is
-        // consumed here, their deliver_turn skipped, and the plugin then sees
-        // count=0). If we consumed nothing, another path (the plugin's
-        // session.idle, or a prior kick's turn) already covers it — skip.
+    // Opencode: pre-consume so swarmx-wake.js sees count=0; turn text is the
+    // generic wake_reason covering all consumed rows.
+    let kick_text = if matches!(
+        delivery,
+        crate::input_delivery::LiveDelivery::Opencode { .. }
+    ) {
         let consumed = match swarm.store().consume_wakes(target.to_string(), now).await {
             Ok(ids) => {
                 let n = ids.len();
@@ -1128,38 +1260,68 @@ async fn kick_agent(
                 n
             }
             Err(err) => {
-                tracing::warn!(?err, target, key, "opencode pre-consume wakes failed; plugin may double-kick");
+                tracing::warn!(
+                    ?err,
+                    target,
+                    key,
+                    "opencode pre-consume wakes failed; plugin may double-kick"
+                );
                 0
             }
         };
-        // Deliver UNCONDITIONALLY (even when consumed==0). `consume_wakes` races
-        // the opencode plugin's own `session.idle` consumer: if the plugin won
-        // the rows but its re-prompt then fails, our turn is the ONLY backstop
-        // that still starts a turn to drain them — skipping here would lose the
-        // wake permanently on a one-shot handoff. A redundant turn (plugin also
-        // delivered) is harmless: the agent re-checks depends_on and continues.
-        // `wake_reason(count)` covers ALL rows a greedy consume swept, so a
-        // sibling whose own kick was single-flighted away is never stranded.
-        let reason = crate::reasonix_serve::wake_reason(consumed.max(1) as i64);
-        if let Err(err) = crate::opencode_tui::deliver_turn(port, &reason).await {
-            tracing::warn!(?err, target, key, port, "opencode TUI wake delivery failed");
-        } else {
-            tracing::debug!(target, key, port, consumed, "opencode wake delivered (generic recipe; covers all consumed rows)");
+        crate::reasonix_serve::wake_reason(consumed.max(1) as i64)
+    } else {
+        format!("共享区 `{key}` 有更新，请查看")
+    };
+
+    match crate::input_delivery::deliver_wake_turn(
+        registry,
+        target,
+        &kick_text,
+        key,
+        crate::input_delivery::WakeTurnCtx {
+            server_url,
+            reasonix_body: None,
+        },
+    )
+    .await
+    {
+        Ok(crate::input_delivery::WakeChannel::Keystroke) => {
+            // Consume after PTY inject so Stop hook noops (double-token fix).
+            match swarm.store().consume_wakes(target.to_string(), now).await {
+                Ok(ids) if !ids.is_empty() => {
+                    swarm.publish_event(SwarmEvent::MessageRead {
+                        ids,
+                        to_agent: target.to_string(),
+                        at: now,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        target,
+                        key,
+                        "post-inject consume_wakes failed; Stop hook will re-deliver"
+                    )
+                }
+            }
+            tracing::info!(target, key, "wake delivered");
         }
-        return;
+        Ok(ch) => {
+            tracing::info!(target, key, channel = ?ch, "wake delivered via TurnDelivery");
+        }
+        Err(err) => {
+            tracing::warn!(?err, target, key, "wake kick failed");
+            // PTY-missing / agent-gone: drop stale subscription so we don't churn.
+            if matches!(
+                delivery,
+                crate::input_delivery::LiveDelivery::Keystroke
+            ) {
+                unregister_wake_subs(subs, target).await;
+            }
+        }
     }
-
-    // PTY kick (claude/codex): belt-and-suspenders. Failures are tolerable: the
-    // next Stop hook fire will see the unread mailbox entry and wake.
-    if let Err(err) = inject_wake_kick(registry, target, key).await {
-        tracing::warn!(?err, target, key, "wake PTY inject failed");
-        // Reap the stale subscription so we don't churn on every future write to
-        // this key. The agent is gone anyway; a comeback re-registers.
-        unregister_wake_subs(subs, target).await;
-        return;
-    }
-
-    tracing::info!(target, key, "wake delivered");
 }
 
 fn now_ms() -> i64 {
@@ -1237,6 +1399,32 @@ mod tests {
     }
 
     #[test]
+    fn kick_lock_try_lock_single_flights_same_agent() {
+        // Mirrors spawn_deliver_wake: a second same-agent kick must not block
+        // the coordinator — try_lock fails while the first holds the mutex.
+        let lock = kick_lock_for("agent-a");
+        let held = lock.try_lock().expect("first kick acquires");
+        assert!(
+            lock.try_lock().is_err(),
+            "concurrent same-agent kick must be skipped (single-flight)"
+        );
+        drop(held);
+        assert!(lock.try_lock().is_ok(), "after release, next kick may proceed");
+    }
+
+    #[test]
+    fn delivery_sem_caps_concurrent_kicks() {
+        // Documents the A′ mitigation: wedged engines consume permits but
+        // cannot unbounded-spawn kick tasks.
+        assert!(
+            MAX_CONCURRENT_KICKS >= 4,
+            "MAX_CONCURRENT_KICKS must stay high enough for a small swarm fan-out"
+        );
+        let sem = Semaphore::new(MAX_CONCURRENT_KICKS);
+        assert_eq!(sem.available_permits(), MAX_CONCURRENT_KICKS);
+    }
+
+    #[test]
     fn select_targets_empty_map_returns_empty() {
         let m: HashMap<String, Vec<String>> = HashMap::new();
         assert!(select_targets(&m, "any.key", None).is_empty());
@@ -1282,6 +1470,8 @@ mod tests {
                         role: role.to_string(),
                         handoff_signal: sig.to_string(),
                         spawned_at_ms: 0,
+                        verify_cmds: Vec::new(),
+                        verify_attempts: 0,
                     },
                 )
             })
@@ -1454,8 +1644,557 @@ mod tests {
     #[tokio::test]
     async fn inject_wake_kick_errors_on_missing_agent() {
         let registry = Registry::new();
-        let err = inject_wake_kick(&registry, "ghost", "k").await.unwrap_err();
+        let err = inject_wake_kick(&registry, "http://127.0.0.1:7777", "ghost", "k")
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("ghost"));
+    }
+
+    // ── PTY kick consume: one wake = ONE turn, no duplicate Stop-hook turn ──
+
+    /// Live PTY-backed slot for kick tests — same construction as
+    /// `reaper.rs`'s `agent_slot_for`, with one twist: the child is
+    /// `sh -c 'read x; exit 0'`, so the wake kick's trailing `\r` completes
+    /// the `read` and the child EXITS ON ITS OWN right after the inject.
+    ///
+    /// The returned `output_rx` MUST stay alive until the slot's bridge is
+    /// dropped (the caller drops the registry first, the receiver last):
+    /// dropping it early kills the reader thread on its first
+    /// `blocking_send`, the pty master's output side is then never drained,
+    /// and the tty echo of the injected bytes is still pending when the
+    /// child exits — on macOS that wedges the child mid-exit (STAT E) and
+    /// `PtyBridge::kill`'s `wait4` never returns. Observed as this test
+    /// hanging past the 60s harness warning with `cat`, `sleep 30`, and
+    /// self-exiting children alike; reaper.rs's `exit 0`/`sleep 10` slots
+    /// never hit it only because they never write to the pty input (no
+    /// input → no echo → nothing pending at exit).
+    #[cfg(unix)]
+    fn live_pty_slot() -> (
+        crate::registry::AgentSlot,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        use crate::pty_stream::PtyStream;
+        use crate::registry::{AgentChannel, AgentSlot, Lifecycle};
+        use std::sync::atomic::AtomicBool;
+        use swarmx_pty::{PtyBridge, PtyHandles, SpawnOpts};
+
+        let PtyHandles { bridge, output_rx } = PtyBridge::spawn(SpawnOpts {
+            argv: &["/bin/sh".into(), "-c".into(), "read x; exit 0".into()],
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+        })
+        .expect("spawn test child");
+        let input_tx = bridge.input_sender();
+        let (lifecycle_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let slot = AgentSlot {
+            channel: AgentChannel::Pty {
+                bridge: Arc::new(bridge),
+                stream: Arc::new(PtyStream::new()),
+                input_tx,
+            },
+            lifecycle: Arc::new(parking_lot::Mutex::new(Lifecycle::default())),
+            lifecycle_tx,
+            cli: "test".into(),
+            role: "test".into(),
+            workspace: "/tmp".into(),
+            paused: Arc::new(AtomicBool::new(false)),
+            mcp_ready: tokio::sync::watch::channel(false).0,
+            tui_http_port: None,
+            serve_http_port: None,
+            zulu: None,
+        };
+        (slot, output_rx)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pty_kick_consumes_wake_rows_so_stop_hook_sees_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            swarmx_storage::Store::open(&dir.path().join("db.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let swarm = Swarm::new(store.clone(), dir.path().join("bb"));
+        let registry = Registry::new();
+        let (slot, output_rx) = live_pty_slot();
+        registry.insert("worker".into(), slot);
+        let subs: WakeSubs = Arc::new(RwLock::new(HashMap::new()));
+
+        // Same order as spawn_deliver_wake: mailbox row first, then the kick.
+        assert!(write_wake_mailbox(&swarm, &registry, "worker", "ws/a.done").await);
+        assert_eq!(store.count_unread("worker".into()).await.unwrap(), 1);
+
+        kick_agent(
+            &swarm,
+            &registry,
+            &subs,
+            "http://127.0.0.1:1",
+            "worker",
+            "ws/a.done",
+        )
+        .await;
+
+        // What wake-check (the Stop hook) would claim at the end of the
+        // injected turn: nothing — so it noops instead of blocking a second,
+        // content-duplicate turn.
+        let left = store
+            .consume_wakes("worker".into(), now_ms())
+            .await
+            .unwrap();
+        assert!(
+            left.is_empty(),
+            "delivered wake rows must be consumed by the kick"
+        );
+        assert_eq!(store.count_unread("worker".into()).await.unwrap(), 0);
+
+        // Teardown ORDER matters (see live_pty_slot): kill the bridge while
+        // the reader thread can still drain the pty, drop the receiver last.
+        drop(registry);
+        drop(output_rx);
+    }
+
+    #[tokio::test]
+    async fn failed_pty_kick_keeps_wake_rows_for_stop_hook_fallback() {
+        // The flip side: an inject FAILURE must leave the mailbox row unread
+        // so the next Stop hook still force-wakes the agent (belt-and-
+        // suspenders), and the dead agent's subscription gets reaped.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            swarmx_storage::Store::open(&dir.path().join("db.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let swarm = Swarm::new(store.clone(), dir.path().join("bb"));
+        let registry = Registry::new(); // no slot for "ghost" → inject errors
+        let subs: WakeSubs = Arc::new(RwLock::new(HashMap::new()));
+        register_wake_subs(&subs, "ghost".into(), vec!["ws/a.done".into()]).await;
+
+        assert!(write_wake_mailbox(&swarm, &registry, "ghost", "ws/a.done").await);
+        kick_agent(
+            &swarm,
+            &registry,
+            &subs,
+            "http://127.0.0.1:1",
+            "ghost",
+            "ws/a.done",
+        )
+        .await;
+
+        let left = store.consume_wakes("ghost".into(), now_ms()).await.unwrap();
+        assert_eq!(
+            left.len(),
+            1,
+            "failed kick must not consume the wake fallback"
+        );
+        assert!(
+            subs.read().await.get("ghost").is_none(),
+            "dead agent's subscription reaped"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manual_wake_pty_path_consumes_wake_row() {
+        // Regression: the manual ⚡ wake on claude/codex/kimi injected the PTY
+        // turn but never consumed the mailbox wake row, so the trailing Stop
+        // hook (wake-check) claimed it and forced a SECOND, content-duplicate
+        // turn — every manual wake cost double tokens.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            swarmx_storage::Store::open(&dir.path().join("db.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let swarm = Swarm::new(store.clone(), dir.path().join("bb"));
+        let registry = Registry::new();
+        let (slot, output_rx) = live_pty_slot();
+        registry.insert("manual-worker".into(), slot);
+
+        deliver_manual_wake(&swarm, &registry, "http://127.0.0.1:1", "manual-worker")
+            .await
+            .unwrap();
+
+        let msgs = store
+            .list_messages(swarmx_storage::ListMessagesOpts {
+                to_agent: Some("manual-worker".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 1, "exactly one wake row written");
+        assert!(msgs[0].body.contains("操作员唤醒"));
+        assert_eq!(
+            store.count_unread("manual-worker".into()).await.unwrap(),
+            0,
+            "the delivered wake row must be consumed so the Stop hook noops"
+        );
+        // Teardown ORDER matters (see live_pty_slot).
+        drop(registry);
+        drop(output_rx);
+    }
+
+    // ── W2-1 verify gate: a handoff write ≠ done until the checks pass ────
+
+    /// Insert a live PTY-backed worker whose cwd is `ws_dir` (created), so
+    /// verify commands run somewhere hermetic. Returns the receiver that MUST
+    /// outlive the registry drop (see live_pty_slot).
+    #[cfg(unix)]
+    fn insert_pty_worker(
+        registry: &Registry,
+        agent: &str,
+        ws_dir: &std::path::Path,
+    ) -> tokio::sync::mpsc::Receiver<Bytes> {
+        std::fs::create_dir_all(ws_dir).unwrap();
+        let (slot, output_rx) = live_pty_slot();
+        let slot = crate::registry::AgentSlot {
+            workspace: ws_dir.to_string_lossy().into_owned(),
+            ..slot
+        };
+        registry.insert(agent.into(), slot);
+        output_rx
+    }
+
+    #[cfg(unix)]
+    async fn gate_fixtures() -> (
+        tempfile::TempDir,
+        Arc<swarmx_storage::Store>,
+        Arc<Swarm>,
+        Registry,
+        ExitKeys,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            swarmx_storage::Store::open(&dir.path().join("db.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let swarm = Swarm::new(store.clone(), dir.path().join("bb"));
+        let registry = Registry::new();
+        let exit_keys: ExitKeys = Arc::new(RwLock::new(HashMap::new()));
+        (dir, store, swarm, registry, exit_keys)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_gate_pass_allows_completion() {
+        let (dir, store, swarm, registry, exit_keys) = gate_fixtures().await;
+        let output_rx = insert_pty_worker(&registry, "pass-worker", &dir.path().join("ws"));
+        register_exit_key(
+            &exit_keys,
+            "pass-worker".into(),
+            "backend".into(),
+            "ws/a.done".into(),
+            now_ms(),
+            vec!["node --version".to_string()],
+        )
+        .await;
+
+        let proceed = verify_gate_before_kill(
+            &swarm,
+            &registry,
+            &exit_keys,
+            "http://127.0.0.1:1",
+            "pass-worker",
+            "backend",
+            "ws/a.done",
+            &["node --version".to_string()],
+        )
+        .await;
+        assert!(proceed, "passing checks let the completion through");
+        assert_eq!(
+            exit_keys.read().await["pass-worker"].verify_attempts,
+            0,
+            "a pass is not a bounce"
+        );
+        assert_eq!(
+            store.count_unread("pass-worker".into()).await.unwrap(),
+            0,
+            "no bounce mail on pass"
+        );
+        drop(registry);
+        drop(output_rx);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_gate_failure_bounces_back_and_worker_stays_alive() {
+        let (dir, store, swarm, registry, exit_keys) = gate_fixtures().await;
+        // `cargo test` in an empty dir fails fast (no Cargo.toml, exit 101).
+        // (Unique agent name per test: kick_locks() is process-global, and a
+        // same-named agent in a concurrently-running test would coalesce this
+        // test's kick, leaving its wake row unconsumed.)
+        let output_rx = insert_pty_worker(&registry, "vfy-worker", &dir.path().join("ws"));
+        register_exit_key(
+            &exit_keys,
+            "vfy-worker".into(),
+            "backend".into(),
+            "ws/a.done".into(),
+            now_ms(),
+            vec!["cargo test".to_string()],
+        )
+        .await;
+
+        let proceed = verify_gate_before_kill(
+            &swarm,
+            &registry,
+            &exit_keys,
+            "http://127.0.0.1:1",
+            "vfy-worker",
+            "backend",
+            "ws/a.done",
+            &["cargo test".to_string()],
+        )
+        .await;
+        assert!(!proceed, "a failed check must block the completion");
+        assert!(
+            registry.get("vfy-worker").is_some(),
+            "worker stays alive to fix and re-deliver"
+        );
+        assert_eq!(exit_keys.read().await["vfy-worker"].verify_attempts, 1);
+        let msgs = store
+            .list_messages(swarmx_storage::ListMessagesOpts {
+                to_agent: Some("vfy-worker".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 1, "one bounce message");
+        assert!(msgs[0].body.contains("VERIFY GATE"), "got: {}", msgs[0].body);
+        assert!(
+            msgs[0].body.contains("re-write") && msgs[0].body.contains("ws/a.done"),
+            "the bounce names the key to re-deliver: {}",
+            msgs[0].body
+        );
+        assert!(
+            msgs[0].body.contains("FAILED"),
+            "the bounce carries the check evidence: {}",
+            msgs[0].body
+        );
+        // The PTY delivery consumed the wake row (one wake = ONE turn).
+        assert_eq!(store.count_unread("vfy-worker".into()).await.unwrap(), 0);
+        drop(registry);
+        drop(output_rx);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_gate_stops_bouncing_after_cap() {
+        let (dir, store, swarm, registry, exit_keys) = gate_fixtures().await;
+        let output_rx = insert_pty_worker(&registry, "cap-worker", &dir.path().join("ws"));
+        register_exit_key(
+            &exit_keys,
+            "cap-worker".into(),
+            "backend".into(),
+            "ws/a.done".into(),
+            now_ms(),
+            vec!["cargo test".to_string()],
+        )
+        .await;
+        // Pre-load the counter at the cap: the NEXT failure must be the
+        // give-up escalation, not another fix bounce (token-burn guardrail).
+        exit_keys
+            .write()
+            .await
+            .get_mut("cap-worker")
+            .unwrap()
+            .verify_attempts = MAX_VERIFY_BOUNCES;
+
+        let proceed = verify_gate_before_kill(
+            &swarm,
+            &registry,
+            &exit_keys,
+            "http://127.0.0.1:1",
+            "cap-worker",
+            "backend",
+            "ws/a.done",
+            &["cargo test".to_string()],
+        )
+        .await;
+        assert!(!proceed, "still not accepted");
+        let msgs = store
+            .list_messages(swarmx_storage::ListMessagesOpts {
+                to_agent: Some("cap-worker".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].body.contains("stops bouncing"),
+            "give-up branch, got: {}",
+            msgs[0].body
+        );
+        assert!(
+            msgs[0].body.contains("ws/a.done.error"),
+            "escalation path named: {}",
+            msgs[0].body
+        );
+        drop(registry);
+        drop(output_rx);
+    }
+
+    /// Full wiring through `maybe_auto_kill_on_handoff` (with the real 5s
+    /// auto-kill grace): no `done_checks` → legacy kill; passing checks →
+    /// gate then kill; failing check → bounce, no kill.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn auto_kill_respects_verify_gate_pass_and_fail() {
+        let (dir, store, swarm, registry, exit_keys) = gate_fixtures().await;
+        let subs: WakeSubs = Arc::new(RwLock::new(HashMap::new()));
+        let mut receivers = Vec::new();
+        for (agent, cmds) in [
+            ("w-plain", Vec::new()),
+            ("w-pass", vec!["node --version".to_string()]),
+            ("w-fail", vec!["cargo test".to_string()]),
+        ] {
+            receivers.push(insert_pty_worker(&registry, agent, &dir.path().join("ws")));
+            register_exit_key(
+                &exit_keys,
+                agent.into(),
+                "backend".into(),
+                format!("ws/{agent}.done"),
+                now_ms(),
+                cmds,
+            )
+            .await;
+        }
+        let coord = WakeCoordinator {
+            swarm: swarm.clone(),
+            registry: registry.clone(),
+            subs: subs.clone(),
+            exit_keys: exit_keys.clone(),
+            store: store.clone(),
+            server_url: "http://127.0.0.1:1".into(),
+            delivery_sem: Arc::new(Semaphore::new(4)),
+        };
+        for agent in ["w-plain", "w-pass", "w-fail"] {
+            coord
+                .maybe_auto_kill_on_handoff(&format!("ws/{agent}.done"), Some(agent))
+                .await;
+        }
+
+        // The kill fires after AUTO_KILL_GRACE_MS plus gate runtime; poll.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let plain_gone = registry.get("w-plain").is_none();
+            let pass_gone = registry.get("w-pass").is_none();
+            let bounced = store
+                .list_messages(swarmx_storage::ListMessagesOpts {
+                    to_agent: Some("w-fail".into()),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.body.contains("VERIFY GATE"));
+            if plain_gone && pass_gone && bounced {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting: plain_gone={plain_gone} pass_gone={pass_gone} bounced={bounced}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Gate disabled (plain) and gate passed (pass) → both reaped; gate
+        // failed (fail) → still registered, and stays that way (no late kill).
+        assert!(registry.get("w-plain").is_none());
+        assert!(registry.get("w-pass").is_none());
+        assert!(registry.get("w-fail").is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            registry.get("w-fail").is_some(),
+            "a failed verify gate must not kill the worker"
+        );
+        assert_eq!(
+            exit_keys.read().await["w-fail"].verify_attempts,
+            1,
+            "one bounce recorded"
+        );
+        // Teardown ORDER matters (see live_pty_slot).
+        drop(registry);
+        drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn producer_death_wakes_dependent_exactly_once() {
+        // Regression for the double-channel wake: `handle_agent_exit` writes
+        // `<signal>.error`, whose BlackboardChanged broadcast fans out to the
+        // base key's subscribers via `base_key_aliases`. The old explicit
+        // dispatch on top of that delivered a SECOND identical mailbox row.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            swarmx_storage::Store::open(&dir.path().join("db.sqlite"))
+                .await
+                .unwrap(),
+        );
+        // The blackboard root must exist for the .error write to succeed —
+        // this test only guards the dedup when the write's own broadcast
+        // fires (the Ok path; the Err path is a single dispatch either way).
+        std::fs::create_dir_all(dir.path().join("bb")).unwrap();
+        let swarm = Swarm::new(store.clone(), dir.path().join("bb"));
+        let registry = Registry::new();
+        let subs: WakeSubs = Arc::new(RwLock::new(HashMap::new()));
+        let exit_keys: ExitKeys = Arc::new(RwLock::new(HashMap::new()));
+        register_wake_subs(&subs, "dep".into(), vec!["ws/sig.done".into()]).await;
+        // spawned_at in the future → the freshness check fails → .error written.
+        register_exit_key(
+            &exit_keys,
+            "prod".into(),
+            "role".into(),
+            "ws/sig.done".into(),
+            now_ms() + 60_000,
+            Vec::new(),
+        )
+        .await;
+        let _coordinator = WakeCoordinator::spawn(
+            swarm.clone(),
+            registry.clone(),
+            subs.clone(),
+            exit_keys.clone(),
+            store.clone(),
+            "http://127.0.0.1:1".into(),
+        );
+
+        // The coordinator task subscribes to the broadcast only when it is
+        // first polled. `publish_event` below is synchronous, so without this
+        // yield the AgentState event is emitted BEFORE the subscription
+        // exists and is silently missed (broadcast receivers only see what
+        // lands after they subscribe) — the test then fails on rows==0.
+        tokio::task::yield_now().await;
+        swarm.publish_event(SwarmEvent::AgentState {
+            agent_id: "prod".into(),
+            state: swarmx_protocol::ws_swarm::AgentState::Exited,
+        });
+
+        // Wait for the .error fallback + fan-out to land in dep's mailbox,
+        // then settle to give any duplicate dispatch time to appear too.
+        let mut rows = 0;
+        for _ in 0..250 {
+            rows = store.count_unread("dep".into()).await.unwrap();
+            if rows > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(rows, 1, "dependent must get the .error wake");
+        assert!(
+            dir.path().join("bb/ws/sig.done.error").exists(),
+            "the .error fallback landed on disk (Ok path, fan-out delivered the wake)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            store.count_unread("dep".into()).await.unwrap(),
+            1,
+            "no duplicate wake row from a second dispatch channel"
+        );
     }
 
     // ── M6c step 5: exit_keys + .error/.failed fan-out ──────────────────
@@ -1469,6 +2208,7 @@ mod tests {
             "frontend".into(),
             "frontend.done".into(),
             1_700_000_000_000,
+            Vec::new(),
         )
         .await;
         let stored = keys.read().await.get("a").cloned();
@@ -1492,6 +2232,7 @@ mod tests {
             "planner".into(),
             "".into(),
             1_700_000_000_000,
+            Vec::new(),
         )
         .await;
         assert!(

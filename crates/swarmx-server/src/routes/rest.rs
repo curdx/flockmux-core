@@ -55,6 +55,19 @@ fn first_response_watchdog_ms(engine: &str) -> u64 {
     }
 }
 
+/// See `crate::agent_lifecycle::gate_should_shield_watchdog`.
+
+/// NeedsYou「该醒没醒」stalled 信号的静默窗口:一封未读邮件要等待这么久、
+/// 且 agent 同期毫无活动,才允许怀疑唤醒链断了。10 分钟是刻意保守的选择 —
+/// 0.3.0 的 suspected-stuck 因为误报(狼来了:codex 明明还在出 exec 事件被标
+/// 「疑似卡住」)被整体撤出收件箱,这一版零误报优先:
+///   - 空闲等活的 worker 没有未读邮件,永不命中;
+///   - 正在干活的 worker 活动时间戳是新的,永不命中;
+///   - 只有「有东西等着它读 + 它长时间没动静」才命中 —— 即使命中,UI 也只说
+///     「可能卡住」。10min 留足了一个正常回合读信的余量(wake-check 在回合末
+///     触发,长回合里到的邮件回合末才读),又把真断链的暴露延迟控制在可接受范围。
+const STALLED_UNREAD_SILENCE_MS: i64 = 10 * 60 * 1000;
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -90,24 +103,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// First dependency not yet satisfied — neither the key itself NOR its
-/// `.error`/`.failed` failure alias is present on the blackboard — or `None` if
-/// all are satisfied. Pure (unit-tested); drives the P1-D readiness gate's
-/// "are this worker's inputs ready?" decision. A `.error`/`.failed` alias counts
-/// as satisfied so a downstream worker wakes to handle an upstream FAILURE
-/// rather than waiting forever for a key the dead producer will never write.
-fn first_unsatisfied_dep(
-    deps: &[String],
-    present: &std::collections::HashSet<String>,
-) -> Option<String> {
-    deps.iter()
-        .find(|k| {
-            !present.contains(k.as_str())
-                && !present.contains(format!("{k}.error").as_str())
-                && !present.contains(format!("{k}.failed").as_str())
-        })
-        .cloned()
-}
+/// See `crate::agent_lifecycle::first_unsatisfied_dep`.
 
 /// The by-role `consumes` model assumes ≤1 live producer per role in a
 /// direction. Return the handoff key an already-live sibling of `role_slug`
@@ -128,6 +124,24 @@ fn conflicting_producer<'a>(
                 w.handoff_signal.clone()
             }
         })
+}
+
+/// Live orchestrator in this direction, if any. Thread match is exact on the
+/// normalized key (`None` ≡ `""` for legacy rows without a thread stamp).
+async fn live_orchestrator_in_direction(
+    state: &AppState,
+    workspace_id: &str,
+    thread_id: Option<&str>,
+) -> Option<swarmx_storage::AgentRecord> {
+    let want = thread_id.unwrap_or("");
+    let agents = state.store.list_agents().await.ok()?;
+    agents.into_iter().find(|a| {
+        a.role == "orchestrator"
+            && a.killed_at.is_none()
+            && a.shim_exit_at.is_none()
+            && a.workspace_id.as_deref() == Some(workspace_id)
+            && a.thread_id.as_deref().unwrap_or("") == want
+    })
 }
 
 /// Spawn-time dependency-graph validation + key minting (P0-A), pure so it can
@@ -186,11 +200,17 @@ fn resolve_consumes_to_deps(
 /// Append the server-minted handoff key(s) to the orchestrator-authored worker
 /// prompt, so the worker writes the canonical key verbatim instead of inventing
 /// one — the F3 drift class is designed away (P0-A).
+///
+/// `done_checks` is the W2-1 verify gate (opt-in): when non-empty the worker is
+/// TOLD its delivery will be objectively re-run by the server, so it can run
+/// the checks itself before declaring done. Empty (the default) adds nothing —
+/// the prompt is byte-identical to before the gate existed.
 fn build_worker_prompt(
     base: &str,
     success_keys: &[String],
     error_key: &str,
     dep_keys: &[String],
+    done_checks: &[String],
 ) -> String {
     let mut out = base.to_string();
 
@@ -234,6 +254,28 @@ fn build_worker_prompt(
              • On SUCCESS (only when the task is actually done), write your result to:\n{keys}\n\
              • On FAILURE/abort, write to `{error_key}` instead, so dependents \
              fail loudly rather than hang forever.\n"
+        ));
+    }
+
+    // VERIFY GATE (W2-1, only when the role declared done_checks): telling the
+    // worker its handoff is objectively graded changes behaviour for the better
+    // — it runs the checks itself BEFORE declaring done instead of trusting its
+    // own claim, and a bounce no longer surprises it.
+    if !done_checks.is_empty() {
+        let checks = done_checks
+            .iter()
+            .map(|c| format!("  - {c}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push_str(&format!(
+            "\n──────────────────────────────────────────────────────────────\n\
+             VERIFY GATE (managed by swarmx): when you write your handoff key, the \
+             server runs these objective checks in your working directory and only \
+             accepts the delivery if every one exits 0:\n{checks}\n\
+             Run them yourself BEFORE writing the handoff key. If a check fails, the \
+             delivery is bounced back to you with the failure output — fix it and \
+             re-write the key; if it is genuinely unsatisfiable, write the error key \
+             above and report the blocker.\n"
         ));
     }
 
@@ -382,8 +424,8 @@ fn install_hint_for(p: &CliPlugin) -> Option<CliInstallHint> {
         }),
         "zulu" => Some(CliInstallHint {
             title: "Install Comate Zulu".to_string(),
-            summary: "多模型编码 CLI —— 一把 Comate license 跑十余个模型（研究委员会 / \
-                      融合竞赛的多模型来源）。npm 全局安装后，在下方填入 Comate license 即可。"
+            summary: "多模型编码 CLI —— 一把 Comate license 跑十余个模型（多模对比 / \
+                      竞赛的多模型来源）。npm 全局安装后，在下方填入 Comate license 即可。"
                 .to_string(),
             docs_url: "https://www.npmjs.com/package/@comate/zulu".to_string(),
             commands: vec!["npm install -g @comate/zulu".to_string()],
@@ -703,6 +745,33 @@ pub async fn spawn(
             .next()
             .map(|t| t.id),
     };
+    // Captain singleton: never spawn a second live orchestrator in this
+    // direction. Return the existing one — zero user burden (no "already
+    // running" error to decode).
+    if req.role.as_deref() == Some("orchestrator") {
+        if let Some(existing) =
+            live_orchestrator_in_direction(&state, &ws.id, resolved_thread_id.as_deref()).await
+        {
+            tracing::info!(
+                agent = %existing.id,
+                workspace = %ws.id,
+                "POST /api/agent: reusing live orchestrator (singleton)"
+            );
+            let billing = state
+                .plugins
+                .get(&existing.cli)
+                .map(|p| billing_surface_token(p.billing_surface))
+                .unwrap_or_else(|| "unknown".into());
+            return Ok(Json(SpawnAgentResponse {
+                agent_id: existing.id,
+                cli: existing.cli,
+                role: existing.role,
+                workspace: existing.workspace,
+                fallback_from: None,
+                billing_surface: Some(billing),
+            }));
+        }
+    }
     // Single-agent spawn always uses per-agent subdir layout. Spells
     // are the only path that can ask for a shared workspace.
     let layout = WorkspaceLayout::PerAgent {
@@ -726,6 +795,8 @@ pub async fn spawn(
         cli: outcome.cli,
         role: outcome.role,
         workspace: outcome.workspace,
+        fallback_from: outcome.fallback_from,
+        billing_surface: Some(billing_surface_token(outcome.billing_surface)),
     }))
 }
 
@@ -738,7 +809,28 @@ pub(crate) struct SpawnOutcome {
     pub cli: String,
     pub role: String,
     pub workspace: String,
+    /// Set when the requested CLI wasn't installed and an installed fallback
+    /// was spawned instead: the REQUESTED plugin id (`cli` above is then the
+    /// fallback). Billing red line: the fallback filter allows API-billed
+    /// engines (e.g. reasonix's `requires_explicit_billing_opt_in == false`),
+    /// so every spawn response carries this and the UI can warn loudly instead
+    /// of the fallback only leaving a server-side `warn` log.
+    pub fallback_from: Option<String>,
+    /// Billing surface of the engine that ACTUALLY spawned — paired with
+    /// `fallback_from` so the caller can say "按 API 计费" when it matters.
+    pub billing_surface: crate::plugins::BillingSurface,
     pub lifecycle_rx: tokio::sync::broadcast::Receiver<LifecycleEvent>,
+}
+
+/// Wire token for a plugin's billing surface. swarmx-protocol DTOs carry the
+/// surface as a plain string (the protocol crate can't depend on the server
+/// crate's BillingSurface enum); reuse the enum's serde kebab-case rename so
+/// the token can't drift from the manifest spelling.
+fn billing_surface_token(surface: crate::plugins::BillingSurface) -> String {
+    serde_json::to_value(surface)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Shared "spawn + register + wire bookkeeping" pipeline used by both
@@ -818,6 +910,11 @@ pub(crate) async fn spawn_with_bookkeeping(
             "requested CLI binary unavailable; falling back to installed provider"
         );
     }
+    // Carry the fallback fact onto the outcome so every spawn response
+    // (/api/agent, /api/worker, run_spell) can surface it to the user — the
+    // warn above alone left a paid-API engine (e.g. reasonix) running in
+    // disguise when the user asked for claude.
+    let fallback_from_id = fallback_from.map(|p| p.id.clone());
     let plugin: CliPlugin = selected_plugin.clone();
     let actual_cli = plugin.id.as_str();
 
@@ -873,7 +970,7 @@ pub(crate) async fn spawn_with_bookkeeping(
     };
     let recorder_handle = recorder.as_ref().map(|r| r.handle());
 
-    let result = spawn_agent(
+    let result = match spawn_agent(
         &plugin,
         role,
         model,
@@ -883,8 +980,22 @@ pub(crate) async fn spawn_with_bookkeeping(
         &state.mcp_bin,
         &state.server_url,
         recorder_handle,
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // Spawn failed AFTER the recorder minted its .cast up front: no PTY
+            // pump took the writer and no agent row will ever reference it —
+            // the file is an orphan. Best-effort remove; tolerate failure (a
+            // header-only leftover is harmless, and a still-open handle can
+            // refuse the unlink on Windows) — warn and take the original error.
+            if recorder.is_some() {
+                if let Err(re) = tokio::fs::remove_file(&recording_path).await {
+                    tracing::warn!(?re, path = %recording_path.display(), "spawn failed; could not remove orphan .cast");
+                }
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
 
     let agent_id = result.agent_id.clone();
 
@@ -1153,6 +1264,8 @@ pub(crate) async fn spawn_with_bookkeeping(
         cli: result.slot.cli.clone(),
         role: result.slot.role.clone(),
         workspace: result.slot.workspace.clone(),
+        fallback_from: fallback_from_id,
+        billing_surface: plugin.billing_surface,
         lifecycle_rx: lifecycle_rx_for_caller,
     };
     state.registry.insert(agent_id, result.slot);
@@ -1236,6 +1349,8 @@ pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
                 // Backfilled in the batch `.error` pass after the SQLite union.
                 handoff_failed: false,
                 handoff_missing: false,
+                // Backfilled in the stalled pass after the SQLite union.
+                stalled: false,
             },
         );
     }
@@ -1288,6 +1403,9 @@ pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
                         // Backfilled in the batch `.error` pass below.
                         handoff_failed: false,
                         handoff_missing: false,
+                        // Historical rows are never alive, so the stalled pass
+                        // below never flags them — but default it explicitly.
+                        stalled: false,
                     });
                 }
             }
@@ -1391,6 +1509,63 @@ pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
+    // Stalled detection for the NeedsYou inbox's 「该醒没醒」lane: an ALIVE
+    // agent (shim ready, not exited, not killed, not paused) with unread mail
+    // older than STALLED_UNREAD_SILENCE_MS and no activity in that window —
+    // the precise shape of a broken wake chain. Deliberately NOT the 0.3.0
+    // suspected-stuck heuristic (misflagged a working codex; zero-false-
+    // positive is the bar, see STALLED_UNREAD_SILENCE_MS).
+    //
+    // Paused agents are excluded here (the store can't see the in-memory
+    // flag): a paused agent's undelivered wake is DELIBERATE (the operator
+    // turned auto-wake off), not a broken chain.
+    let now = now_ms();
+    let stalled_candidates: Vec<String> = items
+        .iter()
+        .filter(|it| {
+            it.shim_ready && it.shim_exit.is_none() && it.killed_at.is_none() && !it.paused
+        })
+        .map(|it| it.agent_id.clone())
+        .collect();
+    if !stalled_candidates.is_empty() {
+        match state
+            .store
+            .stalled_agents_with_unread(stalled_candidates, now, STALLED_UNREAD_SILENCE_MS)
+            .await
+        {
+            Ok(flagged) => {
+                if !flagged.is_empty() {
+                    let cutoff = now - STALLED_UNREAD_SILENCE_MS;
+                    for it in items.iter_mut() {
+                        if !flagged.contains(&it.agent_id) {
+                            continue;
+                        }
+                        // Live-activity guard: the persisted `last_activity_at`
+                        // is only stamped by the transcript tailer (claude/
+                        // codex) — opencode/reasonix/zulu report tool activity
+                        // over the ingress POST, which feeds the in-memory ring
+                        // (and WS) but NOT that column. Without this check a
+                        // mid-turn opencode worker that received mail minutes
+                        // ago would read as "silent" — the exact 0.3.0 false
+                        // positive. Fresh ring activity ⇒ alive and working.
+                        let live_active = state
+                            .swarm
+                            .recent_activity(&it.agent_id)
+                            .iter()
+                            .any(|rec| rec.at > cutoff);
+                        it.stalled = !live_active;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    "list_agents: stalled_agents_with_unread failed; stalled flags omitted"
+                );
+            }
+        }
+    }
+
     Json(items)
 }
 
@@ -1398,8 +1573,11 @@ pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
 /// `ClientControl::Kill` path so the two can't diverge (F1): kill the PTY, drop
 /// the in-memory inbox, unregister the wake subscription, persist the kill, and
 /// broadcast `Exited`. Returns `true` if the agent existed (caller maps to
-/// 204 vs 404). NOTE: this does NOT post a farewell message or clear exit_keys
-/// — those are specific to the WakeCoordinator's auto-kill-on-handoff path.
+/// 200 vs 404). NOTE: the broadcast `Exited` does NOT bypass the WakeCoordinator
+/// — its AgentState arm (wake.rs) routes `Exited` AND `Error` alike into
+/// `handle_agent_exit`, which unregisters the exit_key and writes the
+/// `<handoff>.error` alias for dependents when no fresh signal landed. What
+/// teardown itself skips is only the farewell message and the auto-kill grace.
 pub(crate) async fn teardown_agent(state: &AppState, agent_id: &str) -> bool {
     match state.registry.remove(agent_id) {
         Some(slot) => {
@@ -1443,7 +1621,7 @@ pub async fn kill(
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
     if teardown_agent(&state, &agent_id).await {
-        (StatusCode::NO_CONTENT, Json(json!({"ok": true})))
+        (StatusCode::OK, Json(json!({"ok": true})))
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -1469,7 +1647,7 @@ pub async fn wake_agent(
         );
     }
     match crate::wake::deliver_manual_wake(&state.swarm, &state.registry, &state.server_url, &agent_id).await {
-        Ok(_) => (StatusCode::NO_CONTENT, Json(json!({"ok": true}))),
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))),
         Err(e) => {
             tracing::warn!(?e, agent = %agent_id, "manual wake failed");
             (
@@ -1589,496 +1767,9 @@ pub async fn post_agent_activity(
 // 跟 run_spell 的区别只是"不解析 spell / 不查 role registry / 不挂 spell_run"。
 // ────────────────────────────────────────────────────────────────────────
 
-/// Per-agent bootstrap-injection context — the only things that differ
-/// between the `spawn_worker` (ad-hoc) and `run_spell` launch paths.
-pub(crate) struct BootstrapCtx {
-    /// "worker" or "spell" — surfaced in log lines.
-    pub(crate) source: &'static str,
-    /// Spell name for spell-launched agents; empty for ad-hoc workers.
-    pub(crate) spell: String,
-    /// Declared role-id keys; used to flag a surviving `{<role>_id}` / `{task}`
-    /// placeholder in the rendered prompt (empty for raw worker prompts).
-    pub(crate) role_keys: Vec<String>,
-}
-
-/// Background task: wait for `ShimReady` (short-circuit if it already fired),
-/// let the agent's MCP servers settle, then paste `prompt` + Enter into its
-/// PTY. Fail-soft — every error path `warn!`s and returns.
-///
-/// This is the SINGLE home of the timing-sensitive bootstrap sequence. It was
-/// previously copy-pasted between `spawn_worker` and `run_spell` (the F22
-/// finding); extracting it means the 2500ms MCP-settle window, the
-/// paste→150ms→`\r` submit split, and the ShimReady race handling can never
-/// drift between the two paths.
-pub(crate) fn spawn_bootstrap_inject(
-    registry: crate::registry::Registry,
-    mut rx: tokio::sync::broadcast::Receiver<LifecycleEvent>,
-    agent_id: String,
-    prompt: String,
-    ctx: BootstrapCtx,
-    // P1-D readiness gate: blackboard keys this agent depends on. The first
-    // prompt is NOT injected until all are present (or their `.error`/`.failed`
-    // alias). Empty ⇒ inject immediately (orchestrators / dep-less workers).
-    deps: Vec<String>,
-    swarm: std::sync::Arc<swarmx_swarm::Swarm>,
-    // The plugin catalog — used to read the agent's keystroke framing flags
-    // (e.g. kimi's `bracketed_paste`) off the slot's plugin id.
-    plugins: std::sync::Arc<crate::plugins::PluginRegistry>,
-    // This worker's spawn time (unix-ms). A dep only satisfies the gate if its
-    // latest blackboard write is at/after this — so a STALE key left on disk by
-    // a PRIOR run on the same thread can't bypass the gate.
-    spawned_at: i64,
-    // This server's own base URL (loopback). Threaded to the reasonix SSE driver
-    // so it can reach consume_wakes + the activity ingress; unused by the
-    // keystroke / opencode paths.
-    server_url: String,
-) {
-    tokio::spawn(async move {
-        // Short-circuit if ShimReady already fired in the gap between
-        // spawn_agent returning and our resubscribe — the PTY pump runs
-        // concurrently with the spawn caller, so for fast CLIs OSC_READY can
-        // arrive before a receiver is hooked up. Reading the mutex covers it.
-        let already_ready = registry
-            .get(&agent_id)
-            .map(|s| s.lock().lifecycle.lock().shim_ready)
-            .unwrap_or(false);
-        if !already_ready {
-            let wait_ready = async {
-                loop {
-                    match rx.recv().await {
-                        Ok(LifecycleEvent::ShimReady) => return Ok(()),
-                        Ok(LifecycleEvent::ShimExit(code)) => {
-                            return Err(format!("agent exited before ShimReady (code={code})"));
-                        }
-                        // Auth/quota failure is reported independently (the
-                        // lifecycle subscriber publishes Error); keep waiting for
-                        // ShimReady so injection still follows the normal path.
-                        Ok(LifecycleEvent::HealthFail { .. }) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Err("lifecycle channel closed".into());
-                        }
-                    }
-                }
-            };
-            match tokio::time::timeout(std::time::Duration::from_secs(30), wait_ready).await {
-                Ok(Ok(())) => {}
-                Ok(Err(msg)) => {
-                    tracing::warn!(source = ctx.source, spell = %ctx.spell, agent = %agent_id, msg = %msg, "bootstrap aborted");
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!(source = ctx.source, spell = %ctx.spell, agent = %agent_id, "bootstrap timed out waiting for ShimReady");
-                    return;
-                }
-            }
-        }
-        // Wait until the agent's MCP tools are actually visible to the model
-        // before injecting — otherwise the model reads an empty toolset and
-        // hand-waves "I don't have a swarm_send_message tool". The agent's own
-        // swarmx-mcp pings /api/agent/:id/mcp-ready when the CLI fetches its
-        // tool list (MCP lifecycle), flipping the slot's `mcp_ready` watch. We
-        // wait for that real signal (readiness-probe pattern) with a bounded
-        // fallback for any CLI/case that never pings. This replaces a fixed
-        // 2500ms sleep: claude/codex emit no stable "MCP ready" banner to
-        // scrape (verified empirically), and a fixed sleep both over-waits on
-        // fast starts and under-waits on slow ones (a known anti-pattern).
-        let slot_lock = match registry.get(&agent_id) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(source = ctx.source, spell = %ctx.spell, agent = %agent_id, "slot vanished before bootstrap");
-                return;
-            }
-        };
-        // reasonix connects its MCP servers only AFTER the first `/submit` (its
-        // session bootstraps the MCP clients lazily), so the mcp-ready ping can
-        // never arrive before we submit — waiting here would just burn the full
-        // fallback every time. Skip the wait for reasonix; the driver submits as
-        // soon as serve binds and MCP attaches a beat later.
-        let is_reasonix_serve = slot_lock.lock().serve_http_port().is_some();
-        // Subscribe without holding the parking_lot guard across the await.
-        let mut mcp_rx = slot_lock.lock().mcp_ready.subscribe();
-        if !is_reasonix_serve && !*mcp_rx.borrow() {
-            // Generous cap: only applies when the ping never arrives (e.g. a
-            // future CLI without MCP, or a lost ping). On the happy path the
-            // watch fires in ~1-2s and we proceed immediately.
-            const MCP_READY_FALLBACK: std::time::Duration = std::time::Duration::from_secs(6);
-            tokio::select! {
-                _ = mcp_rx.changed() => {
-                    tracing::debug!(source = ctx.source, spell = %ctx.spell, agent = %agent_id, "mcp ready; injecting bootstrap");
-                }
-                _ = tokio::time::sleep(MCP_READY_FALLBACK) => {
-                    tracing::warn!(source = ctx.source, spell = %ctx.spell, agent = %agent_id, "mcp-ready not signalled within fallback; injecting anyway");
-                }
-            }
-        }
-
-        // ── P1-D readiness gate ───────────────────────────────────────────
-        // Do NOT inject the worker's first prompt until every declared
-        // dependency (or its `.error`/`.failed` failure alias) is on the
-        // blackboard. A dependent worker therefore CANNOT run its first turn on
-        // inputs that don't exist yet — the premature-execution bug (observed:
-        // a reviewer judged FAIL before its producer wrote the file) is made
-        // structurally impossible at the mechanism level; the prompt INPUTS
-        // block becomes a secondary catch. The PTY sits idle (no tokens) while
-        // waiting; the producer's write lands the key and the next poll
-        // proceeds. A producer that DIES writes `<key>.error` (M6c), accepted by
-        // the alias check so the worker wakes to handle the failure rather than
-        // hang. Aborts if the agent is killed meanwhile.
-        if !deps.is_empty() {
-            const POLL: std::time::Duration = std::time::Duration::from_millis(750);
-            const LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
-            // Bound: if a declared producer is NEVER spawned (and so never writes
-            // a key OR a `.error`), don't poll forever as a phantom-alive agent.
-            // On timeout, inject anyway — the prompt INPUTS block then catches the
-            // missing input and the worker fails LOUD (surfacing the mistake to
-            // the orchestrator) instead of hanging invisibly.
-            const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
-            let start = std::time::Instant::now();
-            let mut since_log = LOG_EVERY; // log once immediately on first wait
-            loop {
-                if registry.get(&agent_id).is_none() {
-                    tracing::info!(agent = %agent_id, "readiness gate: agent gone before deps satisfied; aborting bootstrap");
-                    return;
-                }
-                // A dep counts as present only if its latest blackboard write is
-                // FRESH (`at >= spawned_at`). A stale key left by a prior run on
-                // the same thread must NOT satisfy the gate — else the premature-
-                // execution bug silently returns against stale inputs. `.error`/
-                // `.failed` aliases count (fail-loud on producer death).
-                let mut present = std::collections::HashSet::new();
-                for key in &deps {
-                    for probe in [key.clone(), format!("{key}.error"), format!("{key}.failed")] {
-                        let fresh = swarm
-                            .store()
-                            .list_blackboard_ops(Some(probe.clone()))
-                            .await
-                            .ok()
-                            .and_then(|ops| ops.first().map(|r| r.at))
-                            .is_some_and(|at| at >= spawned_at);
-                        if fresh {
-                            present.insert(probe);
-                        }
-                    }
-                }
-                let missing = first_unsatisfied_dep(&deps, &present);
-                if missing.is_none() {
-                    tracing::info!(agent = %agent_id, deps = ?deps, "readiness gate: deps satisfied; injecting first turn");
-                    break;
-                }
-                if start.elapsed() >= MAX_WAIT {
-                    tracing::warn!(agent = %agent_id, waiting_for = ?missing, max_wait_s = MAX_WAIT.as_secs(), "readiness gate: timed out; injecting anyway (producer may never have spawned) — worker's INPUTS block will fail loud");
-                    break;
-                }
-                if since_log >= LOG_EVERY {
-                    tracing::info!(agent = %agent_id, waiting_for = ?missing, deps = ?deps, elapsed_s = start.elapsed().as_secs(), "readiness gate: holding first turn until deps land");
-                    since_log = std::time::Duration::ZERO;
-                }
-                tokio::time::sleep(POLL).await;
-                since_log += POLL;
-            }
-        }
-
-        // opencode is driven over its TUI's `/tui/*` HTTP control API, not
-        // keystrokes: its TUI can't take a large (~24k-char) bootstrap via
-        // bracketed paste (it parks at READY and never submits). POST the prompt
-        // (append + submit) to the agent's `--port`. No terminal keyboard path →
-        // no escape-injection risk, so send the RAW (un-PTY-sanitized) text — the
-        // HTTP body is rendered as a message, not interpreted as terminal bytes.
-        // `deliver_bootstrap` RE-submits until opencode actually starts a turn: a
-        // cold TUI accepts a too-early submit with 200 but silently drops it (the
-        // race that parked captains forever). `workspace_dir` scopes the
-        // confirmation to this agent.
-        // zulu (Comate) is driven over `zulu serve` HTTP+SSE, but via its OWN
-        // per-turn-SSE driver (each turn is a fresh POST /session stream). Route
-        // zulu agents here BEFORE the reasonix serve_port check — zulu also sets
-        // serve_http_port. The driver owns the conversation for the agent's whole
-        // life. See crate::zulu_serve.
-        let zulu_conv = { slot_lock.lock().zulu() };
-        if let Some(conv) = zulu_conv {
-            crate::zulu_serve::run_driver_spawn(crate::zulu_serve::DriverCfg {
-                conv,
-                agent_id: agent_id.clone(),
-                bootstrap_prompt: prompt,
-                registry: registry.clone(),
-            });
-            tracing::info!(agent = %agent_id, "bootstrap: zulu serve driver started");
-            return;
-        }
-
-        // reasonix is driven over its `reasonix serve` HTTP+SSE API. Instead of
-        // pasting/POSTing the bootstrap inline, hand off to the long-lived driver
-        // task: it waits for serve to bind, sets yolo, submits this bootstrap,
-        // then follows /events to drive the turn_done→wake loop + activity. The
-        // driver owns delivery for the agent's whole life. See crate::reasonix_serve.
-        let serve_port = { slot_lock.lock().serve_http_port() };
-        if let Some(port) = serve_port {
-            crate::reasonix_serve::run_driver_spawn(crate::reasonix_serve::DriverCfg {
-                serve_port: port,
-                agent_id: agent_id.clone(),
-                swarmx_url: server_url.clone(),
-                bootstrap_prompt: prompt,
-                registry: registry.clone(),
-            });
-            tracing::info!(agent = %agent_id, port, "bootstrap: reasonix serve driver started");
-            return;
-        }
-
-        let (tui_port, workspace_dir) = {
-            let g = slot_lock.lock();
-            (g.tui_http_port(), g.workspace.clone())
-        };
-        if let Some(port) = tui_port {
-            match crate::opencode_tui::deliver_bootstrap(port, &prompt, &workspace_dir).await {
-                Ok(()) => {
-                    tracing::info!(agent = %agent_id, port, "bootstrap: opencode started its first turn (TUI HTTP)");
-                    // Feed the first-response watchdog a real liveness signal.
-                    // opencode (TUI) has no transcript tailer, so it never emits
-                    // the message/activity/usage the watchdog watches for — a
-                    // slow-but-fine cold start (45-60s+) was otherwise misflagged
-                    // "启动后无响应（可能未登录或卡住）" at 90s even while working
-                    // (live-observed). deliver_bootstrap returns Ok ONLY once
-                    // opencode provably started a turn, so stamp that instant as
-                    // activity → agent_silent_since_ready() goes false → no false
-                    // fire. (The clear-on-send path still covers a >90s turn.)
-                    if let Err(e) = swarm
-                        .store()
-                        .touch_agent_activity(agent_id.clone(), now_ms())
-                        .await
-                    {
-                        tracing::debug!(?e, agent = %agent_id, "opencode bootstrap: touch_agent_activity failed");
-                    }
-                }
-                Err(err) => {
-                    // opencode never started a turn within the 90s window — the
-                    // cold TUI is wedged. Don't just warn and leave a green
-                    // ShimReady dot + "暂无消息" (the worst engine to lie about
-                    // — cold opencode is the most failure-prone). Flip it to a
-                    // failure card the same way the HealthFail path does: persist
-                    // last_error AND publish the live Error state, so the user
-                    // gets an honest, actionable card instead of a forever-parked
-                    // "online" agent (the first-response watchdog otherwise races
-                    // a second 90s window before catching it).
-                    let reason =
-                        "opencode 启动后 90s 内没能发起第一次对话（TUI 卡住，可能未登录或配置不全）"
-                            .to_string();
-                    let at = now_ms();
-                    if let Err(e) = swarm
-                        .store()
-                        .record_agent_error(agent_id.clone(), reason.clone(), "fatal", at)
-                        .await
-                    {
-                        tracing::warn!(?e, agent = %agent_id, "opencode bootstrap: record_agent_error failed");
-                    }
-                    tracing::warn!(agent = %agent_id, port, ?err, "bootstrap: opencode never started a turn (TUI HTTP) — flipped to Error");
-                    swarm.publish_event(SwarmEvent::AgentState {
-                        agent_id: agent_id.clone(),
-                        state: AgentState::Error,
-                    });
-                    swarm.publish_event(SwarmEvent::AgentActivity {
-                        agent_id: agent_id.clone(),
-                        kind: "system".to_string(),
-                        label: reason,
-                        phase: "error".to_string(),
-                        seq: 0,
-                        duration_ms: None,
-                        at,
-                    });
-                }
-            }
-            return;
-        }
-        // kimi-class readiness gate: wait for the TUI's OWN settled banner
-        // (`bootstrap_ready_needle` in the manifest) before pasting. kimi's
-        // mcp-ready ping fires early (its tool fetch precedes the input
-        // pipeline becoming stable) — a paste landing in that window is
-        // silently eaten (ctx stays 0%; measured 2/4 spawns). Bounded: a
-        // missing banner injects anyway and the first-response watchdog
-        // judges the outcome. Empty needle (claude/codex) skips the gate.
-        let (ready_needle, ready_settle_ms) = {
-            let cli = slot_lock.lock().cli.clone();
-            match plugins.get(&cli) {
-                Some(p) => (
-                    p.bootstrap_ready_needle.clone(),
-                    p.bootstrap_ready_settle_ms,
-                ),
-                None => (String::new(), 0),
-            }
-        };
-        if !ready_needle.is_empty() {
-            let stream = slot_lock.lock().pty_stream();
-            let found = match stream {
-                Some(s) => {
-                    wait_for_pty_needle(&s, ready_needle.as_bytes(), BOOTSTRAP_READY_NEEDLE_TIMEOUT)
-                        .await
-                }
-                None => false,
-            };
-            if found {
-                if ready_settle_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(ready_settle_ms)).await;
-                }
-                tracing::debug!(source = ctx.source, agent = %agent_id, needle = %ready_needle, "bootstrap readiness needle seen; pasting");
-            } else {
-                tracing::warn!(source = ctx.source, agent = %agent_id, needle = %ready_needle, "bootstrap readiness needle not seen in time; injecting anyway");
-            }
-        }
-        let pty_input = slot_lock.lock().pty_input();
-        let Some(input_tx) = pty_input else {
-            tracing::warn!(agent = %agent_id, "bootstrap: agent has no live PTY input; first turn not delivered");
-            return;
-        };
-        // SECURITY: strip ANSI / terminal-control bytes before they hit the PTY.
-        // The prompt is machine-rendered from spell/role/worker text that may carry
-        // ESC/CSI/OSC sequences or other control chars; injected verbatim they let
-        // the source manipulate the agent's TUI and the user's terminal (incl.
-        // INVISIBLE prompt injection that hides what the model was told). Keeps
-        // visible text + `\n`/`\t`; drops `\r` (would prematurely submit the paste)
-        // and all other control codes. See `spells::sanitize_pty_inject`.
-        let prompt = crate::spells::sanitize_pty_inject(&prompt);
-        // Diagnostic: flag a surviving `{task}` / `{<role>_id}` placeholder
-        // (computed before `prompt` is consumed by `into_bytes`).
-        let has_unsubst = prompt.contains("{task}")
-            || ctx
-                .role_keys
-                .iter()
-                .any(|r| prompt.contains(&format!("{{{r}_id}}")));
-        let body = prompt.into_bytes();
-        let body_len = body.len();
-        // kimi declares `bracketed_paste`: wrap the body in explicit
-        // `ESC[200~`…`ESC[201~` markers so its TUI treats the (large) paste as
-        // ONE atomic paste — without them the trailing `\r` can be absorbed
-        // as a newline mid-burst and the turn never starts (live-verified).
-        // Resolved off the slot's plugin id; claude/codex keep the raw-burst
-        // framing they're proven on. The settle scaling below still keys off
-        // the PROMPT length (markers add a constant 12 bytes).
-        let bracketed = {
-            let cli = slot_lock.lock().cli.clone();
-            plugins.get(&cli).map(|p| p.bracketed_paste).unwrap_or(false)
-        };
-        let body = if bracketed {
-            let mut b = Vec::with_capacity(body.len() + 12);
-            b.extend_from_slice(b"\x1b[200~");
-            b.extend_from_slice(&body);
-            b.extend_from_slice(b"\x1b[201~");
-            b
-        } else {
-            body
-        };
-        // Submit as separate frames (paste body, settle, then \r): claude/
-        // codex TUIs classify a burst containing newlines as a *paste*, so a
-        // \r in the same burst becomes a literal newline rather than a submit.
-        // Splitting lets the TUI settle the paste, then the standalone \r reads
-        // as Enter.
-        //
-        // The settle delay MUST scale with prompt size. A cold-start TUI takes
-        // longer to drain + classify a large bracketed paste; a \r that lands
-        // before the paste closes is swallowed into the paste buffer and never
-        // submits. Observed in QA: a 21988-byte `init` orchestrator prompt left
-        // claude parked at Ctx:0 forever (green "READY", no greeting) — a manual
-        // Enter unstuck it instantly. A flat 150ms is only safe for small
-        // prompts. We scale ~1ms per 100 bytes on top of a 150ms floor, and then
-        // re-send \r once more after a further gap as a safety net: if the first
-        // \r was absorbed by a still-open paste, the second (well after the paste
-        // has closed) submits; if the first already submitted, the second lands
-        // on an empty prompt and is a harmless no-op.
-        if let Err(err) = input_tx.send(bytes::Bytes::from(body)).await {
-            tracing::warn!(source = ctx.source, spell = %ctx.spell, agent = %agent_id, ?err, "PTY paste send failed during bootstrap");
-            return;
-        }
-        let settle_ms = 150 + (body_len as u64 / 100);
-        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
-        if let Err(err) = input_tx.send(bytes::Bytes::from_static(b"\r")).await {
-            tracing::warn!(source = ctx.source, spell = %ctx.spell, agent = %agent_id, ?err, "PTY submit send failed during bootstrap");
-            return;
-        }
-        // Safety net: re-submit once after the paste has certainly closed. A
-        // second Enter on an already-submitted (now empty) prompt is a no-op.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        if let Err(err) = input_tx.send(bytes::Bytes::from_static(b"\r")).await {
-            tracing::warn!(source = ctx.source, spell = %ctx.spell, agent = %agent_id, ?err, "PTY re-submit send failed during bootstrap");
-        }
-        tracing::info!(
-            source = ctx.source,
-            spell = %ctx.spell,
-            agent = %agent_id,
-            bytes = body_len,
-            has_unsubstituted_placeholders = has_unsubst,
-            "bootstrap prompt injected"
-        );
-        // Stage heartbeat for the cold-start progress UI: the first prompt is
-        // now submitted; the "first turn" boundary is the first AgentActivity
-        // that follows (no extra event needed).
-        swarm.publish_event(SwarmEvent::AgentStage {
-            agent_id: agent_id.clone(),
-            stage: "bootstrap_injected".into(),
-            at: now_ms(),
-        });
-    });
-}
-
-/// How long the keystroke bootstrap waits for a plugin's
-/// `bootstrap_ready_needle` before giving up and pasting anyway. kimi's
-/// "MCP server … connected" banner lands <2s after spawn on a warm box; 45s
-/// covers a cold first run (plugin/theme init) while still leaving the 90s
-/// first-response watchdog room to judge a genuinely wedged agent.
-const BOOTSTRAP_READY_NEEDLE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(45);
-
-/// Scan an agent's PTY output for `needle` — ring buffer first, then live
-/// appends — returning `true` once found (`false` on timeout or stream
-/// close). Plain byte search over a rolling stitch window (needles are short
-/// ASCII banners; no decoding). Used by the keystroke bootstrap's
-/// kimi-class readiness gate: the TUI's own banner is the only trustworthy
-/// "input pipeline is stable" signal we have.
-async fn wait_for_pty_needle(
-    stream: &std::sync::Arc<crate::pty_stream::PtyStream>,
-    needle: &[u8],
-    timeout: std::time::Duration,
-) -> bool {
-    use crate::pty_stream::FetchResult;
-    if needle.is_empty() {
-        return true;
-    }
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut cursor: u32 = 0; // 0 = replay from the oldest still-buffered entry
-    let mut window: Vec<u8> = Vec::new();
-    /// Stitch across chunk boundaries without unbounded growth (a banner is
-    /// <100 bytes; 64KB of tail is far more than enough).
-    const WINDOW_CAP: usize = 64 * 1024;
-    loop {
-        match stream.fetch_since(cursor) {
-            FetchResult::Ok(entries) => {
-                for (seq, bytes) in entries {
-                    cursor = seq;
-                    window.extend_from_slice(&bytes);
-                }
-                if window.len() > WINDOW_CAP {
-                    let drop = window.len() - WINDOW_CAP;
-                    window.drain(..drop);
-                }
-                if window.windows(needle.len()).any(|w| w == needle) {
-                    return true;
-                }
-            }
-            FetchResult::Gap { current_seq } => {
-                // Buffer wrapped past us — resync and keep watching.
-                cursor = current_seq;
-                window.clear();
-            }
-        }
-        if stream.snapshot().closed {
-            return false;
-        }
-        tokio::select! {
-            _ = stream.wait_changed(cursor) => {}
-            _ = tokio::time::sleep_until(deadline) => return false,
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-    }
-}
+// BootstrapCtx + spawn_bootstrap_inject live in `crate::agent_lifecycle`
+// (ShimReady → mcp-ready → readiness gate → TurnDelivery / PTY paste).
+pub(crate) use crate::agent_lifecycle::{spawn_bootstrap_inject, BootstrapCtx};
 
 pub async fn spawn_worker(
     State(state): State<AppState>,
@@ -2275,6 +1966,30 @@ pub async fn spawn_worker(
         vec!["done".to_string()]
     };
 
+    // W2-1 verify gate (opt-in, default OFF): the role manifest may declare
+    // `done_checks` — objective commands the server runs in the worker's cwd
+    // after it writes its handoff key, BEFORE the completion is accepted
+    // (auto-kill). Empty = no gate, legacy behaviour. Validate every entry
+    // against the allowlist NOW — before anything is spawned or persisted —
+    // so a bad declaration is a loud 400 the orchestrator can fix, never a
+    // silently-swallowed gate (the security boundary lives in verify.rs).
+    let done_checks: Vec<String> = manifest
+        .done_checks
+        .iter()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    for c in &done_checks {
+        if let Err(e) = crate::verify::validate_verify_cmd(c) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("role '{role_slug}' done_checks entry {c:?} rejected: {e}")
+                })),
+            ));
+        }
+    }
+
     // Mint the canonical handoff key(s) this worker writes (one per kind), plus
     // the single primary signal (the "done" kind if present, else the first).
     let minted_produces: Vec<String> = produces
@@ -2423,6 +2138,7 @@ pub async fn spawn_worker(
         &minted_produces,
         &error_key,
         &depends_on,
+        &done_checks,
     );
     let produces_json = serde_json::to_string(&produces).unwrap_or_else(|_| "[]".to_string());
     let consumes_json =
@@ -2502,6 +2218,8 @@ pub async fn spawn_worker(
         role_slug.clone(),
         handoff_signal.clone(),
         now_ms(),
+        // W2-1: validated above; empty (the default) = no verify gate.
+        done_checks.clone(),
     )
     .await;
 
@@ -2548,6 +2266,22 @@ pub async fn spawn_worker(
     // from="system" makes send_message fall back to the recipient's (the
     // dispatcher's) direction, so it lands in the right thread. Best-effort,
     // like record_worker above; a failure here doesn't fail the spawn.
+    let mut dispatch_meta = serde_json::json!({
+        "subtype": "dispatch",
+        "child_agent": out.agent_id,
+        "child_role": role_label,
+        "role_slug": role_slug,
+    });
+    // Billing red line: if this worker's engine silently fell back (e.g. the
+    // orchestrator asked for claude but only API-billed reasonix is installed),
+    // stamp it on the persisted card — the SpawnWorkerResponse fields alone
+    // only reach the orchestrator LLM, which may never relay them to the user.
+    if let Some(from) = &out.fallback_from {
+        dispatch_meta["fallback_from"] = serde_json::json!(from);
+        dispatch_meta["fallback_cli"] = serde_json::json!(out.cli);
+        dispatch_meta["billing_surface"] =
+            serde_json::json!(billing_surface_token(out.billing_surface));
+    }
     if let Err(e) = state
         .swarm
         .send_message(swarmx_swarm::NewMessage {
@@ -2557,12 +2291,7 @@ pub async fn spawn_worker(
             body: format!("派给 {role_label}"),
             sent_at: now_ms(),
             in_reply_to: None,
-            meta: Some(serde_json::json!({
-                "subtype": "dispatch",
-                "child_agent": out.agent_id,
-                "child_role": role_label,
-                "role_slug": role_slug,
-            })),
+            meta: Some(dispatch_meta),
         })
         .await
     {
@@ -2596,6 +2325,8 @@ pub async fn spawn_worker(
         workspace: out.workspace,
         handoff_signal,
         depends_on,
+        fallback_from: out.fallback_from,
+        billing_surface: Some(billing_surface_token(out.billing_surface)),
     }))
 }
 
@@ -3082,6 +2813,38 @@ pub async fn run_spell(
         .map(|t| t.slug.clone())
         .unwrap_or_else(|| "main".to_string());
 
+    // Captain singleton (zero-burden): init / any orch-only spell reuses the
+    // live captain instead of spawning a twin that sits silent and burns
+    // quota. Model-switch paths kill first, then hit this with an empty room.
+    let orch_only = !resolved_agents.is_empty()
+        && resolved_agents.iter().all(|a| a.role == "orchestrator");
+    if orch_only {
+        if let Some(existing) =
+            live_orchestrator_in_direction(&state, &workspace.id, thread_id.as_deref()).await
+        {
+            tracing::info!(
+                spell = %req.name,
+                agent = %existing.id,
+                workspace = %workspace.id,
+                "run_spell: reusing live orchestrator (singleton)"
+            );
+            let billing = state
+                .plugins
+                .get(&existing.cli)
+                .map(|p| billing_surface_token(p.billing_surface));
+            return Ok(Json(RunSpellResponse {
+                spell: req.name,
+                agents: vec![RunSpellAgent {
+                    role: existing.role,
+                    cli: existing.cli,
+                    agent_id: existing.id,
+                    fallback_from: None,
+                    billing_surface: billing,
+                }],
+            }));
+        }
+    }
+
     // Pick the workspace layout. For shared_workspace spells we use the
     // explicit `workspace_dir` if the client sent one (M6a UX: the
     // SpellsLauncher exposes a text input); otherwise default to the
@@ -3238,6 +3001,10 @@ pub async fn run_spell(
             resolved.role.clone(),
             handoff_signal,
             now_ms(),
+            // Spell path: no verify gate (empty = legacy behaviour). The gate
+            // is declared per-role via `done_checks` and wired on the
+            // spawn_worker path only; spells ship no roles with checks.
+            Vec::new(),
         )
         .await;
         outcomes.push((out, resolved.system_prompt.clone()));
@@ -3299,6 +3066,11 @@ pub async fn run_spell(
                 role: o.role,
                 cli: o.cli,
                 agent_id: o.agent_id,
+                // Engine fallback visibility (billing red line): the UI toasts
+                // on these — e.g. captain_cli=claude requested but only
+                // API-billed reasonix installed must not go unannounced.
+                fallback_from: o.fallback_from,
+                billing_surface: Some(billing_surface_token(o.billing_surface)),
             })
             .collect(),
     };
@@ -4001,18 +3773,40 @@ mod p0_tests {
             &["ws1/main/frontend.done".to_string()],
             "ws1/main/frontend.done.error",
             &[],
+            &[],
         );
         assert!(p.starts_with("do the thing"));
         assert!(p.contains("ws1/main/frontend.done"));
         assert!(p.contains("ws1/main/frontend.done.error"));
         assert!(p.contains("VERBATIM"));
         assert!(!p.contains("INPUTS"), "no deps → no inputs gate");
+        assert!(!p.contains("VERIFY GATE"), "no done_checks → no verify gate");
         // No keys at all → prompt returned unchanged (fire-and-forget, no deps).
-        assert_eq!(build_worker_prompt("x", &[], "x.error", &[]), "x");
+        assert_eq!(build_worker_prompt("x", &[], "x.error", &[], &[]), "x");
+    }
+
+    #[test]
+    fn build_worker_prompt_verify_gate_block_only_when_checks_declared() {
+        // W2-1: declared done_checks add a VERIFY GATE block naming the exact
+        // commands, so the worker self-checks before declaring done.
+        let p = build_worker_prompt(
+            "do the thing",
+            &["ws1/main/backend.done".to_string()],
+            "ws1/main/backend.done.error",
+            &[],
+            &["cargo test".to_string(), "cargo clippy".to_string()],
+        );
+        assert!(p.contains("VERIFY GATE"));
+        assert!(p.contains("- cargo test"));
+        assert!(p.contains("- cargo clippy"));
+        assert!(p.contains("bounced back"), "names the failure semantics");
+        // Still carries the handoff block above it.
+        assert!(p.contains("ws1/main/backend.done"));
     }
 
     #[test]
     fn readiness_gate_first_unsatisfied_dep() {
+        use crate::agent_lifecycle::first_unsatisfied_dep;
         use std::collections::HashSet;
         let deps = vec![
             "ws/main/backend.done".to_string(),
@@ -4050,12 +3844,75 @@ mod p0_tests {
     }
 
     #[test]
+    fn gate_watchdog_shield_only_after_long_wait() {
+        use crate::agent_lifecycle::gate_should_shield_watchdog;
+        use std::time::Duration;
+        // Short gate waits must NOT stamp activity: `last_activity_at` is
+        // permanent once set, and a worker that clears the gate quickly and
+        // then truly wedges before any sign of life has to stay catchable by
+        // the one-shot watchdog.
+        assert!(!gate_should_shield_watchdog(Duration::ZERO));
+        assert!(!gate_should_shield_watchdog(Duration::from_secs(59)));
+        // At/past the shield point the 90s watchdog (the minimum window) fires
+        // DURING the wait → shield the legitimate silence.
+        assert!(gate_should_shield_watchdog(Duration::from_secs(60)));
+        assert!(gate_should_shield_watchdog(Duration::from_secs(299)));
+    }
+
+    #[tokio::test]
+    async fn gated_worker_shield_touch_defuses_watchdog_probe() {
+        // Regression: a readiness-gated worker waits silently past the
+        // first-response watchdog window, and the watchdog's one-shot probe
+        // (`agent_silent_since_ready`) must NOT flag it once the gate's shield
+        // touch has landed. Exercised at the store layer — the gate loop's
+        // timings are wall-clock minutes, too slow for a unit test; the probe's
+        // message/usage/killed signals are covered by swarmx-storage's own
+        // `agent_silent_since_ready_reflects_signs_of_life`.
+        let dir = tempfile::tempdir().unwrap();
+        let store = swarmx_storage::Store::open(&dir.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        let at = now_ms();
+        store
+            .record_agent_spawn(NewAgent {
+                id: "w-gated".into(),
+                cli: "claude".into(),
+                role: "backend".into(),
+                workspace: dir.path().join("ws").to_string_lossy().into_owned(),
+                spawned_at: at,
+                workspace_id: None,
+                spell_run_id: None,
+                thread_id: None,
+            })
+            .await
+            .unwrap();
+        store.record_shim_ready("w-gated".into(), at).await.unwrap();
+        // Bug precondition: ready but silent (still gated) → the probe flags
+        // it — exactly what the watchdog mistook for a wedge.
+        assert!(store
+            .agent_silent_since_ready("w-gated".into())
+            .await
+            .unwrap());
+        // What the gate now does on every poll while holding past the shield
+        // point → the probe goes false and the watchdog stands down.
+        store
+            .touch_agent_activity("w-gated".into(), now_ms())
+            .await
+            .unwrap();
+        assert!(!store
+            .agent_silent_since_ready("w-gated".into())
+            .await
+            .unwrap());
+    }
+
+    #[test]
     fn build_worker_prompt_adds_inputs_wait_gate_when_deps_present() {
         let p = build_worker_prompt(
             "review it",
             &["ws1/main/reviewer.done".to_string()],
             "ws1/main/reviewer.done.error",
             &["ws1/main/backend.done".to_string()],
+            &[],
         );
         // The wait-gate must name the dep and forbid acting / writing handoff early.
         assert!(p.contains("INPUTS"));
@@ -4065,7 +3922,7 @@ mod p0_tests {
         // Still carries its own handoff block.
         assert!(p.contains("ws1/main/reviewer.done"));
         // A dep-only worker with no produces still gets the inputs gate.
-        let q = build_worker_prompt("x", &[], "x.error", &["ws1/main/dep.done".to_string()]);
+        let q = build_worker_prompt("x", &[], "x.error", &["ws1/main/dep.done".to_string()], &[]);
         assert!(q.contains("INPUTS"));
         assert!(q.contains("ws1/main/dep.done"));
     }
@@ -4155,11 +4012,31 @@ mod p0_tests {
                 .contains("Codex CLI: curl -fsSL https://chatgpt.com/codex/install.sh | sh")
         );
     }
+
+    #[test]
+    fn billing_surface_token_matches_serde_kebab_rename() {
+        // The token feeds UI copy ("按 API 计费") on an engine fallback, so pin
+        // it to the manifest's serde spelling — reasonix is the ApiKey-billed
+        // fallback this surfacing exists for (its requires_explicit_billing_opt_in
+        // is false, making it a legal silent fallback candidate).
+        assert_eq!(
+            billing_surface_token(crate::plugins::BillingSurface::ApiKey),
+            "api-key"
+        );
+        assert_eq!(
+            billing_surface_token(crate::plugins::BillingSurface::InteractiveSubscription),
+            "interactive-subscription"
+        );
+        assert_eq!(
+            billing_surface_token(crate::plugins::BillingSurface::Unknown),
+            "unknown"
+        );
+    }
 }
 
 #[cfg(test)]
 mod bootstrap_needle_tests {
-    use super::wait_for_pty_needle;
+    use crate::agent_lifecycle::wait_for_pty_needle;
     use bytes::Bytes;
     use std::sync::Arc;
     use std::time::Duration;

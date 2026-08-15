@@ -43,9 +43,11 @@ import type {
   ThreadInfo,
 } from "../../api/types";
 import { setActiveWorkspaceId } from "../../lib/activeWorkspace";
+import { notifySpawnFallbacks } from "../../lib/engineFallback";
 import { ErrorBoundary } from "../../components/ErrorBoundary";
 import { Welcome } from "../../components/Welcome";
 import { toast } from "@/lib/toast";
+import { useAutoNudgeStalled } from "@/hooks/useAutoNudgeStalled";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   Sheet,
@@ -207,6 +209,7 @@ export default function WorkspaceShell() {
     threadAgentIds,
     threadMembers,
     handoffMissingAgents,
+    needsYouMembers,
     liveMessages,
     liveRead,
     agentStateById,
@@ -221,6 +224,13 @@ export default function WorkspaceShell() {
     wsError,
     deleteWorkspace,
   } = useWorkspaceShellData(wsId, threadSlugParam);
+
+  // Stalled agents = auto-nudge (no user "催一下" button). Cooldown inside.
+  useAutoNudgeStalled({
+    members: needsYouMembers,
+    liveById: agentStateById,
+    messages: liveMessages,
+  });
 
   // deleteWorkspace performs the kill+delete+optimistic-drop and returns where
   // to navigate when the ACTIVE workspace was removed (router stays here).
@@ -275,13 +285,15 @@ export default function WorkspaceShell() {
         // direction comes back "ready" with no isolation, so the frontend
         // owns the spawn (isolation happens later via swarm_name_thread).
         if (th.state !== "preparing") {
-          await api.runSpell({
+          const resp = await api.runSpell({
             name: "init",
             task: "",
             workspace_dir: ws.path,
             workspace_id: ws.workspaceId,
             thread_id: th.id,
           });
+          // Engine fallback is never silent (billing red line) — see CreateWizard.
+          notifySpawnFallbacks(t, resp.agents);
         } else {
           // Watch this one for the failed-isolation case (degraded → no
           // orchestrator). The settle-watcher effect resolves it.
@@ -363,7 +375,11 @@ export default function WorkspaceShell() {
           workspace_id: info.workspaceId,
           thread_id: threadId,
         })
-        .then(() => refreshAgents())
+        .then((resp) => {
+          // Engine fallback is never silent (billing red line) — see CreateWizard.
+          notifySpawnFallbacks(t, resp.agents);
+          refreshAgents();
+        })
         .catch((e) => {
           recoveringDirRef.current.delete(threadId);
           // eslint-disable-next-line no-console
@@ -579,11 +595,10 @@ export default function WorkspaceShell() {
             onCleanupThread={(threadId) => onDeleteThread(activeWs, threadId)}
             onOpenWorkspaceNav={() => setMobileNavOpen(true)}
           />
-          {/* 「需要我」全局收件箱:error/stalled/handoff 三类聚合,一键直达
-              agent 抽屉。空时整条消失(不占视觉)。数据判定与成员栏同一套
-              视觉管线(deriveNeedsYou → resolveMemberVisual)。 */}
+          {/* 「需要你」:只放 error / handoff（要人决定）。stalled 由
+              useAutoNudgeStalled 自动催，不进这条栏。 */}
           <NeedsYouBar
-            members={activeWs.members}
+            members={needsYouMembers}
             liveById={agentStateById}
             messages={liveMessages}
             onOpenAgent={openAgent}

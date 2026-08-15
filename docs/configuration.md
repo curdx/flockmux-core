@@ -64,6 +64,7 @@ running). Use macOS or Linux for a supported setup.
 | `SWARMX_AUTO_RESPAWN_ORCHESTRATORS` | unset (off) | `1` = on boot, re-spawn orchestrators for alive workspaces the orphan sweep killed. Can burn an LLM turn / revive a provider you're avoiding — opt-in. |
 | `SWARMX_ALLOW_PAID_TRANSPORT` | unset (off) | Opt-in to a CLI's paid SDK/API transport when its plugin declares one (billing guard). |
 | `SWARMX_ALLOW_CLAUDE_PRINT` | unset (off) | Opt-in to claude non-PTY print/SDK mode (a separate billing surface). |
+| `SWARMX_DISABLE_LITELLM_REFRESH` | unset (off) | `1` = don't fetch the LiteLLM price table from GitHub at boot; use the shipped/disk snapshot only. |
 
 ## Agent git identity
 

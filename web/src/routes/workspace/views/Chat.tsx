@@ -21,6 +21,7 @@ import {
   type EngineReadinessState,
 } from "../../../hooks/useEngineReadiness";
 import { engineStatusKey } from "../../../lib/engineEvidence";
+import { notifySpawnFallbacks } from "../../../lib/engineFallback";
 import { MessagesPanel } from "../../../components/MessagesPanel";
 import { OrchestratorFailureCard } from "../../../components/workspace/OrchestratorFailureCard";
 import { BootstrapChecklistCard } from "../../../components/chat/BootstrapChecklistCard";
@@ -39,11 +40,6 @@ import {
   type ConfirmActionState,
 } from "@/components/ConfirmActionDialog";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import {
   Boxes,
   FolderOpen,
   GitBranch,
@@ -52,15 +48,16 @@ import {
   Radio,
   TriangleAlert,
   Users,
-  Zap,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { toast } from "@/lib/toast";
 import {
   roleColorClass as roleColor,
   roleDisplayName,
+  roleLabelAmong,
   resolveMemberVisual,
   formatActivityLine,
+  agentIsAlive,
   agentIsWorkable,
   agentIsErrored,
 } from "@/lib/agent";
@@ -248,7 +245,7 @@ const TASK_PENDING_TIMEOUT_MS = 60_000;
 // task 进入 ready 后展示这么久再自动消失（让用户看清楚已就绪）。
 const TASK_READY_DISMISS_MS = 4_000;
 // spawning 事件归属到最近 user 消息的窗口。超过这个时长的 spawn 视为
-// 独立事件，不归到用户上一条消息。注意是 LLM 节奏:队长收到消息 →
+// 独立事件，不归到用户上一条消息。注意是 LLM 节奏:规划收到消息 →
 // 唤醒 → 思考 → 调 swarm_spawn_worker —— 实测派活延迟 10s~70s+(思考摘要
 // 里明明白白写着 "思考 1m 10s")。15s 窗几乎永远挂不上,60s 窗照样被
 // 71s 的真实派活甩掉。180s 覆盖 p99 派活,同时仍小于"无关联自发 spawn"
@@ -262,8 +259,6 @@ function WorkspaceStatusStrip({
   sourceCount,
   cwdBranch,
   readiness,
-  reviving,
-  onRevive,
   hasError = false,
   preparing = false,
 }: {
@@ -273,16 +268,13 @@ function WorkspaceStatusStrip({
   sourceCount: number;
   cwdBranch: string | null;
   readiness: EngineReadinessState;
-  reviving: boolean;
-  onRevive: () => void;
   /** True when the direction's orchestrator is in an error state (auth/quota/
    *  watchdog). Keeps the strip's liveness dot honest — without it the strip
    *  would still say "1 个 AI 在线" directly above the failure card. */
   hasError?: boolean;
   /** True while the direction is still bootstrapping (thread.state ===
-   *  "preparing") — the orchestrator is on its way up. Suppresses the
-   *  "唤起 orchestrator" button so the user can't double-spawn it in the
-   *  startup window. */
+   *  "preparing",或规划已 spawn 但 PTY 还没 ready 的冷启动窗口)——
+   *  the orchestrator is on its way up. */
   preparing?: boolean;
 }) {
   const { t } = useTranslation();
@@ -297,18 +289,10 @@ function WorkspaceStatusStrip({
   // surface the real error), so we don't hard-gate on the probe verdict here.
   const noCliReady =
     !cliLoading && engines.length > 0 && installedEngines.length === 0;
-  const someCliMissing =
-    !cliLoading &&
-    installedEngines.length > 0 &&
-    installedEngines.length < engines.length;
   // Prefer verified-usable names for the chip; fall back to installed names
   // (shown without a "ready" claim) when nothing's been probed yet.
   const usableNames = usableEngines.map((p) => p.display_name).join(" / ");
   const cliNames = installedEngines.map((p) => p.display_name).join(" / ");
-  const missingCliNames = engines
-    .filter((e) => !e.installed)
-    .map((p) => p.display_name)
-    .join(" / ");
   // Hover detail for the engine chip: every installed engine + how it was
   // verified (已验证回合 / 使用中 / 仅启动 / 需登录 …), one per line. Lets the
   // compact chip stay short while the full per-engine evidence is one hover away.
@@ -360,20 +344,21 @@ function WorkspaceStatusStrip({
                   <span className="truncate font-mono">{cwdBranch}</span>
                 </span>
               )}
-              {/* Honest engine chip: "可用" (green) ONLY for engines the probe
-                  verified can run; otherwise the neutral "已安装" — installed is
-                  not "ready". Hidden on error so it never sits beside a failure
-                  card claiming the engine is fine. */}
-              {!hasError && !cliLoading && installedEngines.length > 0 && (
+              {/* Engine chip: only when members are up but engines aren't
+                  verified usable yet. Empty room already has EmptyState;
+                  online+usable is redundant next to「N 人在线」. */}
+              {!hasError &&
+                !cliLoading &&
+                hasMembers &&
+                installedEngines.length > 0 &&
+                !usableNames && (
                 <span
                   className="inline-flex min-w-0 cursor-default items-center gap-1"
                   title={engineHover}
                 >
                   <PlugZap className="size-3 shrink-0" />
                   <span className="truncate">
-                    {usableNames
-                      ? t("chat.workspaceStripCliUsable", { names: usableNames })
-                      : t("chat.workspaceStripCliInstalled", { names: cliNames })}
+                    {t("chat.workspaceStripCliInstalled", { names: cliNames })}
                   </span>
                 </span>
               )}
@@ -404,39 +389,13 @@ function WorkspaceStatusStrip({
           <div className="flex items-center gap-2 sm:max-w-[430px]">
             <Loader2 className="size-3.5 shrink-0 animate-spin text-foreground-tertiary" />
             <p className="font-caption text-[11px] leading-5 text-foreground-tertiary">
-              {t("chat.workspaceStripPreparing", { defaultValue: "正在准备 orchestrator…" })}
+              {t("chat.workspaceStripPreparing", { defaultValue: "正在准备…" })}
             </p>
-          </div>
-        ) : !hasMembers ? (
-          <div className="flex flex-col gap-2 sm:max-w-[430px] sm:flex-row sm:items-center">
-            <p className="font-caption text-[11px] leading-5 text-foreground-tertiary">
-              {someCliMissing
-                ? t("chat.workspaceStripCliPartial", { names: cliNames, missing: missingCliNames })
-                : t("chat.workspaceStripReviveHint", { names: cliNames })}
-            </p>
-            <Button
-              size="sm"
-              onClick={onRevive}
-              disabled={reviving}
-              className="h-8 shrink-0 gap-1.5"
-            >
-              <Zap className="size-3.5" />
-              {reviving ? t("chat.reviving") : t("chat.reviveOrchestrator")}
-            </Button>
-          </div>
-        ) : someCliMissing ? (
-          <div className="flex flex-col gap-2 sm:max-w-[430px] sm:flex-row sm:items-center">
-            <p className="font-caption text-[11px] leading-5 text-foreground-tertiary">
-              {t("chat.workspaceStripCliPartial", { names: cliNames, missing: missingCliNames })}
-            </p>
-            <Button asChild size="sm" variant="outline" className="h-8 shrink-0 gap-1.5">
-              <Link to="/settings/plugins">
-                <PlugZap className="size-3.5" />
-                {t("chat.workspaceStripSetupMissingCli")}
-              </Link>
-            </Button>
           </div>
         ) : null}
+        {/* 空房间「发消息即可」只由 EmptyState 说一次；这里再写就重复。 */}
+        {/* Online + optional engines missing → don't nag「补齐 OpenCode」beside
+            an already-running swarm (cognitive load). Settings remains the place. */}
       </div>
     </div>
   );
@@ -470,40 +429,11 @@ export default function ChatView() {
     // map (same keys, just used differently).
   } = useWorkspaceContext();
 
-  // ── Revive orchestrator for a member-less workspace ──────────────────
-  // A finished workspace isn't auto-respawned on server boot (that would burn
-  // an LLM turn re-concluding "done"). So a returning user can land on a
-  // 0-member room. This button runs the `init` spell on demand to bring the
-  // orchestrator back; its bootstrap detects the existing ledger and
-  // short-circuits, so it just becomes available to chat with again.
-  const [reviving, setReviving] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmActionState | null>(null);
   // Real engine readiness: install info merged with the on-demand usability
   // probe (`engine_probe.rs`). "installed" alone is NOT "usable" — the EmptyState
   // and the strip render the honest verdict, never a fake "ready".
   const readiness = useEngineReadiness();
-
-  const reviveOrchestrator = useCallback(async () => {
-    if (reviving) return;
-    setReviving(true);
-    try {
-      await api.runSpell({
-        name: "init",
-        task: "",
-        workspace_dir: workspace.path,
-        workspace_id: workspace.workspaceId,
-        // Revive the orchestrator in THIS direction (backend runs it in the
-        // direction's cwd — the worktree once isolated).
-        thread_id: activeThread?.id,
-      });
-      refreshAgents();
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("revive orchestrator failed", e);
-    } finally {
-      setReviving(false);
-    }
-  }, [reviving, workspace.path, workspace.workspaceId, refreshAgents]);
 
   // ── Orchestrator failure (honesty fix) ───────────────────────────────
   // The backend now flips the orchestrator to AgentState::Error when its CLI
@@ -615,35 +545,6 @@ export default function ChatView() {
     refreshAgents,
   ]);
 
-  const requestWakeAgent = useCallback(
-    (agent: AgentInfo) => {
-      setConfirm({
-        title: t("agent.confirm.wake.title", {
-          role: agent.role,
-          defaultValue: "唤醒 agent？",
-        }),
-        description: t(
-          "agent.confirm.wake.desc",
-          "会向该 agent 投递一条手动唤醒消息，推动它继续读取 mailbox / blackboard。仅在它确实卡住或需要人工催促时使用。",
-        ),
-        confirmLabel: t("agent.wake"),
-        // Don't swallow a failed wake — three sibling call sites toast, so a
-        // silent failure here would look exactly like success (the dialog just
-        // closes) while the agent was never actually woken (诚实性红线).
-        onConfirm: () =>
-          api.wakeAgent(agent.agent_id).catch((e) => {
-            toast.error(
-              t("agent.wakeFailed", {
-                msg: (e as Error)?.message ?? "",
-                defaultValue: "唤醒失败：{{msg}}",
-              }),
-            );
-          }),
-      });
-    },
-    [t],
-  );
-
   // ── Per-direction model switch ───────────────────────────────────────
   // The chat model picker calls this. We persist the direction's model_tier,
   // then restart any live orchestrator so the new model takes effect now (it
@@ -674,13 +575,15 @@ export default function ChatView() {
         const orchs = activeMembers.filter((m) => m.role === "orchestrator");
         if (orchs.length > 0) {
           await Promise.allSettled(orchs.map((o) => api.killAgent(o.agent_id)));
-          await api.runSpell({
+          const resp = await api.runSpell({
             name: "init",
             task: "",
             workspace_dir: workspace.path,
             workspace_id: workspace.workspaceId,
             thread_id: activeThread.id,
           });
+          // Engine fallback is never silent (billing red line) — see CreateWizard.
+          notifySpawnFallbacks(t, resp.agents);
         }
       })();
       // L5: surface the REAL outcome instead of swallowing it into console.warn
@@ -690,7 +593,7 @@ export default function ChatView() {
         loading: willRestart
           ? t("chat.modelSwitchingRestart", {
               label,
-              defaultValue: "正在切换到 {{label}} 并重启队长…",
+              defaultValue: "正在切换到 {{label}} 并重启规划…",
             })
           : t("chat.modelSwitching", {
               label,
@@ -724,6 +627,7 @@ export default function ChatView() {
       workspace.path,
       activeMembers,
       refreshAgents,
+      t,
     ],
   );
 
@@ -746,10 +650,10 @@ export default function ChatView() {
         return;
       }
       setConfirm({
-        title: t("messages.modelConfirmTitle", "换模型会重启队长"),
+        title: t("messages.modelConfirmTitle", "换模型会重启规划"),
         description: t(
           "messages.modelConfirmBody",
-          "当前在跑的回复会被打断，队长会用新模型重新开始。",
+          "当前在跑的回复会被打断，规划会用新模型重新开始。",
         ),
         confirmLabel: t("messages.modelConfirmYes", "确认切换"),
         onConfirm: () => {
@@ -776,6 +680,8 @@ export default function ChatView() {
           workspace_id: workspace.workspaceId,
           thread_id: activeThread?.id,
         });
+        // Engine fallback is never silent (billing red line) — see CreateWizard.
+        notifySpawnFallbacks(t, resp.agents);
         const orch =
           resp.agents.find((a) => a.role === "orchestrator") ?? resp.agents[0];
         if (orch) {
@@ -804,7 +710,7 @@ export default function ChatView() {
         bootstrapRef.current = false;
       }
     },
-    [workspace.path, workspace.workspaceId, activeThread?.id, refreshAgents],
+    [workspace.path, workspace.workspaceId, activeThread?.id, refreshAgents, t],
   );
 
   // ── Task activity state machine ──────────────────────────────────
@@ -1053,6 +959,19 @@ export default function ChatView() {
     });
   }, [allAliveAgents]);
 
+  // P1-08 补漏:规划已 spawn 但 PTY 还没 ready(shim_ready=false)的 5–20s
+  // 冷启动窗口里 agentIsWorkable 为 false —— strip 的「有无成员」若只看
+  // workable,窗口内会判定「无成员」重新放出「唤起 orchestrator」按钮,
+  // 连点 = 同方向双规划。只要方向里还有活着的、没报错的 orchestrator
+  // (agentIsAlive 语义:未 kill 未退出),就按「正在准备」处理。
+  const orchestratorStarting = activeMembers.some(
+    (m) =>
+      m.role === "orchestrator" &&
+      agentIsAlive(m) &&
+      !m.shim_ready &&
+      !agentIsErrored(m),
+  );
+
   const directionName =
     activeThread?.slug === "main"
       ? t("chat.mainDirection")
@@ -1076,17 +995,26 @@ export default function ChatView() {
           sourceCount={workspace.roots.length + 1}
           cwdBranch={workspace.cwdBranch}
           readiness={readiness}
-          reviving={reviving}
-          onRevive={reviveOrchestrator}
           hasError={orchestratorFailure != null}
           // P1-08: while the direction is still bootstrapping the orchestrator
-          // is already on its way up — don't offer a revive button or the user
-          // double-spawns it in the startup window.
-          preparing={activeThread?.state === "preparing"}
+          // is already on its way up. `orchestratorStarting`
+          // covers the post-spawn cold-start window (规划已 spawn、PTY 未
+          // ready),where memberCount 的 agentIsWorkable 仍为 false。
+          preparing={activeThread?.state === "preparing" || orchestratorStarting}
         />
         {/* P2: the captain's structured plan, pinned above the conversation —
             accurate ✓/◐/○ from plan.json, not guessed from prose. */}
-        {plan && <PlanStickyCard plan={plan} />}
+        {plan && (
+          <PlanStickyCard
+            plan={plan}
+            dismissKey={`${workspace.workspaceId}:${activeThread?.id ?? "main"}`}
+            // 计划诚实门只盯「还活着却没交」——已死的 worker 归 NeedsYou，
+            // 别用琥珀条永久占着聊天顶（清完 .error 后尤其像撒谎）。
+            undeliveredHandoffs={handoffMissingAgents.filter(
+              (a) => a.killed_at == null && a.shim_exit == null,
+            ).length}
+          />
+        )}
         <MessagesPanel
           liveMessages={liveMessages}
           liveRead={liveRead}
@@ -1170,20 +1098,13 @@ export default function ChatView() {
         </div>
         <div className="flex-1 overflow-y-auto px-2 py-2">
           {activeMembers.length === 0 && (
-            <div className="mx-2 mt-2 flex flex-col items-start gap-3 rounded-xl border border-border-subtle bg-surface-elevated px-4 py-4">
+            <div className="mx-2 mt-2 rounded-xl border border-border-subtle bg-surface-elevated px-4 py-4">
               <p className="font-caption text-xs leading-6 text-foreground-tertiary">
-                {t("chat.noMembers")}
+                {t(
+                  "chat.noMembers",
+                  "还没有成员在线。在对话里发一条消息，规划就会上线。",
+                )}
               </p>
-              <Button
-                size="sm"
-                variant="default"
-                onClick={reviveOrchestrator}
-                disabled={reviving}
-                className="gap-1.5"
-              >
-                <Zap className="size-3.5" />
-                {reviving ? t("chat.reviving") : t("chat.reviveOrchestrator")}
-              </Button>
             </div>
           )}
           {(() => {
@@ -1237,7 +1158,7 @@ export default function ChatView() {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span className="truncate font-heading text-sm text-foreground-primary">
-                      {roleDisplayName(a.role)}
+                      {roleLabelAmong(a, activeMembers)}
                     </span>
                     {isOrchestrator && (
                       <span className="shrink-0 rounded-full bg-accent-primary-soft px-1.5 py-0.5 font-caption text-[9px] font-semibold text-accent-primary">
@@ -1322,23 +1243,6 @@ export default function ChatView() {
                     {unread}
                   </Badge>
                 )}
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={t("chat.wake")}
-                      className="size-8 text-foreground-tertiary hover:text-state-wake"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        requestWakeAgent(a);
-                      }}
-                    >
-                      <Zap className="size-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="left">{t("chat.wake")}</TooltipContent>
-                </Tooltip>
               </div>
             );
           })}

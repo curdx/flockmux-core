@@ -324,10 +324,10 @@ export default function LedgerView() {
       <div className="flex shrink-0 items-center justify-between border-b border-border-subtle px-5 py-3">
         <div className="flex flex-col">
           <h2 className="font-heading text-sm font-semibold text-foreground-primary">
-            {t("ledger.title", "AI 工作台账")}
+            {t("ledger.title", "工作记录")}
           </h2>
           <p className="font-caption text-[11px] text-foreground-tertiary">
-            {t("ledger.subtitle", "orchestrator 的思考过程都在这里。左侧是任务台账(目标 + 计划),右侧是进展状态。")}
+            {t("ledger.subtitle", "规划的思考过程都在这里。左侧是任务记录（目标 + 计划），右侧是进展。")}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -346,7 +346,7 @@ export default function LedgerView() {
             size="sm"
             onClick={compact}
             disabled={compacting || refreshing}
-            title={t("ledger.compactHint", "用小模型把台账压缩(保留关键信息,旧版进 op-log 可恢复)")}
+            title={t("ledger.compactHint", "缩短记录篇幅，关键信息不丢；旧内容可从历史找回")}
             className="gap-1.5"
           >
             <Sparkles className={cn("size-3.5", compacting && "animate-pulse")} />
@@ -370,7 +370,7 @@ export default function LedgerView() {
         <div className="flex min-h-0 flex-1 gap-4 overflow-hidden">
           <LedgerCard
             icon={<ClipboardList className="size-4 text-accent-primary" />}
-            title={t("ledger.taskTitle", "任务台账")}
+            title={t("ledger.taskTitle", "任务记录")}
             subtitle={t("ledger.taskSubtitle", "目标 · 假设 · 计划(DAG)")}
             at={task.at}
             nowTick={nowTick}
@@ -435,14 +435,14 @@ function BreadcrumbsCard({
           <span className="font-caption text-[11px] text-foreground-tertiary">
             {t(
               "ledger.breadcrumbsSubtitle",
-              "worker 们最近的心跳(每完成一步会自动写)",
+              "成员最近做到哪了（每完成一步会自动更新）",
             )}
           </span>
         </div>
         <span className="shrink-0 font-caption text-[10px] text-foreground-tertiary">
           {t("ledger.breadcrumbsCount", {
             n: rows.length,
-            defaultValue: "{{n}} 个 worker",
+            defaultValue: "{{n}} 位成员",
           })}
         </span>
       </div>

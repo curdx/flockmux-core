@@ -84,7 +84,7 @@ export function usePendingResponders(input: {
         reason: v.reason ?? null,
       });
       console.warn(
-        `[swarmx] 队长本轮中断:agent=${v.agentId} 收到任务#${v.trigger.id} 后进入 ` +
+        `[swarmx] 规划本轮中断:agent=${v.agentId} 收到任务#${v.trigger.id} 后进入 ` +
           `${agentLiveStateById?.[v.agentId]?.state ?? "?"} 终态,未产出回复` +
           (v.reason ? ` · 原因:${v.reason}` : ""),
       );

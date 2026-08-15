@@ -15,6 +15,7 @@ import { useTranslation } from "react-i18next";
 import { CircleCheck, ChevronRight, Cpu, Split } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { roleColorClass as roleColor, roleDisplayName } from "@/lib/agent";
+import { fallbackNotice } from "@/lib/engineFallback";
 import type { MessageRecord } from "../../api/types";
 
 export function SystemCard({
@@ -86,7 +87,11 @@ export function SystemCard({
     const childRoleLabel = roleDisplayName(childRole);
     const childAgent = message.meta?.child_agent ?? null;
     const clickable = childAgent != null && onOpenAgent != null;
-    return (
+    // Billing red line: the worker's requested engine wasn't installed and the
+    // server spawned a fallback — possibly API-billed. The card must say so;
+    // a paid engine must never run in disguise.
+    const fallbackFrom = message.meta?.fallback_from ?? null;
+    const card = (
       <button
         type="button"
         disabled={!clickable}
@@ -116,6 +121,19 @@ export function SystemCard({
           <ChevronRight className="size-3 shrink-0 text-foreground-tertiary transition-colors group-hover:text-accent-primary" />
         )}
       </button>
+    );
+    if (!fallbackFrom) return card;
+    return (
+      <span className="inline-flex max-w-full flex-col items-start gap-1">
+        {card}
+        <span className="inline-flex max-w-full items-center gap-1 rounded-full border border-state-warning/40 bg-state-warning/10 px-2.5 py-0.5 font-caption text-[10px] text-state-warning">
+          {fallbackNotice(t, {
+            cli: message.meta?.fallback_cli ?? "?",
+            fallback_from: fallbackFrom,
+            billing_surface: message.meta?.billing_surface,
+          })}
+        </span>
+      </span>
     );
   }
 

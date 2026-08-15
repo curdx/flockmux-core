@@ -121,9 +121,8 @@ interface Props {
   /** All agents alive across every workspace; drives the "X is responding"
    *  pending-bubble inference. Defaults to activeMembers when absent. */
   allAliveAgents?: AgentInfo[];
-  /** Active-direction agents that exited without delivering their declared
-   *  handoff (server-computed `handoff_missing`). Drives the premature-handoff
-   *  banner — empty in the healthy case so nothing renders. */
+  /** @deprecated Handoff inbox lives in NeedsYouBar only — prop kept optional
+   *  so callers can stop passing it without a coordinated rename. Ignored. */
   handoffMissingAgents?: AgentInfo[];
   /** Agent ids that historically belonged to the active workspace (live +
    *  killed). When provided, only messages whose from/to hits this set are
@@ -215,7 +214,7 @@ export function MessagesPanel({
   unreadByFrom,
   activeMembers = [],
   allAliveAgents,
-  handoffMissingAgents = [],
+  handoffMissingAgents: _handoffMissingAgents = [],
   workspaceAgentIds,
   workspaceSlug,
   activeThreadId,
@@ -279,6 +278,15 @@ export function MessagesPanel({
   const rowRefs = useRef<Map<number, HTMLDivElement | null>>(new Map());
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const [highlightId, setHighlightId] = useState<number | null>(null);
+
+  // NeedsYouBar：死掉的 handoff 不打开尸体抽屉，改发这个事件把焦点拉回输入框。
+  useEffect(() => {
+    const onFocus = () => {
+      requestAnimationFrame(() => composerRef.current?.focus());
+    };
+    window.addEventListener("swarmx:focus-composer", onFocus);
+    return () => window.removeEventListener("swarmx:focus-composer", onFocus);
+  }, []);
 
   // P2: guard setState after unmount / fast room-switch. The 「优化」/「重新发送」
   // requests can resolve after the component is gone (or the user已切房间);
@@ -788,7 +796,7 @@ export function MessagesPanel({
   //         (worker 走这条,被 tail 上报真实态);
   //         ② 正在响应 (pendingResponders 同一信号驱动「正在响应」气泡)——
   //         orchestrator 不被 tail、不上报 thinking,但它 mid-turn 时这里能算出,
-  //         否则用户最常见的「队长独自干活」场景反而停不了。
+  //         否则用户最常见的「规划独自干活」场景反而停不了。
   // 二者都基于已展示给用户的事实,菜单只在确有成员在跑时出现,不挂幽灵停止键。
   const runningMembers = useMemo(() => {
     const pendingIds = new Set(pendingResponders.map((p) => p.agentId));
@@ -936,7 +944,7 @@ export function MessagesPanel({
       );
       // W0-2: 唤醒已由服务端在 /api/message 内完成(外部消息→活 agent 自动
       // deliver_manual_wake)。前端不再补发,否则与服务端 wake 双重 kick,会
-      // 多触发一轮队长。重新拉起已退出的队长仍走 onSend / ⚡ 唤醒调度。
+      // 多触发一轮规划。重新拉起已退出的规划仍走 onSend / ⚡ 唤醒调度。
       if (recipientBusy) {
         setQueuedHint(true);
         window.setTimeout(() => setQueuedHint(false), 4000);
@@ -958,8 +966,8 @@ export function MessagesPanel({
 
   // 「重新发送」走独立通道,刻意**不碰输入框**:不读 explicitRecipient(@提及)/
   // inReplyTo / 附件,也绝不 setBody("") —— 否则会冲掉用户在输入框里还没发的草稿
-  // (用户反馈)。直接把原文投给当前默认收件人(活队长直送;没有则经 onSend 拉起
-  // 新队长投递),和原消息当初的去向一致。
+  // (用户反馈)。直接把原文投给当前默认收件人(活规划直送;没有则经 onSend 拉起
+  // 新规划投递),和原消息当初的去向一致。
   const resend = async (text: string) => {
     const trimmed = text.trim();
     if (!trimmed || sending) return;
@@ -1493,7 +1501,7 @@ export function MessagesPanel({
         {rows.length === 0 &&
           (filter ? (
             // An active text filter hid every row. Showing the empty state /
-            // bootstrap ("队长正在上岗") here LIES: it implies no messages / a
+            // bootstrap ("规划正在上岗") here LIES: it implies no messages / a
             // booting captain even when the room is full and just filtered. The
             // user explicitly filtered, so show a "no matches" notice with a
             // one-click clear instead — for any filter, room empty or not.
@@ -1862,33 +1870,8 @@ export function MessagesPanel({
       {/* ── composer ─────────────────────────────────────────────────── */}
       <div className="flex shrink-0 flex-col gap-1.5 border-t border-border-subtle bg-surface-secondary px-3 py-2.5">
         <div className="mx-auto flex w-full flex-col gap-1.5 px-6">
-        {handoffMissingAgents.length > 0 && (
-          // Premature/silent-handoff guard (research direction B): a member left
-          // the turn without ever delivering its declared handoff key. Unlike a
-          // failed handoff there's no `.error` to notice, so without this the
-          // user could be misled by a finished-looking turn. Honest + actionable:
-          // name who dropped, and offer a one-tap nudge to send a follow-up.
-          <div className="flex items-start gap-2 self-stretch rounded-md border border-state-warning/40 bg-status-warning-soft px-2.5 py-1.5 text-[11px] text-state-warning">
-            <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
-            <div className="min-w-0 flex-1">
-              <p className="font-medium">
-                {t("chat.handoffMissing.title", {
-                  count: handoffMissingAgents.length,
-                  defaultValue: "{{count}} 个成员退出时没有交付结果",
-                })}
-              </p>
-              <p className="text-foreground-tertiary">
-                {handoffMissingAgents
-                  .map((a) => roleDisplayName(a.role))
-                  .join("、")}
-                {" · "}
-                {t("chat.handoffMissing.hint", {
-                  defaultValue: "黑板上没有它声明的交付，可发条消息让队长补救",
-                })}
-              </p>
-            </div>
-          </div>
-        )}
+        {/* handoff 提示只在 NeedsYouBar（顶栏）出现一次——这里再画横幅会变成
+            「请看一眼 / 计划 / composer」三连轰炸（UX 去重）。 */}
         {inReplyTo != null && (
           <div className="flex items-center gap-2 self-start rounded-md bg-accent-primary-soft px-2 py-1 text-[11px] text-accent-primary-deep">
             <CornerUpLeft className="size-3" />
@@ -2122,7 +2105,7 @@ export function MessagesPanel({
             {queuedHint && (
               <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-surface-tertiary px-2 py-0.5 font-caption text-[10px] text-foreground-secondary">
                 <Clock3 className="size-3" />
-                {t("messages.queuedToCaptain", "已排队 · 队长接手后送达")}
+                {t("messages.queuedToCaptain", "已排队 · 规划接手后送达")}
               </span>
             )}
             {preOptimize !== null && (
@@ -2194,17 +2177,18 @@ function ReasoningDisclosure({
   status: "active" | "done";
 }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(status === "active");
+  // 默认收起：跑着的时候摊开 swarm_list_* 对小白是噪音墙。
+  const [open, setOpen] = useState(false);
   const active = status === "active";
   const elapsed =
     summary.durationMs == null ? null : formatElapsed(summary.durationMs);
   return (
     <div
       className={cn(
-        "mb-2 overflow-hidden rounded-xl border text-[11px]",
+        "mb-2 overflow-hidden rounded-lg border text-[11px]",
         active
-          ? "border-accent-primary/30 bg-accent-primary-soft/70"
-          : "border-border-subtle bg-surface-primary/70",
+          ? "border-border-subtle bg-surface-secondary/50"
+          : "border-border-subtle/80 bg-transparent",
       )}
     >
       <button
@@ -2327,7 +2311,7 @@ function PendingBubble({
   // The counter shows the TRUE cumulative wait — how long since the user's
   // message — not the latest single tool event's duration (which reset every
   // event and sat at "0s" for fast ops, the reported bug). This ticks up
-  // honestly the whole turn = "队长已为你这条消息忙了 Ns". `now` refreshes every
+  // honestly the whole turn = "规划已为你这条消息忙了 Ns". `now` refreshes every
   // 500ms (interval above). clamp ≥0 for client/server clock skew.
   const elapsedSinceTrigger = Math.max(0, now - trigger.sent_at);
 
@@ -2478,7 +2462,7 @@ function PendingBubble({
   );
 }
 
-/** 入流律:队长收到任务却没回复就退出了 —— 把"正在响应…然后突然消失"换成一张
+/** 入流律:规划收到任务却没回复就退出了 —— 把"正在响应…然后突然消失"换成一张
  *  诚实、可操作的卡(说明本轮没送达 + 一键把原消息填回输入框重发),而不是让
  *  气泡凭空消失。`reason` 仅在死因是显式错误(未登录 / 卡死等)时才有。 */
 function VanishedTurnCard({

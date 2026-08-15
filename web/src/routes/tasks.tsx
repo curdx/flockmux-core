@@ -262,6 +262,10 @@ function TaskCard({
     (task.role_slug ? roleDisplayName(task.role_slug) : task.role_label) ||
     task.role_label ||
     task.agent_id.slice(0, 8);
+  const showBlock =
+    task.status !== "blocked" &&
+    task.status !== "done" &&
+    task.status !== "archived";
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border-subtle bg-surface-secondary p-3">
       <div className="flex items-center justify-between gap-2">
@@ -285,13 +289,14 @@ function TaskCard({
           </span>
         )}
       </div>
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[10px] text-foreground-tertiary">
-        <span title={task.agent_id}>{task.agent_id.slice(0, 8)}</span>
-        {task.handoff_signal && (
-          <span className="truncate" title={task.handoff_signal}>
-            → {task.handoff_signal.split("/").pop()}
-          </span>
-        )}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-caption text-[10px] text-foreground-tertiary">
+        {task.error_present ? (
+          <span>{t("tasks.failed", { defaultValue: "失败" })}</span>
+        ) : task.handoff_done ? (
+          <span>{t("tasks.delivered", { defaultValue: "已交付" })}</span>
+        ) : task.handoff_signal ? (
+          <span>{t("tasks.undelivered", { defaultValue: "未交结果" })}</span>
+        ) : null}
         <span className="ml-auto shrink-0" title={new Date(task.spawned_at).toLocaleString()}>
           {relTime(task.last_activity_at ?? task.spawned_at, t)}
         </span>
@@ -300,7 +305,7 @@ function TaskCard({
         {busy && (
           <Loader2 className="size-3 shrink-0 animate-spin text-foreground-tertiary" />
         )}
-        {task.status !== "blocked" && (
+        {showBlock && (
           <CardBtn
             onClick={() => onSet(task, "blocked")}
             disabled={busy}

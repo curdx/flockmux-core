@@ -186,8 +186,8 @@ function CreateFusionForm({
       </div>
 
       <div className="space-y-1.5">
-        <label className="font-caption text-[11px] uppercase tracking-wide text-foreground-tertiary">
-          {t("fusion.needLabel", { defaultValue: "需求（同一份会发给每位选手）" })}
+        <label className="font-caption text-[11px] tracking-wide text-foreground-tertiary">
+          {t("fusion.needLabel")}
         </label>
         <textarea
           value={need}
@@ -215,16 +215,24 @@ function CreateFusionForm({
       </label>
 
       {autopilot ? (
-        <p className="rounded-md bg-surface-secondary px-2.5 py-2 font-body text-[12px] text-foreground-secondary">
-          {t("fusion.autopilotHint", {
-            defaultValue:
-              "只填需求即可。系统会自动挑选可用模型并行实现、跑客观检查、综合出最优版并合并到主线，全程零手动。",
-          })}
-        </p>
+        <div className="space-y-1.5">
+          <p className="rounded-md bg-surface-secondary px-2.5 py-2 font-body text-[12px] text-foreground-secondary">
+            {t("fusion.autopilotHint", {
+              defaultValue:
+                "只填需求即可。系统会自动挑选可用模型并行实现、跑客观检查、综合出最优版并合并到主线，全程零手动。",
+            })}
+          </p>
+          <p className="rounded-md border border-status-warning/30 bg-status-warning-soft/40 px-2.5 py-2 font-body text-[12px] text-foreground-secondary">
+            {t("fusion.costWarning", {
+              defaultValue:
+                "会同时拉起多个模型跑同一任务，可能较快消耗订阅额度。没把握先用聊天让规划派一个人。",
+            })}
+          </p>
+        </div>
       ) : (
         <div className="space-y-1.5">
-          <label className="font-caption text-[11px] uppercase tracking-wide text-foreground-tertiary">
-            {t("fusion.labelsLabel", { defaultValue: "选手（2–4 个，通常是模型/CLI 名）" })}
+          <label className="font-caption text-[11px] tracking-wide text-foreground-tertiary">
+            {t("fusion.labelsLabel")}
           </label>
           <div className="space-y-2">
             {labels.map((l, i) => (
@@ -264,8 +272,8 @@ function CreateFusionForm({
 
       {/* optional objective check (both modes) */}
       <div className="space-y-1.5">
-        <label className="font-caption text-[11px] uppercase tracking-wide text-foreground-tertiary">
-          {t("fusion.checkCmdLabel", { defaultValue: "客观检查命令（可选，如 python3 check.py / cargo test）" })}
+        <label className="font-caption text-[11px] tracking-wide text-foreground-tertiary">
+          {t("fusion.checkCmdLabel")}
         </label>
         <input
           value={checkCmd}
@@ -274,6 +282,12 @@ function CreateFusionForm({
           className="w-full rounded-md border border-border-subtle bg-surface-secondary px-2.5 py-1.5 font-mono text-[13px] text-foreground-primary outline-none focus:border-accent-primary"
         />
       </div>
+
+      {/* 非 git 目录的副作用明示(同 CreateWizard):发起竞赛 = N 个选手并行
+          隔离,后端会在项目目录 git init + 全量提交一次。 */}
+      <p className="font-caption text-[11px] leading-relaxed text-foreground-tertiary">
+        {t("fusion.gitInitNotice")}
+      </p>
 
       {error && (
         <p className="rounded-md bg-state-danger/10 px-2.5 py-2 font-caption text-[11px] text-state-danger">
@@ -333,7 +347,7 @@ function BatchCard({
         toast.success(
           synthesize
             ? t("fusion.synthStarted", { defaultValue: "已派出综合者，博采众长合成一版并合并" })
-            : t("fusion.autoJudgeStarted", { defaultValue: "已派出评审 agent，由它自动评出赢家" }),
+            : t("fusion.autoJudgeStarted"),
         );
       }
       onChanged();
@@ -407,7 +421,7 @@ function BatchCard({
             </span>
             <span
               className={cn(
-                "shrink-0 rounded-full px-2 py-0.5 font-caption text-[10px] font-semibold uppercase tracking-wide",
+                "shrink-0 rounded-full px-2 py-0.5 font-caption text-[10px] font-semibold tracking-wide",
                 statusTone(batch.status),
               )}
             >
@@ -427,7 +441,7 @@ function BatchCard({
                 : t("fusion.judge", { defaultValue: "进入评判" })}
             </Button>
             <Button size="sm" onClick={() => runJudge(true)} disabled={judging}
-              title={t("fusion.autoJudgeHint", { defaultValue: "派一个 CLI agent 自动读 diff 并评出赢家" })}>
+              title={t("fusion.autoJudgeHint")}>
               <Gavel className="size-3.5" />
               {t("fusion.autoJudge", { defaultValue: "自动评判" })}
             </Button>
@@ -445,7 +459,7 @@ function BatchCard({
         <p className="flex items-center gap-1.5 rounded-md bg-state-warning/10 px-2.5 py-1.5 font-body text-[12px] text-state-warning">
           <Gavel className="size-3.5 shrink-0" />
           {t("fusion.autoJudgeRunning", {
-            defaultValue: "评审 agent 正在自动读 diff 并评出赢家,完成后会自动落判决。",
+            defaultValue: "评审正在读 diff 并选出结果，完成后会自动写入。",
           })}
         </p>
       )}
@@ -481,16 +495,36 @@ function BatchCard({
                     {contestantLabel(c)}
                   </span>
                 </span>
-                {c.degraded && (
-                  <span
-                    className="shrink-0 rounded-full bg-state-warning/15 px-1.5 py-0.5 font-caption text-[10px] text-state-warning"
-                    title={t("fusion.degradedHint", {
-                      defaultValue: "未获得独立工作树，改动无法单独比较",
-                    })}
-                  >
-                    {t("fusion.degraded", { defaultValue: "降级" })}
-                  </span>
-                )}
+                <span className="flex shrink-0 items-center gap-1">
+                  {/* Objective gate result — run for BOTH auto and manual
+                      judging now; previously a manual 进入评判 silently
+                      ignored the batch's check_cmd. */}
+                  {c.check_passed != null && (
+                    <span
+                      className={cn(
+                        "rounded-full px-1.5 py-0.5 font-caption text-[10px]",
+                        c.check_passed
+                          ? "bg-status-success-soft text-status-success"
+                          : "bg-state-danger/15 text-state-danger",
+                      )}
+                      title={c.check_output ?? undefined}
+                    >
+                      {c.check_passed
+                        ? t("fusion.checkPassed", { defaultValue: "客观检查通过" })
+                        : t("fusion.checkFailed", { defaultValue: "客观检查未过" })}
+                    </span>
+                  )}
+                  {c.degraded && (
+                    <span
+                      className="rounded-full bg-state-warning/15 px-1.5 py-0.5 font-caption text-[10px] text-state-warning"
+                      title={t("fusion.degradedHint", {
+                        defaultValue: "未获得独立工作树，改动无法单独比较",
+                      })}
+                    >
+                      {t("fusion.degraded", { defaultValue: "降级" })}
+                    </span>
+                  )}
+                </span>
               </div>
 
               {c.branch && (
@@ -501,7 +535,7 @@ function BatchCard({
 
               {hasDiffs && (
                 <>
-                  <div className="font-caption text-[10px] uppercase tracking-wide text-foreground-tertiary">
+                  <div className="font-caption text-[10px] tracking-wide text-foreground-tertiary">
                     {t("fusion.filesChanged", {
                       count: c.files.length,
                       defaultValue: "改动 {{count}} 个文件",
@@ -536,10 +570,10 @@ function BatchCard({
           <Gavel className="size-3" />
           {judge?.judge_agent_id
             ? t("fusion.autoJudgeRunning", {
-                defaultValue: "评审 agent 正在自动读 diff 并评出赢家,完成后会自动落判决。",
+                defaultValue: "评审正在读 diff 并选出结果，完成后会自动写入。",
               })
             : t("fusion.judgeThread", {
-                defaultValue: "评委方向已创建,可在聊天中查看其判决推理。",
+                defaultValue: "评审方向已创建，可在聊天中查看其判决推理。",
               })}
         </p>
       )}
@@ -549,7 +583,7 @@ function BatchCard({
         <div className="space-y-2 rounded-md border border-status-success/40 bg-status-success-soft/20 p-3">
           <p className="flex items-center gap-1.5 font-heading text-[13px] font-semibold text-status-success">
             <Check className="size-4" />
-            {t("fusion.decided", { defaultValue: "判决完成" })}
+            {t("fusion.decided", { defaultValue: "已选定" })}
           </p>
           {decision.merge_status === "merged" && (
             <p className="font-body text-[12px] text-foreground-secondary">

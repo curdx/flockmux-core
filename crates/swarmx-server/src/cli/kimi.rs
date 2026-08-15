@@ -8,8 +8,8 @@
 //! stdio MCP children INHERITING its process env (verified live on 0.28), and
 //! swarmx puts `SWARMX_AGENT_ID`/`SWARMX_SERVER_URL` in every spawn's env —
 //! identity flows through the process tree, the file is identical for every
-//! agent, and the shared-workspace last-writer-wins identity bug (which
-//! reasonix/zulu accept) cannot occur. Selected by [`super::adapter_for`] for
+//! agent, and the shared-workspace last-writer-wins identity bug cannot occur
+//! (reasonix/zulu now use the same pattern). Selected by [`super::adapter_for`] for
 //! `mcp_format = "kimi-mcp-json"`.
 //!
 //! Stop hook: kimi has NO project-level hooks — `[[hooks]]` is read only from
@@ -44,6 +44,7 @@ use super::{CliAdapter, PreSpawnCtx};
 use crate::plugins::CliPlugin;
 use anyhow::{Context, Result};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -71,6 +72,26 @@ impl CliAdapter for KimiAdapter {
             }
         }
     }
+
+    fn contribute_env(
+        &self,
+        _plugin: &CliPlugin,
+        _agent_id: &str,
+        env: &mut HashMap<String, String>,
+    ) {
+        // The spawn env is rebuilt from an allowlist (spawn.rs: env_clear +
+        // FORWARDED_ENV_KEYS) that KIMI_CODE_HOME is NOT on — but the
+        // Stop-hook patch above targets kimi_home(), which DOES honor it. A
+        // server launched with KIMI_CODE_HOME set would therefore patch
+        // <that>/config.toml while the child kimi reads ~/.kimi-code: the
+        // wake hook silently never fires. Forward the var verbatim so the
+        // child resolves the SAME config root we patched. When unset, insert
+        // nothing — the child falls back to ~/.kimi-code via the forwarded
+        // HOME, exactly kimi_home()'s own fallback.
+        if let Some(dir) = std::env::var("KIMI_CODE_HOME").ok().filter(|v| !v.is_empty()) {
+            env.insert("KIMI_CODE_HOME".into(), dir);
+        }
+    }
 }
 
 /// Write `<workspace>/.kimi-code/mcp.json` carrying the swarmx-swarm MCP server
@@ -81,9 +102,9 @@ impl CliAdapter for KimiAdapter {
 /// environment, and swarmx already puts `SWARMX_AGENT_ID`/`SWARMX_SERVER_URL`
 /// in every spawn's env (spawn.rs) — so identity flows per-agent through the
 /// process tree, and this file is IDENTICAL for every agent. That's what makes
-/// it safe under a shared-workspace layout (reasonix/zulu's last-writer-wins
-/// identity bug can't happen here): a sibling's write has the same content,
-/// and a respawn reads its OWN env, not a stale file value.
+/// it safe under a shared-workspace layout (same pattern as reasonix/zulu): a
+/// sibling's write has the same content, and a respawn reads its OWN env, not a
+/// stale file value.
 fn write_kimi_mcp_json(workspace: &Path, mcp_bin: &Path) -> Result<()> {
     let dir = workspace.join(".kimi-code");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -103,9 +124,12 @@ fn write_kimi_mcp_json(workspace: &Path, mcp_bin: &Path) -> Result<()> {
 /// kimi..."` line is unambiguously ours to rewrite/dedupe.
 const HOOK_MARKER: &str = "--hook-format kimi";
 
-/// kimi's data root: `$KIMI_CODE_HOME` when set (the spawned child would
-/// inherit it), else `~/.kimi-code`. Shared by the config.toml patcher and the
-/// transcript tailer (sessions live at `<root>/sessions/`).
+/// kimi's data root: `$KIMI_CODE_HOME` when set, else `~/.kimi-code`. Shared
+/// by the config.toml patcher and the transcript tailer (sessions live at
+/// `<root>/sessions/`). The spawned child sees the SAME root because
+/// [`KimiAdapter::contribute_env`] forwards the var — the spawn env is
+/// allowlist-rebuilt (spawn.rs), so without that explicit handoff the child
+/// would silently fall back to `~/.kimi-code` while we patched the other root.
 pub(crate) fn kimi_home() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("KIMI_CODE_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(dir));
@@ -114,7 +138,7 @@ pub(crate) fn kimi_home() -> Option<PathBuf> {
 }
 
 /// Where kimi reads `[[hooks]]`: `$KIMI_CODE_HOME/config.toml` when the var is
-/// set (the spawned child would inherit it), else `~/.kimi-code/config.toml`.
+/// set (forwarded to the child — see kimi_home), else `~/.kimi-code/config.toml`.
 fn kimi_config_path() -> Option<PathBuf> {
     kimi_home().map(|h| h.join("config.toml"))
 }
@@ -326,5 +350,34 @@ mod tests {
         // Second install with the SAME command: file untouched.
         install_kimi_stop_hook_at(&cfg, &bin, "http://127.0.0.1:7777", 10).unwrap();
         assert_eq!(fs::read(&cfg).unwrap(), before, "no-op when already current");
+    }
+
+    #[test]
+    fn contribute_env_forwards_kimi_code_home_verbatim() {
+        let registry = crate::plugins::PluginRegistry::builtin();
+        let plugin = registry.get("kimi").unwrap();
+        // Mutates the process-global KIMI_CODE_HOME — kept inside ONE test fn
+        // (no sibling test reads or writes the var) so cargo's parallel test
+        // runner can't race the mutation.
+        std::env::set_var("KIMI_CODE_HOME", "/tmp/swarmx-test-kimi-home");
+        let mut env = HashMap::new();
+        KimiAdapter.contribute_env(plugin, "kimi-test", &mut env);
+        assert_eq!(
+            env.get("KIMI_CODE_HOME").map(String::as_str),
+            Some("/tmp/swarmx-test-kimi-home"),
+            "child env must carry the server's KIMI_CODE_HOME verbatim — else \
+             the child reads a different config root than the one we patched"
+        );
+        // An empty value is kimi_home()'s "unset" — insert nothing.
+        std::env::set_var("KIMI_CODE_HOME", "");
+        let mut env = HashMap::new();
+        KimiAdapter.contribute_env(plugin, "kimi-test", &mut env);
+        assert!(!env.contains_key("KIMI_CODE_HOME"), "empty value treated as unset");
+        // Unset on the server ⇒ nothing inserted: the child defaults to
+        // ~/.kimi-code via the forwarded HOME, kimi_home()'s own fallback.
+        std::env::remove_var("KIMI_CODE_HOME");
+        let mut env = HashMap::new();
+        KimiAdapter.contribute_env(plugin, "kimi-test", &mut env);
+        assert!(!env.contains_key("KIMI_CODE_HOME"), "unset ⇒ child falls back via HOME");
     }
 }

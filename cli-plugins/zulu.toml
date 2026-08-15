@@ -53,6 +53,10 @@ home_env = "HOME"
 billing_surface = "license"
 requires_explicit_billing_opt_in = false
 blocked_env_prefixes = []
+# No provider env either: auth is the explicit `-l <license>` argv (header
+# note 2), never an ambient key. Empty = ANTHROPIC_/OPENAI_/DEEPSEEK_ all stay
+# out of this full-shell agent.
+provider_env_prefixes = []
 
 # No "do you trust this folder?" gate in zulu.
 auto_trust_workspace = false

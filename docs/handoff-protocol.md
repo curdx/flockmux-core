@@ -1,112 +1,122 @@
 # Handoff Protocol
 
-How multi-agent fullstack spells (M6a) coordinate via the blackboard
-and swarm messages. **This is a convention, not a runtime contract** —
-agents that don't follow it deadlock or produce inconsistent artifacts,
-but swarmx-core does not enforce it.
+How agents in a swarmx workspace hand work to each other: typed
+`produces`/`consumes` contracts, server-minted blackboard keys, and the
+`WakeCoordinator` that turns a blackboard write into a wakeup.
 
-## Standard blackboard keys
+Unlike the M6-era convention this doc once described (archived at
+[`research/handoff-protocol-m6-archive.md`](research/handoff-protocol-m6-archive.md)),
+the current protocol is **enforced by the server at spawn time** — keys are
+never hand-typed by agents, so the two sides of a handoff cannot drift
+(the F3 bug class).
 
-| Key              | Writer    | Reader(s)        | Schema                                                                                                            |
-| ---------------- | --------- | ---------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `api.spec`       | backend   | frontend, test   | Markdown OR OpenAPI 3 snippet. Required fields per endpoint: method, path, request body schema, response schema, error responses. |
-| `frontend.done`  | frontend  | test             | `{ commit, components: [], entry, dev_server, built_at }`                                                          |
-| `frontend.error` | frontend  | test             | `{ reason, details }`                                                                                              |
-| `backend.done`   | backend   | frontend, test   | `{ commit, endpoints: [], entry, run_cmd, port, built_at }`                                                        |
-| `backend.error`  | backend   | frontend, test   | `{ reason, details }`                                                                                              |
-| `test.passed`    | test      | system (user)    | `{ framework, passed, failed: 0, report, ran_at }`                                                                 |
-| `test.failed`    | test      | system (user)    | `{ framework, passed, failed, failures: [{ name, reason }], ran_at }`                                              |
-| `test.skipped`   | test      | system (user)    | `{ reason, upstream_error }` — emitted when FE or BE failed                                                        |
-| `frontend.review`| critic    | test, system     | `{ role: "frontend", commit, verdict: "pass"\|"warn"\|"block", issues: [{ severity, where, summary }], reviewed_at }` (M6c step 6) |
-| `backend.review` | critic    | test, system     | Same shape as `frontend.review` with `role: "backend"` (M6c step 6) |
-| `review.completed`| critic   | test, fixer      | `{ round, frontend: { verdict, commit, issues }, backend: { verdict, commit, issues }, reviewed_at }`. Test waits on this in `fullstack-feature-reviewed` and `fullstack-feature-strict` (spell-level `depends_on` override) so test never starts until critic has weighed in. (M6c step 6, `round` added M6d-3.) |
-| `fixer.done`     | fixer    | critic           | `{ round, fixed_roles, commits: [{ role, commit, issues_addressed }], completed_at }`. Critic subscribes via `depends_on=["fixer.done"]`; each fixer.done wakes critic to re-review. The strict loop terminates when critic writes review.completed with all-pass/warn verdicts. (M6d-3) |
-| `fixer.skipped`  | fixer    | (observability)  | `{ reason, round }`. Written when critic verdict is already all pass/warn — fixer has nothing to do but wants to leave a trail. No subscribers wake on this. (M6d-3) |
-| `fixer.escalated`| fixer    | test             | `{ reason: "max rounds exceeded", round: 3, remaining_issues: [...] }`. Written when round 3 still has blockers fixer couldn't address. Test sees this in its M6d-3 verdict check, runs e2e anyway, and notes the escalation in the final test report. (M6d-3) |
-| `design.md`      | architect | human operator   | Short markdown: what we're building, tech stack, data model, API surface, UX sketch, open questions. Written ONCE at start of `fullstack-feature-gated`, or REWRITTEN on each rejection round (M6d-2). The operator reads this and decides whether to approve or reject. |
-| `design.approved`| human operator | frontend, backend | Any non-empty value (operator writes via the blackboard panel). Its presence is what unblocks FE+BE in `fullstack-feature-gated` — they `depends_on = ["design.approved"]` and the M6b WakeCoordinator wakes them in the same tick. (M6c step 7) |
-| `design.rejected`| human operator | architect        | `{ "reason": "<short feedback>" }`. Architect subscribes via `depends_on = ["design.rejected"]`; on each write, it re-reads the reason, rewrites `design.md`, asks for re-review. Loop until `design.approved`. (M6d-2) |
+## Roles declare typed outputs and inputs
 
-All `*_at` timestamps are ISO 8601 UTC.
+Every role manifest (`roles/*.md` front-matter, parsed in
+`crates/swarmx-server/src/roles.rs`) may declare:
 
-The blackboard keeps **version history** on every write (see
-`swarmx-storage`), so amendments to e.g. `api.spec` mid-build are
-recoverable — read the latest version via `swarm_read_blackboard`.
+- `produces = ["done"]` — the typed output-kinds this role emits. Empty
+  falls back to a single `done` kind at spawn time.
+- `consumes = [{ from_role = "backend", kind = "done" }]` — typed upstream
+  dependencies: "I consume the `kind` output of `from_role`". `kind`
+  defaults to `"done"`.
 
-**Listing vs reading (M6d-1).** `swarm_list_blackboard` returns the
-SQLite write history, which persists across server restarts and
-across `rm` of the FS files under `~/.swarmx/blackboard/`. A row
-in the listing is therefore NOT proof that the key's value is
-currently available — the file may have been deleted between runs.
-Agents that branch on the presence of `.error` (or any other
-"signal" key) should follow up with `swarm_read_blackboard`:
-`NOT_FOUND` / empty body = stale listing row, ignore; non-empty
-body = real signal, act on it. Test and critic roles already do
-this in their upstream-failed branches.
+The orchestrator normally leaves both alone and just passes a `role` slug to
+`swarm_spawn_worker`; per-spawn `produces` / `consumes` overrides exist for
+deliberate deviations.
 
-## Standard swarm messages
+## The server mints the handoff key
 
-| From     | To              | kind    | When                                | Body                                                            |
-| -------- | --------------- | ------- | ----------------------------------- | --------------------------------------------------------------- |
-| backend  | frontend        | reply   | After `api.spec` is written         | `"api.spec written. <N> endpoints. FE can start."`              |
-| frontend | backend         | note    | When api.spec needs amendment       | `"need X endpoint for Y. please amend api.spec."`               |
-| frontend | test            | reply   | After `frontend.done` written       | `"Frontend ready at commit <SHA>. Entry: ..."`                  |
-| backend  | test            | reply   | After `backend.done` written        | `"Backend ready at commit <SHA>. Run with: ..."`                |
-| test     | system          | reply   | After test run                      | `"✅ test passed: N tests."` or `"❌ test failed: M/N tests."`   |
-| test     | system          | reply   | If upstream failed                  | `"⏭️ test skipped — <which> failed."`                            |
+`mint_handoff_key` (`roles.rs`) is the **single source of truth** for a
+handoff key:
 
-Messages drive **wake-check**: receiving an unread message turns the
-recipient's next Stop hook into a `block` decision, giving them a
-fresh turn.
+```
+<workspace_id>/<thread_slug>/<role_slug>.<kind>
+```
 
-**M6b update — blackboard writes also wake subscribers.** A role that
-declares `depends_on = ["X"]` in its TOML front-matter is subscribed
-to key `X` automatically at spell-launch. When anyone writes that key,
-the server (a) drops a system note `kind="wake"` into the role's
-mailbox AND (b) injects `\x15…\r` directly into its PTY input, so the
-agent does NOT have to be currently mid-Stop to get reactivated. Roles
-that don't declare `depends_on` still work the M6a way (other agents
-explicitly notify them via swarm messages).
+Both the producer's prompt injection ("write your completion summary to THIS
+key, then STOP") and the consumer's resolved dependency list derive from this
+one function, so producer and consumer can never disagree on the key string.
+Agents never name keys themselves.
 
-## Why both blackboard AND messages?
+At `swarm_spawn_worker` time (`routes/rest.rs`) the server:
 
-| Mechanism   | What it carries          | Wake semantics                          |
-| ----------- | ------------------------ | --------------------------------------- |
-| blackboard  | Structured artifacts    | Wakes any subscriber declared via `depends_on` (M6b) |
-| messages    | "Something happened" signals | Triggers wake-check → fresh turn       |
+1. Mints one key per produced kind; the **primary handoff signal** is the
+   `done` kind if present, else the first kind.
+2. Resolves each `consumes` entry against the role registry
+   (`resolve_consumes_to_deps`): unknown producer role → rejected with a
+   did-you-mean; kind the producer doesn't declare → rejected; self-dependency
+   → rejected. Typos fail LOUD at spawn, never as a silent never-wake.
+3. Guards the runtime DAG: a `consumes` cycle among live workers in the
+   direction is rejected (W0-4), and a second live worker of the same role in
+   the same direction is rejected — two producers would mint the identical
+   key and overwrite each other (the minted key has no per-worker component).
 
-The pattern is: **write the artifact to the blackboard, then send a
-notification message**. Subscribers wake on the blackboard event;
-unsubscribed recipients wake on the message.
+## WakeCoordinator: a write becomes a wakeup
 
-This is the same pattern git+CI uses: the artifact (commit) goes to a
-repo, the notification (webhook) wakes the consumer.
+`WakeCoordinator` (`wake.rs`, one background tokio task) subscribes to the
+swarm broadcast and reacts to `SwarmEvent::BlackboardChanged`:
 
-## Failure model
+1. **Subscription table** (`wake_subs: agent_id → Vec<blackboard_key>`).
+   When any agent writes a key, every subscriber gets (a) a persisted mailbox
+   note `kind="wake"` and (b) a best-effort PTY kick (`\x15…\r` — Ctrl-U +
+   Enter) that wakes even a fully stopped agent, no polling.
+2. **Loop closure for the orchestrator**: `swarm_spawn_worker` appends the
+   new worker's primary handoff key to the *spawning* agent's subscriptions
+   (`append_wake_sub`), so the orchestrator wakes the instant each worker
+   finishes, reads the artifact, and updates its ledgers.
+3. **A worker's own deps are NOT wake subscriptions.** Its first prompt is
+   held by a readiness gate (`spawn_bootstrap_inject`, P1-D) that polls the
+   blackboard and injects the bootstrap only once every dep — or its `.error`
+   alias — is present. Subscribing the un-prompted worker would race the gate
+   with a spurious PTY kick.
+4. **Failure aliases fan out**: writing `<key>.error` or `<key>.failed` also
+   wakes the base key's subscribers (`base_key_aliases`), so a failure signal
+   unblocks exactly the agents waiting on the success key — no separate
+   wiring.
+5. **Post-handoff auto-kill**: a write matching a live agent's registered
+   handoff signal means that worker is done; after a 5s grace (final
+   scrollback + recording flush) its PTY is torn down so the UI returns to
+   ground truth.
+6. **Zero-wake diagnosis**: if a written key is some agent's handoff signal
+   but nothing was woken, a `depends_on`/handoff mismatch is logged (F3
+   diagnostics). Broadcast-lag overflow triggers a full reconcile of
+   `depends_on` against the blackboard (F12).
 
-- An agent fails → writes `<role>.error` to blackboard + notifies
-  downstream agents.
-- **M6c step 5 auto-fallback**: an agent that dies before writing its
-  `handoff_signal` triggers the server to write `<role>.error`
-  automatically AND directly wake the subscribers of the missed
-  signal. So downstream agents see `*.error` whether the producer
-  self-reported failure OR crashed silently.
-- Downstream agents do a generic check on every wake: any `*.error`
-  on the blackboard means upstream is dead — route to the
-  upstream-failed branch (`test.skipped` for test; for critic, write a
-  `review.completed` with `skipped:true` so test still gets the
-  expected signal).
-- Downstream agents do NOT attempt repair (M6c-6). A future critic /
-  fixer loop (M6d) could close that gap.
-- The user observes the final state via the swarm panel, the
-  blackboard inspector, and the `graph` tab in the swarm drawer
-  (edges turn red when an `*.error` is the latest write for a key).
+## exit_keys: crashed producers still fail loud
 
-## Why this layout
+At spawn, every worker registers an `ExitKey { role, handoff_signal,
+spawned_at_ms }` (`register_exit_key`). When the agent later exits — clean
+`Exited` or reaper-synthesized `Error` — without a *fresh* write of its
+handoff signal (a write older than `spawned_at_ms` is a leftover from a
+previous run and doesn't count), the WakeCoordinator synthesizes
 
-Modeled on MetaGPT's "Code = SOP(Team)" finding (ICLR 2024): pinning
-the inter-agent protocol to a small set of named slots (PRD, design,
-code, tests in MetaGPT; `api.spec`, `*.done`, test.passed here)
-prevents the cascade-hallucination failure mode where FE and BE drift
-on their assumed API shape. The shared key namespace forces the
-contract to be explicit and inspectable.
+```
+<workspace_id>/<thread_slug>/<role_slug>.<kind>.error
+```
+
+and directly wakes the subscribers of the missed signal. Downstream agents
+therefore see the same `.error` whether the producer self-reported failure or
+died silently (M6c step 5). Consumers' role prompts check for the `.error`
+alias and route to their upstream-failed branch; they do not attempt repair —
+the orchestrator decides whether to spawn a `fixer` or re-dispatch.
+
+## Conventions that live on top
+
+These are prompt-level conventions (in `roles/orchestrator.md`), not runtime
+contracts:
+
+- `{workspace_id}/{thread_slug}/task.ledger.md` / `progress.ledger.md` /
+  `plan.json` — the orchestrator's Magentic-One dual ledger + UI checklist.
+- `{workspace_id}/{thread_slug}/<role>.progress.md` — worker progress
+  breadcrumbs, overwritten per milestone so the UI shows liveness.
+
+## Why blackboard AND messages?
+
+| Mechanism  | What it carries               | Wake semantics                                    |
+| ---------- | ----------------------------- | ------------------------------------------------- |
+| blackboard | Structured artifacts          | WakeCoordinator wakes subscribers / readiness gate |
+| messages   | "Something happened" signals  | Stop hook (`wake-check`) → fresh turn              |
+
+The artifact goes to the blackboard; the wake rides the event. Same pattern
+as git + CI: the commit lands in the repo, the webhook wakes the consumer.

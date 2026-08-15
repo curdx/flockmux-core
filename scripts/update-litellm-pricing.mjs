@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 // Refresh the embedded LiteLLM pricing snapshot that backs /api/usage.
 //
+// Runtime also auto-refreshes once per process from the same URL (see
+// `spawn_litellm_pricing_refresh` in usage.rs; opt out:
+// SWARMX_DISABLE_LITELLM_REFRESH=1). This script keeps the *shipped* embed
+// current for offline / first-boot before the background fetch lands.
+//
 // swarmx can't ask claude/codex for spend, so it scrapes token counts and
-// applies a pricing table. The 4 hand-maintained rules (opus/sonnet/haiku/
-// gpt-5) stay the editable PRIMARY layer; this snapshot is the FALLBACK so a
-// brand-new model id auto-prices instead of showing tokens-only. Source is
-// BerriAI/litellm (the same table ccusage uses), converted from USD-per-token
-// to USD-per-1M-tokens and trimmed to just the fields the cost math needs.
+// applies a pricing table. The hand-maintained primary rules stay editable;
+// this snapshot is the FALLBACK. Source is BerriAI/litellm (same table
+// ccusage uses), converted from USD-per-token to USD-per-1M-tokens.
 //
 // Usage:  node scripts/update-litellm-pricing.mjs            fetch + write
-//         node scripts/update-litellm-pricing.mjs --check    assert up to date (CI)
-//         node scripts/update-litellm-pricing.mjs --from <f> use a local json instead of fetching
+//         node scripts/update-litellm-pricing.mjs --check    assert up to date
+//         node scripts/update-litellm-pricing.mjs --from <f> use a local json
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";

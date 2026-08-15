@@ -745,13 +745,141 @@ async fn zulu_one_turn_check(conv: std::sync::Arc<crate::zulu_serve::ZuluConv>) 
 /// same scratch teardown instead of duplicating the path list.
 pub(crate) fn cleanup(tmp: &Path, agent_id: Option<&str>) {
     let _ = std::fs::remove_dir_all(tmp);
-    let (Some(id), Some(home)) = (agent_id, crate::runtime_path::swarmx_home()) else {
+    if let Some(id) = agent_id {
+        remove_agent_scratch(id);
+    }
+}
+
+/// The per-agent config paths every CLI adapter writes under
+/// `<home>/.swarmx/` at spawn (pre-spawn patches + per-agent HOMEs): the
+/// codex/reasonix isolated HOME dirs, the opencode + swarm-MCP config entries,
+/// and the wake throttle file. ONE list shared by the probe teardown
+/// ([`cleanup`]) and the live-agent GC ([`remove_agent_scratch`]) so an
+/// adapter adding a new per-agent path edits it once and both reclaim it.
+fn per_agent_scratch(fm: &Path, id: &str) -> [PathBuf; 5] {
+    [
+        fm.join("reasonix-home").join(id),
+        fm.join("codex-home").join(id),
+        fm.join("opencode").join(format!("{id}.json")),
+        fm.join("mcp").join(format!("{id}.json")),
+        fm.join("wake").join(format!("{id}.json")),
+    ]
+}
+
+/// Delete a dead agent's per-agent config dirs/files under `~/.swarmx/`.
+/// Called from the registry's slot-removal convergence point (teardown,
+/// auto-kill, reaper eviction all funnel through `Registry::remove`) so a
+/// retired agent doesn't leak its scratch forever — previously only the probe
+/// path ever cleaned these.
+///
+/// Path-injection guard: the id must be a plain directory-safe name (the
+/// server-generated `<cli>-<8hex>` shape satisfies this) and every resolved
+/// path must stay under the swarmx home; anything else is refused with a
+/// warn rather than risk a crafted id escaping via `..` or separators.
+/// Best-effort: missing paths and individual remove failures are ignored.
+pub(crate) fn remove_agent_scratch(agent_id: &str) {
+    let Some(home) = crate::runtime_path::swarmx_home() else {
         return;
     };
-    let fm = home.join(".swarmx");
-    let _ = std::fs::remove_dir_all(fm.join("reasonix-home").join(id));
-    let _ = std::fs::remove_dir_all(fm.join("codex-home").join(id));
-    let _ = std::fs::remove_file(fm.join("opencode").join(format!("{id}.json")));
-    let _ = std::fs::remove_file(fm.join("mcp").join(format!("{id}.json")));
-    let _ = std::fs::remove_file(fm.join("wake").join(format!("{id}.json")));
+    remove_agent_scratch_under(&home.join(".swarmx"), agent_id);
+}
+
+/// The fs half of [`remove_agent_scratch`], split out so tests can point it at
+/// a tempdir instead of the real home (reading `HOME` in a test would race
+/// the parallel runners that mutate it).
+fn remove_agent_scratch_under(fm: &Path, agent_id: &str) {
+    if !is_safe_agent_dir_name(agent_id) {
+        tracing::warn!(agent = %agent_id, "refusing scratch GC: agent id is not a safe dir name");
+        return;
+    }
+    for p in per_agent_scratch(fm, agent_id) {
+        // per_agent_scratch joins a validated plain name onto `fm`, so this
+        // can only fail on a logic bug above — keep it as a debug tripwire.
+        debug_assert!(p.starts_with(fm), "scratch path escaped swarmx home: {}", p.display());
+        // The list mixes dirs and files; try both removes, ignore the one
+        // that doesn't apply (remove_file errors on a dir, remove_dir_all on
+        // a file). `remove_dir_all` does not follow a symlinked final
+        // component, so a planted symlink can't redirect the delete outside.
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+}
+
+/// A safe single path component: non-empty, bounded, and limited to the
+/// charset server-generated agent ids actually use (`<cli>-<8hex>`), which
+/// excludes every separator / dot-dot / absolute-path trick by construction.
+fn is_safe_agent_dir_name(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+
+#[cfg(test)]
+mod scratch_gc_tests {
+    use super::*;
+
+    /// Seed every per-agent scratch path under a fake swarmx home.
+    fn seed_scratch(fm: &Path, id: &str) {
+        std::fs::create_dir_all(fm.join("reasonix-home").join(id)).unwrap();
+        std::fs::create_dir_all(fm.join("codex-home").join(id).join("nested")).unwrap();
+        std::fs::create_dir_all(fm.join("opencode")).unwrap();
+        std::fs::create_dir_all(fm.join("mcp")).unwrap();
+        std::fs::create_dir_all(fm.join("wake")).unwrap();
+        std::fs::write(fm.join("opencode").join(format!("{id}.json")), b"{}").unwrap();
+        std::fs::write(fm.join("mcp").join(format!("{id}.json")), b"{}").unwrap();
+        std::fs::write(fm.join("wake").join(format!("{id}.json")), b"{}").unwrap();
+    }
+
+    #[test]
+    fn gc_removes_every_per_agent_path_but_keeps_neighbours() {
+        let dir = tempfile::tempdir().unwrap();
+        let fm = dir.path().join(".swarmx");
+        seed_scratch(&fm, "codex-deadbeef");
+        seed_scratch(&fm, "claude-alive1");
+
+        remove_agent_scratch_under(&fm, "codex-deadbeef");
+
+        for p in per_agent_scratch(&fm, "codex-deadbeef") {
+            assert!(!p.exists(), "leftover scratch: {}", p.display());
+        }
+        // The sibling agent's scratch is untouched.
+        for p in per_agent_scratch(&fm, "claude-alive1") {
+            assert!(p.exists(), "neighbour scratch wrongly removed: {}", p.display());
+        }
+    }
+
+    #[test]
+    fn gc_tolerates_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let fm = dir.path().join(".swarmx");
+        // Nothing seeded — the GC must be a silent no-op.
+        remove_agent_scratch_under(&fm, "codex-notthere");
+    }
+
+    #[test]
+    fn gc_refuses_path_injection_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let fm = dir.path().join(".swarmx");
+        let sentinel = dir.path().join("sentinel");
+        std::fs::create_dir_all(&sentinel).unwrap();
+        std::fs::create_dir_all(&fm).unwrap();
+
+        for evil in ["../sentinel", "..", "a/b", "a\\b", "", "."] {
+            remove_agent_scratch_under(&fm, evil);
+        }
+        assert!(sentinel.exists(), "injected id must never escape the base dir");
+        assert!(fm.exists());
+    }
+
+    #[test]
+    fn safe_dir_name_matches_server_id_shape() {
+        assert!(is_safe_agent_dir_name("claude-ab12cd34"));
+        assert!(is_safe_agent_dir_name("kimi_orch-1"));
+        for bad in ["", "..", "../x", "a/b", "a\\b", "a b", "a.b"] {
+            assert!(!is_safe_agent_dir_name(bad), "{bad:?} must be rejected");
+        }
+    }
 }

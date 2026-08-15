@@ -23,7 +23,7 @@ export default function McpRoute() {
             {t("mcp.pageTitle", "MCP")}
           </h1>
           <span className="font-caption text-[10px] text-foreground-tertiary">
-            {t("mcp.pageSubtitle", "给 agent 装 MCP server · 对所有工作区生效 · 仅存本机")}
+            {t("mcp.pageSubtitle", "给 AI 加外部工具。对所有工作空间生效，只保存在这台电脑。")}
           </span>
         </div>
       </header>
