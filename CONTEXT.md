@@ -20,6 +20,10 @@ turn; they do not pick PTY vs TUI HTTP vs serve HTTP themselves.
 Pushing an idle or mid-turn Agent to notice mailbox / blackboard work.
 Mailbox `kind=wake` is the source of truth; engine kick is best-effort.
 Blackboard subscription wakes and operator ⚡ share the same delivery plane.
+The continuation prompt (what the engine is told) is **one** recipe:
+`ConsumeWakesResponse::continuation`, filled as `reason` on consume.
+Engine adapters do not author their own "You were woken up" strings.
+The mailbox note body is a separate, operator-facing record.
 
 ## Handoff
 
@@ -48,6 +52,9 @@ owned by this adapter today — those live in spawn orchestration and
 
 ## LiveDelivery
 
-Internal classification of how a *running* Agent accepts turns (zulu serve /
-reasonix serve / opencode TUI / PTY keystroke). Implementation detail of
-TurnDelivery — not the public seam for callers.
+How a *running* Agent accepts turns (zulu serve / reasonix serve / opencode TUI
+/ PTY keystroke). Stored on the AgentSlot at spawn from the plugin's declared
+`InputDelivery` plus the allocated port/handle. Callers read the stored field;
+they do not re-derive the channel from `serve_http_port` / `tui_http_port` /
+`zulu` — those Options are handles only, and zulu and reasonix share
+`serve_http_port`. Implementation detail of TurnDelivery — not a public seam.

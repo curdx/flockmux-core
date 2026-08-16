@@ -109,6 +109,7 @@ export const SwarmxWake = async ({ client }) => {
       if (!sessionID) return
 
       let count = 0
+      let text = ""
       try {
         const res = await fetch(
           `${SERVER_URL}/api/message/consume_wakes?to=${encodeURIComponent(AGENT_ID)}`,
@@ -117,16 +118,20 @@ export const SwarmxWake = async ({ client }) => {
         if (!res.ok) return
         const body = await res.json()
         count = (body && typeof body.count === "number") ? body.count : 0
+        if (count <= 0) return
+        text =
+          (body && typeof body.reason === "string" && body.reason)
+            ? body.reason
+            : wakeReason(count)
       } catch {
         // Server unreachable → never block the agent; just skip this wake.
         return
       }
-      if (count <= 0) return
 
       try {
         await client.session.prompt({
           path: { id: sessionID },
-          body: { parts: [{ type: "text", text: wakeReason(count) }] },
+          body: { parts: [{ type: "text", text }] },
         })
       } catch {
         // Re-prompt failed → the wakes were already consumed; they will be

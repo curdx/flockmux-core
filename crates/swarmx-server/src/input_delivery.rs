@@ -9,12 +9,14 @@
 //! zulu → reasonix → opencode → keystroke cascade, and they do **not** call
 //! engine HTTP helpers directly for wake kicks.
 //!
-//! [`LiveDelivery::classify`] is an implementation detail of that routing.
+//! The live channel is stored on [`AgentSlot`] at spawn ([`LiveDelivery::at_spawn`]).
+//! [`LiveDelivery::classify`] reads that field — it does not inspect ports.
 
-use anyhow::{anyhow, Result};
-use bytes::Bytes;
+use crate::plugins::InputDelivery;
 use crate::registry::{AgentSlot, Registry};
 use crate::zulu_serve::ZuluConv;
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use std::sync::Arc;
 
 /// How a *live* agent accepts bootstrap / wake turn text.
@@ -31,23 +33,40 @@ pub(crate) enum LiveDelivery {
 }
 
 impl LiveDelivery {
-    /// Classify from a registry slot. Order is load-bearing: zulu before
-    /// reasonix (both may set `serve_http_port`), then opencode TUI, else
-    /// keystroke.
+    /// Materialize the live channel from the plugin's declared delivery plus
+    /// the handles spawn just allocated. This is the only place those two
+    /// are combined — later callers read [`AgentSlot::live_delivery`].
+    ///
+    /// A missing handle (port alloc failed) degrades to keystroke rather than
+    /// guessing reasonix from a zulu `serve_http_port`.
+    pub(crate) fn at_spawn(
+        declared: InputDelivery,
+        tui_http_port: Option<u16>,
+        serve_http_port: Option<u16>,
+        zulu: Option<Arc<ZuluConv>>,
+        workspace: &str,
+    ) -> Self {
+        match declared {
+            InputDelivery::ZuluServeHttp => zulu.map(Self::Zulu).unwrap_or(Self::Keystroke),
+            InputDelivery::ReasonixServeHttp => serve_http_port
+                .map(|port| Self::Reasonix { port })
+                .unwrap_or(Self::Keystroke),
+            InputDelivery::OpencodeTuiHttp => tui_http_port
+                .map(|port| Self::Opencode {
+                    port,
+                    workspace: workspace.to_string(),
+                })
+                .unwrap_or(Self::Keystroke),
+            InputDelivery::Keystroke => Self::Keystroke,
+        }
+    }
+
+    /// Read the channel stored on the slot. Does **not** inspect
+    /// `serve_http_port` / `tui_http_port` / `zulu` — those are handles,
+    /// not the discriminant. zulu and reasonix share `serve_http_port`;
+    /// inferring from it made lifecycle treat zulu as reasonix.
     pub(crate) fn classify(slot: &AgentSlot) -> Self {
-        if let Some(conv) = slot.zulu() {
-            return Self::Zulu(conv);
-        }
-        if let Some(port) = slot.serve_http_port() {
-            return Self::Reasonix { port };
-        }
-        if let Some(port) = slot.tui_http_port() {
-            return Self::Opencode {
-                port,
-                workspace: slot.workspace.clone(),
-            };
-        }
-        Self::Keystroke
+        slot.live_delivery()
     }
 
     pub(crate) fn kind_name(&self) -> &'static str {
@@ -57,6 +76,19 @@ impl LiveDelivery {
             Self::Opencode { .. } => "opencode-tui-http",
             Self::Keystroke => "keystroke",
         }
+    }
+
+    /// HTTP serve engines submit the first turn *before* MCP clients attach
+    /// (reasonix documented; zulu same class). Waiting on `mcp-ready` would
+    /// burn the full fallback every spawn.
+    pub(crate) fn skips_mcp_ready_wait(&self) -> bool {
+        matches!(self, Self::Reasonix { .. } | Self::Zulu(_))
+    }
+}
+
+impl Default for LiveDelivery {
+    fn default() -> Self {
+        Self::Keystroke
     }
 }
 
@@ -311,8 +343,8 @@ mod tests {
         AgentSlot {
             channel: AgentChannel::Pty {
                 bridge: {
-                    use swarmx_pty::{PtyBridge, SpawnOpts};
                     use std::collections::HashMap;
+                    use swarmx_pty::{PtyBridge, SpawnOpts};
                     let handles = PtyBridge::spawn(SpawnOpts {
                         argv: &["/bin/sh".into(), "-c".into(), "true".into()],
                         cwd: None,
@@ -336,21 +368,130 @@ mod tests {
             tui_http_port: None,
             serve_http_port: None,
             zulu: None,
+            live_delivery: LiveDelivery::Keystroke,
         }
+    }
+
+    #[test]
+    fn at_spawn_maps_declared_delivery() {
+        assert!(matches!(
+            LiveDelivery::at_spawn(InputDelivery::Keystroke, Some(1), Some(2), None, "/ws"),
+            LiveDelivery::Keystroke
+        ));
+        match LiveDelivery::at_spawn(
+            InputDelivery::OpencodeTuiHttp,
+            Some(4096),
+            None,
+            None,
+            "/ws",
+        ) {
+            LiveDelivery::Opencode { port, workspace } => {
+                assert_eq!(port, 4096);
+                assert_eq!(workspace, "/ws");
+            }
+            other => panic!("expected Opencode, got {}", other.kind_name()),
+        }
+        match LiveDelivery::at_spawn(
+            InputDelivery::ReasonixServeHttp,
+            None,
+            Some(7780),
+            None,
+            "/ws",
+        ) {
+            LiveDelivery::Reasonix { port } => assert_eq!(port, 7780),
+            other => panic!("expected Reasonix, got {}", other.kind_name()),
+        }
+        let conv = Arc::new(crate::zulu_serve::ZuluConv::new(
+            7780,
+            "m".into(),
+            "l".into(),
+            "/tmp".into(),
+            "http://127.0.0.1:7777".into(),
+        ));
+        assert!(matches!(
+            LiveDelivery::at_spawn(
+                InputDelivery::ZuluServeHttp,
+                None,
+                Some(7780),
+                Some(conv),
+                "/ws"
+            ),
+            LiveDelivery::Zulu(_)
+        ));
+    }
+
+    #[test]
+    fn at_spawn_missing_handle_degrades_to_keystroke() {
+        assert!(matches!(
+            LiveDelivery::at_spawn(InputDelivery::OpencodeTuiHttp, None, None, None, "/ws"),
+            LiveDelivery::Keystroke
+        ));
+        assert!(matches!(
+            LiveDelivery::at_spawn(InputDelivery::ReasonixServeHttp, None, None, None, "/ws"),
+            LiveDelivery::Keystroke
+        ));
+        // zulu's serve_http_port is allocated but the conv is the discriminant
+        assert!(matches!(
+            LiveDelivery::at_spawn(InputDelivery::ZuluServeHttp, None, Some(7780), None, "/ws"),
+            LiveDelivery::Keystroke
+        ));
+    }
+
+    #[test]
+    fn skips_mcp_ready_wait_for_http_serve_engines() {
+        assert!(LiveDelivery::Reasonix { port: 1 }.skips_mcp_ready_wait());
+        assert!(!LiveDelivery::Keystroke.skips_mcp_ready_wait());
+        assert!(!LiveDelivery::Opencode {
+            port: 1,
+            workspace: "/ws".into()
+        }
+        .skips_mcp_ready_wait());
+        let conv = Arc::new(crate::zulu_serve::ZuluConv::new(
+            1,
+            "m".into(),
+            "l".into(),
+            "/tmp".into(),
+            "http://127.0.0.1:7777".into(),
+        ));
+        assert!(LiveDelivery::Zulu(conv).skips_mcp_ready_wait());
     }
 
     #[test]
     #[cfg(unix)]
     fn classify_defaults_to_keystroke() {
         let slot = bare_slot();
-        assert!(matches!(LiveDelivery::classify(&slot), LiveDelivery::Keystroke));
+        assert!(matches!(
+            LiveDelivery::classify(&slot),
+            LiveDelivery::Keystroke
+        ));
     }
 
     #[test]
     #[cfg(unix)]
-    fn classify_opencode_from_tui_port() {
+    fn classify_does_not_rederive_from_ports() {
         let mut slot = bare_slot();
         slot.tui_http_port = Some(4096);
+        slot.serve_http_port = Some(7780);
+        slot.zulu = Some(Arc::new(crate::zulu_serve::ZuluConv::new(
+            7780,
+            "m".into(),
+            "l".into(),
+            "/tmp".into(),
+            "http://127.0.0.1:7777".into(),
+        )));
+        // stored channel stays Keystroke — mutating handles must not re-infer
+        assert!(matches!(
+            LiveDelivery::classify(&slot),
+            LiveDelivery::Keystroke
+        ));
+
+        slot.live_delivery = LiveDelivery::at_spawn(
+            InputDelivery::OpencodeTuiHttp,
+            slot.tui_http_port,
+            None,
+            None,
+            &slot.workspace,
+        );
         match LiveDelivery::classify(&slot) {
             LiveDelivery::Opencode { port, workspace } => {
                 assert_eq!(port, 4096);
@@ -362,9 +503,16 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn classify_reasonix_from_serve_port() {
+    fn classify_reasonix_from_stored_delivery() {
         let mut slot = bare_slot();
         slot.serve_http_port = Some(7780);
+        slot.live_delivery = LiveDelivery::at_spawn(
+            InputDelivery::ReasonixServeHttp,
+            None,
+            slot.serve_http_port,
+            None,
+            &slot.workspace,
+        );
         match LiveDelivery::classify(&slot) {
             LiveDelivery::Reasonix { port } => assert_eq!(port, 7780),
             other => panic!("expected Reasonix, got {}", other.kind_name()),
@@ -373,16 +521,24 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn classify_zulu_wins_over_serve_port() {
+    fn classify_zulu_from_stored_delivery_even_with_serve_port() {
         let mut slot = bare_slot();
         slot.serve_http_port = Some(7780);
-        slot.zulu = Some(Arc::new(crate::zulu_serve::ZuluConv::new(
+        let conv = Arc::new(crate::zulu_serve::ZuluConv::new(
             7780,
             "m".into(),
             "l".into(),
             "/tmp".into(),
             "http://127.0.0.1:7777".into(),
-        )));
+        ));
+        slot.zulu = Some(conv.clone());
+        slot.live_delivery = LiveDelivery::at_spawn(
+            InputDelivery::ZuluServeHttp,
+            None,
+            slot.serve_http_port,
+            Some(conv),
+            &slot.workspace,
+        );
         assert!(matches!(
             LiveDelivery::classify(&slot),
             LiveDelivery::Zulu(_)

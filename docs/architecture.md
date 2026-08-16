@@ -302,7 +302,7 @@ reasonix 无 TUI，改为 HTTP+SSE：`reasonix_serve.rs` 里一个长生命周�
 
 已停止的 reasonix agent 的 wake 由 `WakeCoordinator` 通过 `wake_if_idle()` 直接 submit，两路都走 `consume_and_submit()` 保证原子性。
 
-bootstrap / wake 的引擎分支统一经 `input_delivery::LiveDelivery::classify`（zulu → reasonix → opencode → keystroke），避免 `rest.rs` 与 `wake.rs` 各自重排优先级。
+bootstrap / wake 的引擎分支统一经 `input_delivery::LiveDelivery::classify`（读取 spawn 时钉在 slot 上的通道，不再从 `serve_http_port` 反推），避免 `rest.rs` 与 `wake.rs` 各自重排优先级。
 
 ---
 

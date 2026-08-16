@@ -15,10 +15,10 @@
 use crate::pty_stream::PtyStream;
 use bytes::Bytes;
 use dashmap::DashMap;
-use swarmx_pty::PtyBridge;
 use parking_lot::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use swarmx_pty::PtyBridge;
 use tokio::sync::mpsc;
 
 /// Lifecycle status surfaced to every (re-)attaching client so the UI can
@@ -61,22 +61,20 @@ pub struct AgentSlot {
     /// retains the latest value, so a ping that races the subscriber is never
     /// lost (`send_replace` updates the stored value even with no receivers).
     pub mcp_ready: tokio::sync::watch::Sender<bool>,
-    /// For CLIs driven over their TUI's HTTP control API (opencode): the known
-    /// `--port` swarmx spawned the TUI on. `Some(port)` is the signal that
-    /// this agent's prompts (bootstrap + wakes) are delivered via
-    /// `crate::opencode_tui` instead of keystroke injection. `None` for the
-    /// keystroke CLIs (claude/codex/kimi).
+    /// Allocated opencode `--port`. Handle only — the live channel is
+    /// [`Self::live_delivery`]. `None` when this agent is not opencode.
     pub tui_http_port: Option<u16>,
-    /// For reasonix: the `--addr` port its `reasonix serve` HTTP+SSE control API
-    /// listens on. `Some(port)` routes this agent's bootstrap/wakes through
-    /// `crate::reasonix_serve` (POST /submit + /events SSE) instead of keystrokes
-    /// or the opencode `/tui` path. `None` for every other CLI.
+    /// Allocated `reasonix serve` / `zulu serve` listen port. Handle only —
+    /// those two engines share this field; do **not** infer the channel from
+    /// it. Read [`Self::live_delivery`].
     pub serve_http_port: Option<u16>,
-    /// For zulu (Comate): the per-agent conversation handle. `Some(_)` routes
-    /// this agent's bootstrap/wakes through `crate::zulu_serve` (POST /session
-    /// SSE per turn); it carries the serve port, resolved model, license, cwd,
-    /// and the conversation_id + busy state the driver owns. `None` otherwise.
+    /// Allocated zulu conversation handle. Handle only — the live channel is
+    /// [`Self::live_delivery`].
     pub zulu: Option<Arc<crate::zulu_serve::ZuluConv>>,
+    /// Live turn-delivery channel, set once at spawn from the plugin's
+    /// declared `InputDelivery` plus the handles above. Callers read this;
+    /// they do not re-derive from the Options.
+    pub(crate) live_delivery: crate::input_delivery::LiveDelivery,
 }
 
 /// An agent's PTY I/O. Every CLI (claude/codex/opencode/reasonix/zulu/kimi)
@@ -150,21 +148,25 @@ impl AgentSlot {
     }
 
     /// The TUI HTTP-control port for opencode agents (see `tui_http_port` field
-    /// and `crate::opencode_tui`). `None` for keystroke CLIs (claude/codex/kimi).
+    /// and `crate::opencode_tui`). Handle only — channel is [`Self::live_delivery`].
     pub fn tui_http_port(&self) -> Option<u16> {
         self.tui_http_port
     }
 
-    /// The reasonix `serve` HTTP-control port (see `serve_http_port` field and
-    /// `crate::reasonix_serve`). `None` for every non-reasonix CLI.
+    /// The `reasonix serve` / `zulu serve` listen port. Handle only — those
+    /// two engines share this field. Channel is [`Self::live_delivery`].
     pub fn serve_http_port(&self) -> Option<u16> {
         self.serve_http_port
     }
 
     /// The per-agent zulu conversation handle (see `zulu` field and
-    /// `crate::zulu_serve`). `None` for every non-zulu CLI.
+    /// `crate::zulu_serve`). Handle only — channel is [`Self::live_delivery`].
     pub fn zulu(&self) -> Option<Arc<crate::zulu_serve::ZuluConv>> {
         self.zulu.clone()
+    }
+
+    pub(crate) fn live_delivery(&self) -> crate::input_delivery::LiveDelivery {
+        self.live_delivery.clone()
     }
 }
 
@@ -182,7 +184,10 @@ pub enum LifecycleEvent {
     ///
     /// Carries a `String` payload, so this enum is `Clone` (not `Copy`); the
     /// broadcast channel only requires `Clone`.
-    HealthFail { reason: String, kind: String },
+    HealthFail {
+        reason: String,
+        kind: String,
+    },
 }
 
 #[derive(Default, Clone)]

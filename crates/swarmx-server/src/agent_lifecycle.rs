@@ -5,9 +5,8 @@
 //! sensitive bootstrap sequence has one home (F22). Callers:
 //! `spawn_worker` / `run_spell` / workspace fusion helpers.
 
-use swarmx_protocol::ws_swarm::SwarmEvent;
 use crate::registry::LifecycleEvent;
-
+use swarmx_protocol::ws_swarm::SwarmEvent;
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -151,15 +150,15 @@ pub(crate) fn spawn_bootstrap_inject(
                 return;
             }
         };
-        // reasonix connects its MCP servers only AFTER the first `/submit` (its
-        // session bootstraps the MCP clients lazily), so the mcp-ready ping can
-        // never arrive before we submit — waiting here would just burn the full
-        // fallback every time. Skip the wait for reasonix; the driver submits as
-        // soon as serve binds and MCP attaches a beat later.
-        let is_reasonix_serve = slot_lock.lock().serve_http_port().is_some();
+        // HTTP serve engines (reasonix documented; zulu same class) connect MCP
+        // clients only AFTER the first submit, so the mcp-ready ping can never
+        // arrive before we submit — waiting here would just burn the full
+        // fallback every spawn. Keyed off stored LiveDelivery, not
+        // `serve_http_port` (zulu and reasonix share that port field).
+        let skip_mcp_ready = slot_lock.lock().live_delivery().skips_mcp_ready_wait();
         // Subscribe without holding the parking_lot guard across the await.
         let mut mcp_rx = slot_lock.lock().mcp_ready.subscribe();
-        if !is_reasonix_serve && !*mcp_rx.borrow() {
+        if !skip_mcp_ready && !*mcp_rx.borrow() {
             // Generous cap: only applies when the ping never arrives (e.g. a
             // future CLI without MCP, or a lost ping). On the happy path the
             // watch fires in ~1-2s and we proceed immediately.
@@ -346,7 +345,10 @@ pub(crate) fn spawn_bootstrap_inject(
         // the PROMPT length (markers add a constant 12 bytes).
         let bracketed = {
             let cli = slot_lock.lock().cli.clone();
-            plugins.get(&cli).map(|p| p.bracketed_paste).unwrap_or(false)
+            plugins
+                .get(&cli)
+                .map(|p| p.bracketed_paste)
+                .unwrap_or(false)
         };
         let body = if bracketed {
             let mut b = Vec::with_capacity(body.len() + 12);
@@ -414,8 +416,7 @@ pub(crate) fn spawn_bootstrap_inject(
 /// "MCP server … connected" banner lands <2s after spawn on a warm box; 45s
 /// covers a cold first run (plugin/theme init) while still leaving the 90s
 /// first-response watchdog room to judge a genuinely wedged agent.
-const BOOTSTRAP_READY_NEEDLE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(45);
+const BOOTSTRAP_READY_NEEDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Scan an agent's PTY output for `needle` — ring buffer first, then live
 /// appends — returning `true` once found (`false` on timeout or stream
@@ -524,12 +525,7 @@ pub fn duplicate_orchestrators_to_reap(cands: &[OrchCandidate]) -> Vec<String> {
 mod orch_singleton_tests {
     use super::*;
 
-    fn c(
-        id: &str,
-        spawned_at: i64,
-        activity: Option<i64>,
-        err: Option<&str>,
-    ) -> OrchCandidate {
+    fn c(id: &str, spawned_at: i64, activity: Option<i64>, err: Option<&str>) -> OrchCandidate {
         OrchCandidate {
             id: id.into(),
             spawned_at,
@@ -552,7 +548,10 @@ mod orch_singleton_tests {
             c("active", 200, Some(999), None),
         ];
         assert_eq!(pick_orchestrator_keeper(&cands).unwrap().id, "active");
-        assert_eq!(duplicate_orchestrators_to_reap(&cands), vec!["silent".to_string()]);
+        assert_eq!(
+            duplicate_orchestrators_to_reap(&cands),
+            vec!["silent".to_string()]
+        );
     }
 
     #[test]
@@ -563,13 +562,19 @@ mod orch_singleton_tests {
             c("fresh", 200, None, None),
         ];
         assert_eq!(pick_orchestrator_keeper(&cands).unwrap().id, "fresh");
-        assert_eq!(duplicate_orchestrators_to_reap(&cands), vec!["wedged".to_string()]);
+        assert_eq!(
+            duplicate_orchestrators_to_reap(&cands),
+            vec!["wedged".to_string()]
+        );
     }
 
     #[test]
     fn older_wins_when_scores_tie() {
         let cands = vec![c("old", 10, Some(1), None), c("new", 99, Some(1), None)];
         assert_eq!(pick_orchestrator_keeper(&cands).unwrap().id, "old");
-        assert_eq!(duplicate_orchestrators_to_reap(&cands), vec!["new".to_string()]);
+        assert_eq!(
+            duplicate_orchestrators_to_reap(&cands),
+            vec!["new".to_string()]
+        );
     }
 }

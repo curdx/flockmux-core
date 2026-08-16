@@ -268,10 +268,7 @@ pub async fn probe_all(
         let shim = shim_path.to_path_buf();
         let mcp = mcp_bin.to_path_buf();
         let url = server_url.to_string();
-        let r = match tokio::spawn(
-            async move { probe_one(&plugin, &shim, &mcp, &url).await },
-        )
-        .await
+        let r = match tokio::spawn(async move { probe_one(&plugin, &shim, &mcp, &url).await }).await
         {
             Ok(r) => r,
             Err(join_err) => {
@@ -364,14 +361,15 @@ pub async fn probe_one(
     //         INVALID/expired key binds fine and only 401s on the turn, which is
     //         exactly what this catches).
     let verdict = if verdict.state == ProbeState::Usable {
-        if let Some(port) = slot.tui_http_port() {
-            opencode_one_turn_check(port, &slot.workspace).await
-        } else if let Some(conv) = slot.zulu() {
-            zulu_one_turn_check(conv).await
-        } else if let Some(port) = slot.serve_http_port() {
-            reasonix_one_turn_check(port).await
-        } else {
-            pty_one_turn_check(&slot).await
+        match slot.live_delivery() {
+            crate::input_delivery::LiveDelivery::Opencode { port, workspace } => {
+                opencode_one_turn_check(port, &workspace).await
+            }
+            crate::input_delivery::LiveDelivery::Zulu(conv) => zulu_one_turn_check(conv).await,
+            crate::input_delivery::LiveDelivery::Reasonix { port } => {
+                reasonix_one_turn_check(port).await
+            }
+            crate::input_delivery::LiveDelivery::Keystroke => pty_one_turn_check(&slot).await,
         }
     } else {
         verdict
@@ -649,7 +647,9 @@ async fn opencode_one_turn_check(port: u16, workspace_dir: &str) -> Verdict {
         },
         Ok(false) => Verdict {
             state: ProbeState::NotUsable,
-            reason: Some("启动正常但在超时内没完成一次对话（可能未登录 / 额度耗尽 / 配置不全）".into()),
+            reason: Some(
+                "启动正常但在超时内没完成一次对话（可能未登录 / 额度耗尽 / 配置不全）".into(),
+            ),
             kind: Some("turn-timeout".into()),
             method: "turn-timeout",
         },
@@ -674,8 +674,7 @@ const REASONIX_TURN_TIMEOUT: Duration = Duration::from_secs(45);
 /// key: `serve` binds fine (launch reads Usable) and only the model call fails —
 /// launch-only alone only catches a MISSING key (serve exits at launch).
 async fn reasonix_one_turn_check(port: u16) -> Verdict {
-    let prompt =
-        "What is 318 plus 921? Reply with only the number, nothing else.";
+    let prompt = "What is 318 plus 921? Reply with only the number, nothing else.";
     match crate::reasonix_serve::verify_one_turn(port, prompt, REASONIX_TURN_TIMEOUT).await {
         crate::reasonix_serve::TurnProbe::Ok => Verdict {
             state: ProbeState::Usable,
@@ -691,7 +690,10 @@ async fn reasonix_one_turn_check(port: u16) -> Verdict {
         },
         crate::reasonix_serve::TurnProbe::NoOutput => Verdict {
             state: ProbeState::NotUsable,
-            reason: Some("serve 启动正常但在超时内没产出一次模型回合（key 无效 / 额度耗尽 / 配置不全）".into()),
+            reason: Some(
+                "serve 启动正常但在超时内没产出一次模型回合（key 无效 / 额度耗尽 / 配置不全）"
+                    .into(),
+            ),
             kind: Some("turn-timeout".into()),
             method: "turn-timeout",
         },
@@ -728,7 +730,8 @@ async fn zulu_one_turn_check(conv: std::sync::Arc<crate::zulu_serve::ZuluConv>) 
         crate::zulu_serve::TurnProbe::NoOutput => Verdict {
             state: ProbeState::NotUsable,
             reason: Some(
-                "serve 启动正常但在超时内没产出一次模型回合（license 无效 / 额度耗尽 / 配置不全）".into(),
+                "serve 启动正常但在超时内没产出一次模型回合（license 无效 / 额度耗尽 / 配置不全）"
+                    .into(),
             ),
             kind: Some("turn-timeout".into()),
             method: "turn-timeout",
@@ -795,7 +798,11 @@ fn remove_agent_scratch_under(fm: &Path, agent_id: &str) {
     for p in per_agent_scratch(fm, agent_id) {
         // per_agent_scratch joins a validated plain name onto `fm`, so this
         // can only fail on a logic bug above — keep it as a debug tripwire.
-        debug_assert!(p.starts_with(fm), "scratch path escaped swarmx home: {}", p.display());
+        debug_assert!(
+            p.starts_with(fm),
+            "scratch path escaped swarmx home: {}",
+            p.display()
+        );
         // The list mixes dirs and files; try both removes, ignore the one
         // that doesn't apply (remove_file errors on a dir, remove_dir_all on
         // a file). `remove_dir_all` does not follow a symlinked final
@@ -815,7 +822,6 @@ fn is_safe_agent_dir_name(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
-
 
 #[cfg(test)]
 mod scratch_gc_tests {
@@ -847,7 +853,11 @@ mod scratch_gc_tests {
         }
         // The sibling agent's scratch is untouched.
         for p in per_agent_scratch(&fm, "claude-alive1") {
-            assert!(p.exists(), "neighbour scratch wrongly removed: {}", p.display());
+            assert!(
+                p.exists(),
+                "neighbour scratch wrongly removed: {}",
+                p.display()
+            );
         }
     }
 
@@ -870,7 +880,10 @@ mod scratch_gc_tests {
         for evil in ["../sentinel", "..", "a/b", "a\\b", "", "."] {
             remove_agent_scratch_under(&fm, evil);
         }
-        assert!(sentinel.exists(), "injected id must never escape the base dir");
+        assert!(
+            sentinel.exists(),
+            "injected id must never escape the base dir"
+        );
         assert!(fm.exists());
     }
 

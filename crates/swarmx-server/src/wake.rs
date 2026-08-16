@@ -459,13 +459,13 @@ async fn deliver_wake_with_body(
         None => "",
     };
     if channel_hint == "opencode-tui-http" {
-        match swarm.store().consume_wakes(target.to_string(), now).await {
-            Ok(ids) if !ids.is_empty() => swarm.publish_event(SwarmEvent::MessageRead {
-                ids,
-                to_agent: target.to_string(),
-                at: now,
-            }),
-            _ => {}
+        if let Err(err) = crate::wake_claim::claim(swarm, target, now).await {
+            tracing::warn!(
+                ?err,
+                target,
+                label,
+                "opencode pre-consume wakes failed; plugin may double-kick"
+            );
         }
     }
 
@@ -483,23 +483,13 @@ async fn deliver_wake_with_body(
     {
         Ok(crate::input_delivery::WakeChannel::Keystroke) => {
             // PTY inject started a turn — consume wake rows so Stop hook noops.
-            match swarm.store().consume_wakes(target.to_string(), now).await {
-                Ok(ids) if !ids.is_empty() => {
-                    swarm.publish_event(SwarmEvent::MessageRead {
-                        ids,
-                        to_agent: target.to_string(),
-                        at: now,
-                    });
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        target,
-                        label,
-                        "wake post-inject consume_wakes failed; Stop hook may double-kick"
-                    );
-                }
+            if let Err(err) = crate::wake_claim::claim(swarm, target, now).await {
+                tracing::warn!(
+                    ?err,
+                    target,
+                    label,
+                    "wake post-inject consume_wakes failed; Stop hook may double-kick"
+                );
             }
         }
         Ok(ch) => {
@@ -1278,37 +1268,33 @@ async fn kick_agent(
         }
     };
 
-    // Opencode: pre-consume so swarmx-wake.js sees count=0; turn text is the
-    // generic wake_reason covering all consumed rows.
-    let kick_text = if matches!(
-        delivery,
-        crate::input_delivery::LiveDelivery::Opencode { .. }
-    ) {
-        let consumed = match swarm.store().consume_wakes(target.to_string(), now).await {
-            Ok(ids) => {
-                let n = ids.len();
-                if !ids.is_empty() {
-                    swarm.publish_event(SwarmEvent::MessageRead {
-                        ids,
-                        to_agent: target.to_string(),
-                        at: now,
-                    });
+    // Opencode: pre-consume so swarmx-wake.js sees count=0; kick text is
+    // the shared continuation covering all claimed rows (not a count-only
+    // recipe). Keystroke: peek without consuming so a failed inject still
+    // leaves the mailbox for Stop hook; consume after successful inject.
+    let kick_text = match &delivery {
+        crate::input_delivery::LiveDelivery::Opencode { .. } => {
+            match crate::wake_claim::claim(swarm, target, now).await {
+                Ok(resp) if resp.count > 0 => resp.continuation(),
+                Ok(_) => wake_mailbox_body(key),
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        target,
+                        key,
+                        "opencode pre-consume wakes failed; plugin may double-kick"
+                    );
+                    wake_mailbox_body(key)
                 }
-                n
             }
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    target,
-                    key,
-                    "opencode pre-consume wakes failed; plugin may double-kick"
-                );
-                0
+        }
+        crate::input_delivery::LiveDelivery::Keystroke => {
+            match crate::wake_claim::peek(swarm, target).await {
+                Ok(resp) if resp.count > 0 => resp.continuation(),
+                _ => wake_mailbox_body(key),
             }
-        };
-        crate::reasonix_serve::wake_reason(consumed.max(1) as i64)
-    } else {
-        wake_mailbox_body(key)
+        }
+        _ => wake_mailbox_body(key),
     };
 
     match crate::input_delivery::deliver_wake_turn(
@@ -1325,23 +1311,13 @@ async fn kick_agent(
     {
         Ok(crate::input_delivery::WakeChannel::Keystroke) => {
             // Consume after PTY inject so Stop hook noops (double-token fix).
-            match swarm.store().consume_wakes(target.to_string(), now).await {
-                Ok(ids) if !ids.is_empty() => {
-                    swarm.publish_event(SwarmEvent::MessageRead {
-                        ids,
-                        to_agent: target.to_string(),
-                        at: now,
-                    });
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        target,
-                        key,
-                        "post-inject consume_wakes failed; Stop hook will re-deliver"
-                    )
-                }
+            if let Err(err) = crate::wake_claim::claim(swarm, target, now).await {
+                tracing::warn!(
+                    ?err,
+                    target,
+                    key,
+                    "post-inject consume_wakes failed; Stop hook will re-deliver"
+                );
             }
             tracing::info!(target, key, "wake delivered");
         }
@@ -1741,6 +1717,7 @@ mod tests {
             tui_http_port: None,
             serve_http_port: None,
             zulu: None,
+            live_delivery: crate::input_delivery::LiveDelivery::Keystroke,
         };
         (slot, output_rx)
     }

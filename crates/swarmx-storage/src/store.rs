@@ -2186,6 +2186,27 @@ impl Store {
         .context("spawn_blocking consume_wakes")?
     }
 
+    /// Pending (unread) `kind=wake` ids for `to_agent`, oldest-first.
+    /// Used to build the continuation prompt **before** a PTY kick so the
+    /// inject can carry the B1 digest; consume still happens after a
+    /// successful inject so a failed kick leaves the mailbox for Stop hook.
+    pub async fn unread_wake_ids(&self, to_agent: String) -> Result<Vec<i64>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM messages \
+                     WHERE to_agent = ?1 AND kind = 'wake' AND read_at IS NULL \
+                     ORDER BY id ASC",
+                )?;
+                let rows = stmt.query_map(params![to_agent], |row| row.get::<_, i64>(0))?;
+                rows.collect::<rusqlite::Result<Vec<i64>>>()
+            })
+        })
+        .await
+        .context("spawn_blocking unread_wake_ids")?
+    }
+
     // ── blackboard ───────────────────────────────────────────────────────
 
     /// Of the given blackboard paths, return the subset that has at least one

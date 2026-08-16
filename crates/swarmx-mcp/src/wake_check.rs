@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use swarmx_protocol::rest::{ConsumeWakeItem, ConsumeWakesResponse};
+use swarmx_protocol::rest::ConsumeWakesResponse;
 
 /// Which CLI's Stop-hook protocol to speak. Selected by the `--hook-format`
 /// flag baked into the hook command the server writes into each CLI's config.
@@ -168,8 +168,8 @@ pub async fn run(args: WakeCheckArgs) -> Result<i32> {
     let now_ms = unix_ms();
     let state = read_throttle(&state_path).unwrap_or_default();
     let throttle_window_ms = args.throttle_secs.saturating_mul(1000);
-    let window_active = state.last_at_ms != 0
-        && now_ms.saturating_sub(state.last_at_ms) < throttle_window_ms;
+    let window_active =
+        state.last_at_ms != 0 && now_ms.saturating_sub(state.last_at_ms) < throttle_window_ms;
     if window_active && state.count >= args.max_wakes_per_window {
         return Ok(emit_noop(format));
     }
@@ -244,129 +244,12 @@ pub async fn run(args: WakeCheckArgs) -> Result<i32> {
     // (non-wake) messages too, but the wakes themselves don't need
     // re-fetching.
     //
-    // B1: when the server inlined the wakes' payloads, build_wake_reason
-    // digests them inline (see below), so the woken agent can react
-    // WITHOUT the old 3–5 serial round-trips (list_messages →
-    // list_blackboard → read_blackboard) that made wake latency the
-    // captain's top recoverable delay.
-    let reason = build_wake_reason(&resp);
+    // B1: `resp.continuation()` is the shared recipe (also used by PTY kick
+    // / reasonix / zulu / opencode). The agent can react without the old
+    // 3–5 serial round-trips (list_messages → list_blackboard →
+    // read_blackboard).
+    let reason = resp.continuation();
     Ok(emit_block(format, &reason))
-}
-
-// ── reason construction ────────────────────────────────────────────────────
-
-/// How much of one wake's inlined content the reason quotes verbatim
-/// (bytes, cut on a char boundary). The server inlines up to 64KB per
-/// entry; the continuation prompt shouldn't carry that. Typical handoff
-/// keys (`*.done` notes, short ledger snippets) fit under this whole —
-/// zero extra tool calls — while oversized ones degrade to a
-/// `swarm_read_blackboard` pointer, i.e. exactly the pre-B1 behaviour.
-const REASON_CONTENT_PREVIEW: usize = 2000;
-
-/// Max digest lines in one reason. A long-idle agent can consume dozens of
-/// wakes at once; the prompt gets the first few and a pointer for the rest.
-const REASON_MAX_DIGESTS: usize = 10;
-
-/// Build the `block` reason. One string feeds BOTH hook protocols
-/// (claude/codex stdout-JSON and kimi stderr+exit-2 share `emit_block`), so
-/// this is the single place the digest wording lives.
-///
-/// Two shapes:
-///   - With inline payloads (B1): one digest line per wake —
-///     "<from> wrote `<key>`: <content preview>" — plus the truncated/full
-///     pointer when the server cut the content (or the preview cap did).
-///   - Without payloads (old server, or server-side enrichment failed
-///     soft): the pre-B1 "go list" recipe, verbatim. The count-only
-///     contract is still fully serviced by that path.
-fn build_wake_reason(resp: &ConsumeWakesResponse) -> String {
-    let count = resp.count;
-    if resp.wakes.is_empty() {
-        // Why this exact wording: codex 0.132's swarm_send_message tool
-        // calls observed in the wild often omit `in_reply_to`, which breaks
-        // the threading view in the UI. Naming the field explicitly + tying
-        // it to "the original `id`" turns it from a guessable optional into
-        // a step in the recipe. The "Do not respond ... outside the swarm"
-        // line stops the agent from acknowledging the wake in its own PTY
-        // output (which would otherwise leak the system prompt to the human
-        // user).
-        return format!(
-            "You were woken up: {count} new wake event(s) just arrived. \
-             A blackboard key you depend_on was likely written. Steps:\n\
-             1. Call swarm_list_blackboard to see what's new, then \
-             swarm_read_blackboard on any key you depend on.\n\
-             2. If you also have pending non-wake messages, call \
-             swarm_list_messages.\n\
-             3. Continue with your role's workflow. If you decide to reply \
-             to any message, use swarm_send_message with `kind: \"reply\"` \
-             AND `in_reply_to: <that message's id>`.\n\
-             Do not produce any user-facing output about these wakes \
-             outside the swarm tool calls."
-        );
-    }
-
-    let mut digests = String::new();
-    let listed = resp.wakes.len().min(REASON_MAX_DIGESTS);
-    for w in resp.wakes.iter().take(listed) {
-        digests.push_str(&digest_line(w));
-    }
-    if count as usize > listed {
-        digests.push_str(&format!(
-            "- …plus {} more wake(s) not digested here; call swarm_list_messages \
-             and swarm_list_blackboard if you need them.\n",
-            count as usize - listed
-        ));
-    }
-    format!(
-        "You were woken up: {count} new wake event(s) just arrived. Their \
-         payloads are inlined below — react to them directly, do NOT \
-         re-list first:\n{digests}\
-         Steps:\n\
-         1. Call swarm_read_blackboard on a key ONLY where its digest says \
-         truncated (or you need the full text). Call swarm_list_messages \
-         only for pending non-wake messages; swarm_list_blackboard only \
-         for keys not digested above.\n\
-         2. Continue with your role's workflow. If you decide to reply \
-         to any message, use swarm_send_message with `kind: \"reply\"` \
-         AND `in_reply_to: <that message's id>` (same threading contract \
-         as before).\n\
-         Do not produce any user-facing output about these wakes \
-         outside the swarm tool calls."
-    )
-}
-
-/// One `- …` digest line for an inlined wake.
-fn digest_line(w: &ConsumeWakeItem) -> String {
-    match (&w.key, &w.content) {
-        (Some(key), Some(content)) => {
-            let preview = preview_prefix(content, REASON_CONTENT_PREVIEW);
-            if w.truncated || preview.len() < content.len() {
-                format!(
-                    "- {} wrote `{key}`: {preview}… (truncated — call \
-                     swarm_read_blackboard(\"{key}\") for the full text)\n",
-                    w.from_agent
-                )
-            } else {
-                format!("- {} wrote `{key}`: {preview}\n", w.from_agent)
-            }
-        }
-        // No inline content (manual wake, vanished key, or the response's
-        // total budget was spent): the mailbox note body still says WHAT
-        // happened, and step 1 tells the LLM where to look for more.
-        _ => format!("- {}: {}\n", w.from_agent, w.body),
-    }
-}
-
-/// `&s[..cap]` that never splits inside a UTF-8 char — the prompt is read by
-/// an LLM and a mid-char splice would surface as mojibake.
-fn preview_prefix(s: &str, cap: usize) -> &str {
-    if s.len() <= cap {
-        return s;
-    }
-    let mut end = cap;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 // ── stdout helpers ───────────────────────────────────────────────────────
@@ -413,15 +296,12 @@ async fn read_stdin_bounded() -> Vec<u8> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(2048);
     let mut stdin = tokio::io::stdin();
-    let _ = tokio::time::timeout(
-        STDIN_TIMEOUT,
-        async {
-            // take(...) caps how many bytes we read so a misbehaving CLI
-            // can't OOM us by streaming gigabytes.
-            let mut limited = (&mut stdin).take(STDIN_MAX_BYTES as u64);
-            limited.read_to_end(&mut buf).await
-        },
-    )
+    let _ = tokio::time::timeout(STDIN_TIMEOUT, async {
+        // take(...) caps how many bytes we read so a misbehaving CLI
+        // can't OOM us by streaming gigabytes.
+        let mut limited = (&mut stdin).take(STDIN_MAX_BYTES as u64);
+        limited.read_to_end(&mut buf).await
+    })
     .await;
     buf
 }
@@ -460,8 +340,8 @@ fn agent_id_from_stdin_cwd(stdin: Option<&Value>) -> Option<String> {
 
 /// M6f: atomically claim + mark-read all pending wake messages for this
 /// agent. Replaces the previous `GET unread_count` path. Returns the full
-/// typed response: `count`/`ids` plus (B1) the inline `wakes` payloads that
-/// `build_wake_reason` digests. Whatever this returns as consumed MUST be
+/// typed response: `count`/`ids` plus (B1) the inline `wakes` payloads and
+/// `reason` continuation. Whatever this returns as consumed MUST be
 /// delivered to the LLM via emit_block (otherwise it would be lost, since
 /// it's already marked read).
 async fn consume_wakes(server: &str, agent_id: &str) -> Result<ConsumeWakesResponse, String> {
@@ -514,16 +394,12 @@ fn read_throttle(path: &Path) -> Option<ThrottleState> {
 
 fn write_throttle(path: &Path, state: &ThrottleState) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(state)
-        .map_err(|e| format!("serialize throttle state: {e}"))?;
-    std::fs::write(&tmp, &bytes)
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    let bytes = serde_json::to_vec(state).map_err(|e| format!("serialize throttle state: {e}"))?;
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -553,20 +429,18 @@ mod tests {
         let counter_inner = counter.clone();
         let app = Router::new().route(
             "/api/message/consume_wakes",
-            axum::routing::post(
-                move |Query(q): Query<HashMap<String, String>>| {
-                    let counter = counter_inner.clone();
-                    async move {
-                        let to = q.get("to").cloned().unwrap_or_default();
-                        let count = counter.load(Ordering::SeqCst);
-                        // ids array would be filled in real impl; tests only
-                        // check the count field so a single sentinel per
-                        // count keeps the stub honest about array length.
-                        let ids: Vec<i64> = (1..=count.max(0)).collect();
-                        Json(json!({ "to": to, "count": count, "ids": ids }))
-                    }
-                },
-            ),
+            axum::routing::post(move |Query(q): Query<HashMap<String, String>>| {
+                let counter = counter_inner.clone();
+                async move {
+                    let to = q.get("to").cloned().unwrap_or_default();
+                    let count = counter.load(Ordering::SeqCst);
+                    // ids array would be filled in real impl; tests only
+                    // check the count field so a single sentinel per
+                    // count keeps the stub honest about array length.
+                    let ids: Vec<i64> = (1..=count.max(0)).collect();
+                    Json(json!({ "to": to, "count": count, "ids": ids }))
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -683,7 +557,10 @@ mod tests {
     fn throttle_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.json");
-        let s = ThrottleState { last_at_ms: 12345, count: 2 };
+        let s = ThrottleState {
+            last_at_ms: 12345,
+            count: 2,
+        };
         write_throttle(&path, &s).unwrap();
         let back = read_throttle(&path).unwrap();
         assert_eq!(back.last_at_ms, 12345);
@@ -710,7 +587,14 @@ mod tests {
         let state_dir = dir.path().to_path_buf();
         // Pre-seed throttle to verify it's cleared.
         let path = throttle_path("test-agent", Some(&state_dir));
-        write_throttle(&path, &ThrottleState { last_at_ms: 1, count: 2 }).unwrap();
+        write_throttle(
+            &path,
+            &ThrottleState {
+                last_at_ms: 1,
+                count: 2,
+            },
+        )
+        .unwrap();
         assert!(path.exists());
 
         let (addr, _) = start_stub(0).await;
@@ -718,7 +602,10 @@ mod tests {
         let code = run(args).await.unwrap();
 
         assert_eq!(code, 0, "claude-format noop exits 0");
-        assert!(!path.exists(), "throttle file should be unlinked when count=0");
+        assert!(
+            !path.exists(),
+            "throttle file should be unlinked when count=0"
+        );
     }
 
     #[tokio::test]
@@ -729,7 +616,10 @@ mod tests {
         let args = args_for(addr, "test-agent", &state_dir);
         let code = run(args).await.unwrap();
 
-        assert_eq!(code, 0, "claude-format block still exits 0 (JSON-on-stdout protocol)");
+        assert_eq!(
+            code, 0,
+            "claude-format block still exits 0 (JSON-on-stdout protocol)"
+        );
         let path = throttle_path("test-agent", Some(&state_dir));
         let state = read_throttle(&path).expect("throttle file should exist");
         assert_eq!(state.count, 1);
@@ -760,7 +650,10 @@ mod tests {
         run(args).await.unwrap();
 
         let state = read_throttle(&path).unwrap();
-        assert_eq!(state.count, 3, "throttle should not increment when window is full");
+        assert_eq!(
+            state.count, 3,
+            "throttle should not increment when window is full"
+        );
     }
 
     #[tokio::test]
@@ -901,7 +794,10 @@ mod tests {
             ..args_for(addr, "test-agent", &state_dir)
         };
         let code = run(args).await.unwrap();
-        assert_eq!(code, 2, "kimi wake = exit 2 (kimi's documented block signal)");
+        assert_eq!(
+            code, 2,
+            "kimi wake = exit 2 (kimi's documented block signal)"
+        );
         // The wake still rode the same throttle bookkeeping as claude's.
         let path = throttle_path("test-agent", Some(&state_dir));
         let state = read_throttle(&path).expect("throttle file should exist");
@@ -920,103 +816,6 @@ mod tests {
         };
         let code = run(args).await.unwrap();
         assert_eq!(code, 0, "kimi degrade path is also exit 0");
-    }
-
-    // ── 5. B1: inline wake payloads → digested reason ─────────────────────
-
-    fn wake_item(key: Option<&str>, content: Option<&str>, truncated: bool) -> ConsumeWakeItem {
-        ConsumeWakeItem {
-            id: 1,
-            from_agent: "system".into(),
-            sent_at: 1,
-            body: match key {
-                Some(k) => format!("共享区 `{k}` 有更新，请查看"),
-                None => "操作员唤醒——请先查收邮箱里的新消息".into(),
-            },
-            key: key.map(str::to_string),
-            content: content.map(str::to_string),
-            truncated,
-        }
-    }
-
-    fn resp_with(wakes: Vec<ConsumeWakeItem>) -> ConsumeWakesResponse {
-        ConsumeWakesResponse {
-            to: "cap".into(),
-            count: wakes.len() as i64,
-            ids: wakes.iter().map(|w| w.id).collect(),
-            wakes,
-        }
-    }
-
-    #[test]
-    fn reason_digests_inline_payloads_without_list_recipe() {
-        let resp = resp_with(vec![
-            wake_item(Some("design.md"), Some("# Design\nhello"), false),
-            wake_item(None, None, false),
-        ]);
-        let reason = build_wake_reason(&resp);
-        // The content is RIGHT THERE — no list-first detour.
-        assert!(reason.contains("system wrote `design.md`: # Design\nhello"), "{reason}");
-        assert!(reason.contains("操作员唤醒"), "{reason}");
-        assert!(
-            !reason.contains("A blackboard key you depend_on was likely written"),
-            "inline path must not fall back to the old go-list recipe: {reason}"
-        );
-        // The reply-threading contract survives the rewrite.
-        assert!(reason.contains("in_reply_to"), "{reason}");
-    }
-
-    #[test]
-    fn reason_points_truncated_content_at_read_blackboard() {
-        let resp = resp_with(vec![wake_item(Some("big.md"), Some("aaaa"), true)]);
-        let reason = build_wake_reason(&resp);
-        assert!(
-            reason.contains("swarm_read_blackboard(\"big.md\") for the full text"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn reason_caps_preview_and_marks_oversize_content() {
-        // Server inlined the full 64KB (not truncated server-side), but the
-        // reason itself must stay small: preview cap + explicit pointer.
-        let big = "x".repeat(REASON_CONTENT_PREVIEW * 3);
-        let resp = resp_with(vec![wake_item(Some("big.md"), Some(&big), false)]);
-        let reason = build_wake_reason(&resp);
-        assert!(
-            reason.contains("swarm_read_blackboard(\"big.md\")"),
-            "oversize preview must degrade to a read pointer: {reason}"
-        );
-        assert!(
-            !reason.contains(&"x".repeat(REASON_CONTENT_PREVIEW + 1)),
-            "preview must be capped at REASON_CONTENT_PREVIEW bytes"
-        );
-    }
-
-    #[test]
-    fn reason_falls_back_to_list_recipe_without_payloads() {
-        // Count-only response (old server / fail-soft enrichment): the pre-B1
-        // wording is preserved verbatim so the wake still services the LLM.
-        let resp = resp_with(Vec::new());
-        let reason = build_wake_reason(&ConsumeWakesResponse { count: 2, ids: vec![1, 2], ..resp });
-        assert!(reason.contains("A blackboard key you depend_on was likely written"), "{reason}");
-        assert!(reason.contains("swarm_list_blackboard"), "{reason}");
-    }
-
-    #[test]
-    fn reason_notes_undigested_remainder() {
-        let wakes: Vec<_> = (0..15)
-            .map(|i| ConsumeWakeItem { id: i, ..wake_item(None, None, false) })
-            .collect();
-        let reason = build_wake_reason(&resp_with(wakes));
-        assert!(reason.contains("5 more wake(s) not digested here"), "{reason}");
-    }
-
-    #[test]
-    fn preview_prefix_never_splits_a_char() {
-        // '界' = 3 bytes; a cap at 4 must back off to the boundary at 3.
-        assert_eq!(preview_prefix("界界界", 4), "界");
-        assert_eq!(preview_prefix("short", 64), "short");
     }
 
     #[tokio::test]
@@ -1047,7 +846,10 @@ mod tests {
             ..args_for(addr, "test-agent", &state_dir)
         };
         let code = run(args).await.unwrap();
-        assert_eq!(code, 2, "kimi wake = exit 2 with the digested reason on stderr");
+        assert_eq!(
+            code, 2,
+            "kimi wake = exit 2 with the digested reason on stderr"
+        );
         let path = throttle_path("test-agent", Some(&state_dir));
         assert!(path.exists());
     }

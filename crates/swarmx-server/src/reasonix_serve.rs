@@ -28,6 +28,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use swarmx_protocol::rest::ConsumeWakesResponse;
 
 use crate::registry::Registry;
 
@@ -80,7 +81,10 @@ async fn set_yolo(c: &reqwest::Client, port: u16) -> Result<()> {
         .await
         .context("reasonix /tool-approval-mode send")?;
     if !resp.status().is_success() {
-        return Err(anyhow!("reasonix /tool-approval-mode HTTP {}", resp.status()));
+        return Err(anyhow!(
+            "reasonix /tool-approval-mode HTTP {}",
+            resp.status()
+        ));
     }
     Ok(())
 }
@@ -219,10 +223,9 @@ async fn wait_serve_ready(port: u16, overall: Duration) -> bool {
 }
 
 /// Atomically claim pending wakes for this agent and, if any, submit a fresh
-/// turn. `submit_text = None` submits the generic `wake_reason` recipe (the auto
-/// / turn_done path); `Some(text)` submits `text` verbatim (the manual/operator
-/// path, so the agent gets the operator's mailbox-first "read your new message
-/// and reply to the user" directive instead of a blackboard-framed recipe).
+/// turn. `submit_text = None` submits [`ConsumeWakesResponse::continuation`]
+/// (the auto / turn_done path); `Some(text)` submits `text` verbatim (the
+/// manual/operator path).
 /// Returns true iff a turn was submitted. The atomic `consume_wakes` guarantees
 /// only one caller ever sees count > 0.
 pub async fn consume_and_submit(
@@ -232,13 +235,13 @@ pub async fn consume_and_submit(
     submit_text: Option<&str>,
 ) -> Result<bool> {
     let c = control_client()?;
-    let count = consume_wakes(&c, swarmx_url, agent_id).await?;
-    if count <= 0 {
+    let resp = consume_wakes(&c, swarmx_url, agent_id).await?;
+    if resp.count <= 0 {
         return Ok(false);
     }
     let text = submit_text
         .map(str::to_string)
-        .unwrap_or_else(|| wake_reason(count));
+        .unwrap_or_else(|| resp.continuation());
     submit(&c, serve_port, &text).await?;
     Ok(true)
 }
@@ -276,9 +279,16 @@ pub async fn wake_if_idle(
     }
 }
 
-/// POST `/api/message/consume_wakes?to=<id>` on swarmx-server → count claimed.
-async fn consume_wakes(c: &reqwest::Client, swarmx_url: &str, agent_id: &str) -> Result<i64> {
-    let url = format!("{}/api/message/consume_wakes", swarmx_url.trim_end_matches('/'));
+/// POST `/api/message/consume_wakes?to=<id>` on swarmx-server → claimed set.
+async fn consume_wakes(
+    c: &reqwest::Client,
+    swarmx_url: &str,
+    agent_id: &str,
+) -> Result<ConsumeWakesResponse> {
+    let url = format!(
+        "{}/api/message/consume_wakes",
+        swarmx_url.trim_end_matches('/')
+    );
     let resp = c
         .post(&url)
         .query(&[("to", agent_id)])
@@ -288,30 +298,7 @@ async fn consume_wakes(c: &reqwest::Client, swarmx_url: &str, agent_id: &str) ->
     if !resp.status().is_success() {
         return Err(anyhow!("consume_wakes HTTP {}", resp.status()));
     }
-    let body: Value = resp.json().await.context("consume_wakes json")?;
-    body.get("count")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow!("consume_wakes: missing count"))
-}
-
-/// The continuation prompt fed back on a wake. Mirrors
-/// `swarmx-mcp::wake_check::emit_block` and `cli-plugins/opencode/
-/// swarmx-wake.js::wakeReason` so a woken reasonix agent follows the exact
-/// same recovery recipe as claude/codex/opencode. Keep these three in sync.
-pub(crate) fn wake_reason(count: i64) -> String {
-    format!(
-        "You were woken up: {count} new wake event(s) just arrived. \
-         A blackboard key you depend_on was likely written. Steps:\n\
-         1. Call swarm_list_blackboard to see what's new, then \
-         swarm_read_blackboard on any key you depend on.\n\
-         2. If you also have pending non-wake messages, call \
-         swarm_list_messages.\n\
-         3. Continue with your role's workflow. If you decide to reply \
-         to any message, use swarm_send_message with `kind: \"reply\"` \
-         AND `in_reply_to: <that message's id>`.\n\
-         Do not produce any user-facing output about these wakes \
-         outside the swarm tool calls."
-    )
+    resp.json().await.context("consume_wakes json")
 }
 
 /// Config handed to the per-agent driver task.
@@ -431,12 +418,7 @@ async fn stream_events(
                 Err(_) => continue,
             };
             handle_event(
-                &event,
-                serve_port,
-                agent_id,
-                swarmx_url,
-                &mut seq,
-                &mut calls,
+                &event, serve_port, agent_id, swarmx_url, &mut seq, &mut calls,
             )
             .await;
         }
@@ -464,9 +446,13 @@ async fn handle_event(
         "turn_done" => {
             // Turn-end: deliver any wakes that landed during the turn.
             match consume_and_submit(serve_port, swarmx_url, agent_id, None).await {
-                Ok(true) => tracing::info!(agent = %agent_id, "reasonix: woke agent on turn_done (pending wakes)"),
+                Ok(true) => {
+                    tracing::info!(agent = %agent_id, "reasonix: woke agent on turn_done (pending wakes)")
+                }
                 Ok(false) => {}
-                Err(err) => tracing::debug!(agent = %agent_id, ?err, "reasonix: turn_done consume/submit failed"),
+                Err(err) => {
+                    tracing::debug!(agent = %agent_id, ?err, "reasonix: turn_done consume/submit failed")
+                }
             }
         }
         "tool_dispatch" => {
@@ -474,7 +460,11 @@ async fn handle_event(
                 Some(t) => t,
                 None => return,
             };
-            let id = tool.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = tool
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if id.is_empty() || calls.contains_key(&id) {
                 // Ignore the duplicate "partial" dispatch for the same call.
                 return;
@@ -500,8 +490,20 @@ async fn handle_event(
             let id = tool.get("id").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(call) = calls.remove(id) {
                 let dur = call.started.elapsed().as_millis() as u32;
-                let phase = if tool.get("error").is_some() { "error" } else { "ok" };
-                post_activity(swarmx_url, agent_id, phase, &call.label, call.seq, Some(dur)).await;
+                let phase = if tool.get("error").is_some() {
+                    "error"
+                } else {
+                    "ok"
+                };
+                post_activity(
+                    swarmx_url,
+                    agent_id,
+                    phase,
+                    &call.label,
+                    call.seq,
+                    Some(dur),
+                )
+                .await;
             }
         }
         "usage" => {
@@ -557,7 +559,15 @@ fn tool_label(tool: &Value) -> String {
     if let Some(args_str) = tool.get("args").and_then(|v| v.as_str()) {
         if let Ok(args) = serde_json::from_str::<Value>(args_str) {
             const SALIENT: &[&str] = &[
-                "key", "path", "file_path", "command", "cmd", "pattern", "query", "url", "to",
+                "key",
+                "path",
+                "file_path",
+                "command",
+                "cmd",
+                "pattern",
+                "query",
+                "url",
+                "to",
             ];
             for k in SALIENT {
                 if let Some(v) = args.get(*k).and_then(|v| v.as_str()) {
@@ -616,7 +626,12 @@ mod tests {
 
     #[test]
     fn wake_reason_mentions_blackboard_recipe() {
-        let r = wake_reason(2);
+        let r = ConsumeWakesResponse {
+            count: 2,
+            ids: vec![1, 2],
+            ..Default::default()
+        }
+        .continuation();
         assert!(r.contains("2 new wake"));
         assert!(r.contains("swarm_list_blackboard"));
     }

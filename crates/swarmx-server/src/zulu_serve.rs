@@ -21,8 +21,7 @@
 //! consumed (atomic) and, if any, the wake reason is run as the next turn. A
 //! wake that lands while the agent is IDLE is delivered by the WakeCoordinator
 //! via [`wake_if_idle`]; the atomic `consume_wakes` guarantees at most one path
-//! ever submits. Mirrors the reasonix contract (`consume_wakes`, `wake_reason`,
-//! activity forwarding, `verify_one_turn`).
+//! ever submits. Continuation text is `ConsumeWakesResponse::continuation`.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -30,6 +29,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use swarmx_protocol::rest::ConsumeWakesResponse;
 
 use crate::registry::Registry;
 
@@ -110,7 +110,9 @@ fn stream_client() -> Result<reqwest::Client> {
 /// `GET /health` → serve answering? Single-shot reachability probe: true only
 /// on a success response from the serve port (false = wedged / never bound).
 async fn serve_reachable(port: u16) -> bool {
-    let Ok(c) = control_client() else { return false };
+    let Ok(c) = control_client() else {
+        return false;
+    };
     matches!(
         c.get(format!("{}/health", base(port))).send().await,
         Ok(r) if r.status().is_success()
@@ -297,9 +299,9 @@ async fn drive(conv: &ZuluConv, agent_id: &str, registry: &Registry, first_promp
         }
         // Turn done. While still holding busy, drain any wakes that landed.
         match consume_wakes(&conv.swarmx_url, agent_id).await {
-            Ok(n) if n > 0 => {
-                tracing::info!(agent = %agent_id, wakes = n, "zulu: woke agent after turn (pending wakes)");
-                prompt = wake_reason(n);
+            Ok(resp) if resp.count > 0 => {
+                tracing::info!(agent = %agent_id, wakes = resp.count, "zulu: woke agent after turn (pending wakes)");
+                prompt = resp.continuation();
                 continue;
             }
             Ok(_) => {}
@@ -332,7 +334,9 @@ async fn run_turn(conv: &ZuluConv, agent_id: &str, prompt: &str, mode: &str) -> 
         buf.extend_from_slice(&chunk);
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
             let line = buf.drain(..=nl).collect::<Vec<u8>>();
-            let Some(payload) = sse_payload(&line) else { continue };
+            let Some(payload) = sse_payload(&line) else {
+                continue;
+            };
             let Ok(event) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
@@ -383,12 +387,13 @@ pub async fn wake_if_idle(
         ));
     }
     match consume_wakes(&conv.swarmx_url, agent_id).await {
-        Ok(n) if n > 0 => {
+        Ok(resp) if resp.count > 0 => {
             let c = conv.clone();
             let aid = agent_id.to_string();
             let reg = registry.clone();
+            let prompt = resp.continuation();
             // Drive holds busy for its whole life and releases at the end.
-            tokio::spawn(async move { drive(&c, &aid, &reg, wake_reason(n)).await });
+            tokio::spawn(async move { drive(&c, &aid, &reg, prompt).await });
             Ok(true)
         }
         Ok(_) => {
@@ -437,7 +442,9 @@ fn event_has_text(event: &Value) -> bool {
     element_children(event).is_some_and(|ch| {
         ch.iter().any(|c| {
             c.get("type").and_then(|t| t.as_str()) == Some("TEXT")
-                && c.get("content").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+                && c.get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
         })
     })
 }
@@ -471,12 +478,18 @@ async fn forward_tool_activity(
     seq: &mut u32,
     calls: &mut HashMap<String, ToolCall>,
 ) {
-    let Some(children) = element_children(event) else { return };
+    let Some(children) = element_children(event) else {
+        return;
+    };
     for child in children {
         if child.get("type").and_then(|t| t.as_str()) != Some("TOOL") {
             continue;
         }
-        let id = child.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let id = child
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if id.is_empty() {
             continue;
         }
@@ -488,12 +501,31 @@ async fn forward_tool_activity(
             let label = tool_label(&child);
             let s = *seq;
             *seq += 1;
-            calls.insert(id, ToolCall { seq: s, label: label.clone(), started: Instant::now() });
+            calls.insert(
+                id,
+                ToolCall {
+                    seq: s,
+                    label: label.clone(),
+                    started: Instant::now(),
+                },
+            );
             post_activity(swarmx_url, agent_id, "running", &label, s, None).await;
         } else if let Some(call) = calls.remove(&id) {
             let dur = call.started.elapsed().as_millis() as u32;
-            let phase = if child.get("error").is_some() { "error" } else { "ok" };
-            post_activity(swarmx_url, agent_id, phase, &call.label, call.seq, Some(dur)).await;
+            let phase = if child.get("error").is_some() {
+                "error"
+            } else {
+                "ok"
+            };
+            post_activity(
+                swarmx_url,
+                agent_id,
+                phase,
+                &call.label,
+                call.seq,
+                Some(dur),
+            )
+            .await;
         }
     }
 }
@@ -522,8 +554,17 @@ fn tool_label(tool: &Value) -> String {
         None => None,
     };
     if let Some(args) = args {
-        const SALIENT: &[&str] =
-            &["key", "path", "file_path", "command", "cmd", "pattern", "query", "url", "to"];
+        const SALIENT: &[&str] = &[
+            "key",
+            "path",
+            "file_path",
+            "command",
+            "cmd",
+            "pattern",
+            "query",
+            "url",
+            "to",
+        ];
         for k in SALIENT {
             if let Some(v) = args.get(*k).and_then(|v| v.as_str()) {
                 if !v.is_empty() {
@@ -542,10 +583,13 @@ fn tool_label(tool: &Value) -> String {
 
 // ─── swarmx-server control calls (shared with the reasonix contract) ───────
 
-/// POST `/api/message/consume_wakes?to=<id>` → count claimed (atomic).
-async fn consume_wakes(swarmx_url: &str, agent_id: &str) -> Result<i64> {
+/// POST `/api/message/consume_wakes?to=<id>` → claimed set (atomic).
+async fn consume_wakes(swarmx_url: &str, agent_id: &str) -> Result<ConsumeWakesResponse> {
     let c = control_client()?;
-    let url = format!("{}/api/message/consume_wakes", swarmx_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/api/message/consume_wakes",
+        swarmx_url.trim_end_matches('/')
+    );
     let resp = c
         .post(&url)
         .query(&[("to", agent_id)])
@@ -555,10 +599,7 @@ async fn consume_wakes(swarmx_url: &str, agent_id: &str) -> Result<i64> {
     if !resp.status().is_success() {
         return Err(anyhow!("consume_wakes HTTP {}", resp.status()));
     }
-    let body: Value = resp.json().await.context("consume_wakes json")?;
-    body.get("count")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow!("consume_wakes: missing count"))
+    resp.json().await.context("consume_wakes json")
 }
 
 /// Best-effort POST of one activity row. Never throws into the driver.
@@ -583,25 +624,6 @@ async fn post_activity(
     let _ = c.post(&url).json(&body).send().await;
 }
 
-/// The continuation prompt fed back on a wake. Kept in sync with
-/// `reasonix_serve::wake_reason` / the opencode wake plugin so a woken zulu
-/// agent follows the exact same recovery recipe.
-fn wake_reason(count: i64) -> String {
-    format!(
-        "You were woken up: {count} new wake event(s) just arrived. \
-         A blackboard key you depend_on was likely written. Steps:\n\
-         1. Call swarm_list_blackboard to see what's new, then \
-         swarm_read_blackboard on any key you depend on.\n\
-         2. If you also have pending non-wake messages, call \
-         swarm_list_messages.\n\
-         3. Continue with your role's workflow. If you decide to reply \
-         to any message, use swarm_send_message with `kind: \"reply\"` \
-         AND `in_reply_to: <that message's id>`.\n\
-         Do not produce any user-facing output about these wakes \
-         outside the swarm tool calls."
-    )
-}
-
 /// Minimal percent-encoding for an agent id in a URL path segment.
 fn urlencode(s: &str) -> String {
     s.chars()
@@ -623,7 +645,9 @@ mod tests {
         let done = json!({"conversationInfo": {"status": "Completed"}});
         assert!(!status_completed(&running));
         assert!(status_completed(&done));
-        assert!(status_completed(&json!({"conversationInfo":{"status":"Failed"}})));
+        assert!(status_completed(
+            &json!({"conversationInfo":{"status":"Failed"}})
+        ));
     }
 
     #[test]
@@ -663,14 +687,25 @@ mod tests {
 
     #[test]
     fn wake_reason_mentions_blackboard_recipe() {
-        let r = wake_reason(2);
+        let r = ConsumeWakesResponse {
+            count: 2,
+            ids: vec![1, 2],
+            ..Default::default()
+        }
+        .continuation();
         assert!(r.contains("2 new wake"));
         assert!(r.contains("swarm_list_blackboard"));
     }
 
     #[test]
     fn session_body_includes_conv_id_after_set() {
-        let conv = ZuluConv::new(8790, "M".into(), "L".into(), "/tmp".into(), "http://x".into());
+        let conv = ZuluConv::new(
+            8790,
+            "M".into(),
+            "L".into(),
+            "/tmp".into(),
+            "http://x".into(),
+        );
         let b0 = session_body(&conv, "hi", "Agent");
         assert!(b0.get("conversationId").is_none());
         assert_eq!(b0["display"], "event-stream");

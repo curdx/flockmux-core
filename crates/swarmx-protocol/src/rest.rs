@@ -424,7 +424,7 @@ pub struct MarkReadResponse {
 /// already claims the rows atomically, so the server snapshots their content
 /// here for (nearly) free and `wake-check` can digest it straight into the
 /// continuation prompt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConsumeWakeItem {
     /// Id of the consumed `kind="wake"` message.
     pub id: i64,
@@ -451,8 +451,10 @@ pub struct ConsumeWakeItem {
 
 /// `POST /api/message/consume_wakes` response. `wakes` is additive —
 /// `#[serde(default)]` keeps pre-B1 clients (which read only `count`)
-/// deserializing fine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// deserializing fine. `reason` is the single continuation prompt every
+/// engine kick / Stop hook / serve submit must use — callers do not
+/// author their own "You were woken up" strings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConsumeWakesResponse {
     pub to: String,
     pub count: i64,
@@ -463,6 +465,264 @@ pub struct ConsumeWakesResponse {
     /// always the full consumed set.
     #[serde(default)]
     pub wakes: Vec<ConsumeWakeItem>,
+    /// Server-filled continuation prompt ([`Self::continuation_prompt`]).
+    /// Empty on pre-reason clients; [`Self::continuation`] rebuilds then.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// How much of one wake's inlined content the continuation quotes verbatim
+/// (bytes, cut on a char boundary). The server inlines up to 64KB per
+/// entry; the continuation prompt shouldn't carry that.
+const REASON_CONTENT_PREVIEW: usize = 2000;
+/// Max digest lines in one continuation. A long-idle agent can consume
+/// dozens of wakes at once; the prompt gets the first few and a pointer
+/// for the rest.
+const REASON_MAX_DIGESTS: usize = 10;
+
+impl ConsumeWakesResponse {
+    /// Fill [`Self::reason`] from `count` + `wakes`. The HTTP handler and
+    /// in-process claim path call this so every adapter reads one string.
+    pub fn assemble(to: String, ids: Vec<i64>, wakes: Vec<ConsumeWakeItem>) -> Self {
+        let mut resp = Self {
+            to,
+            count: ids.len() as i64,
+            ids,
+            wakes,
+            reason: String::new(),
+        };
+        resp.reason = resp.continuation_prompt();
+        resp
+    }
+
+    /// Prefer the server-filled `reason`; rebuild from `wakes` if an old
+    /// server (or a stub) left it empty.
+    pub fn continuation(&self) -> String {
+        if self.reason.is_empty() {
+            self.continuation_prompt()
+        } else {
+            self.reason.clone()
+        }
+    }
+
+    /// Build the continuation prompt. One string feeds Stop-hook `block`,
+    /// PTY/opencode kicks, and reasonix/zulu `/submit`.
+    ///
+    /// Two shapes:
+    ///   - With inline payloads (B1): one digest line per wake.
+    ///   - Without payloads (old server / fail-soft enrichment): the
+    ///     pre-B1 "go list" recipe.
+    pub fn continuation_prompt(&self) -> String {
+        let count = self.count;
+        if self.wakes.is_empty() {
+            // Why this exact wording: codex 0.132's swarm_send_message tool
+            // calls observed in the wild often omit `in_reply_to`, which
+            // breaks the threading view in the UI. Naming the field
+            // explicitly + tying it to "the original `id`" turns it from a
+            // guessable optional into a step in the recipe. The "Do not
+            // respond ... outside the swarm" line stops the agent from
+            // acknowledging the wake in its own PTY output.
+            return format!(
+                "You were woken up: {count} new wake event(s) just arrived. \
+                 A blackboard key you depend_on was likely written. Steps:\n\
+                 1. Call swarm_list_blackboard to see what's new, then \
+                 swarm_read_blackboard on any key you depend on.\n\
+                 2. If you also have pending non-wake messages, call \
+                 swarm_list_messages.\n\
+                 3. Continue with your role's workflow. If you decide to reply \
+                 to any message, use swarm_send_message with `kind: \"reply\"` \
+                 AND `in_reply_to: <that message's id>`.\n\
+                 Do not produce any user-facing output about these wakes \
+                 outside the swarm tool calls."
+            );
+        }
+
+        let mut digests = String::new();
+        let listed = self.wakes.len().min(REASON_MAX_DIGESTS);
+        for w in self.wakes.iter().take(listed) {
+            digests.push_str(&digest_line(w));
+        }
+        if count as usize > listed {
+            digests.push_str(&format!(
+                "- …plus {} more wake(s) not digested here; call swarm_list_messages \
+                 and swarm_list_blackboard if you need them.\n",
+                count as usize - listed
+            ));
+        }
+        format!(
+            "You were woken up: {count} new wake event(s) just arrived. Their \
+             payloads are inlined below — react to them directly, do NOT \
+             re-list first:\n{digests}\
+             Steps:\n\
+             1. Call swarm_read_blackboard on a key ONLY where its digest says \
+             truncated (or you need the full text). Call swarm_list_messages \
+             only for pending non-wake messages; swarm_list_blackboard only \
+             for keys not digested above.\n\
+             2. Continue with your role's workflow. If you decide to reply \
+             to any message, use swarm_send_message with `kind: \"reply\"` \
+             AND `in_reply_to: <that message's id>` (same threading contract \
+             as before).\n\
+             Do not produce any user-facing output about these wakes \
+             outside the swarm tool calls."
+        )
+    }
+}
+
+/// One `- …` digest line for an inlined wake.
+fn digest_line(w: &ConsumeWakeItem) -> String {
+    match (&w.key, &w.content) {
+        (Some(key), Some(content)) => {
+            let preview = preview_prefix(content, REASON_CONTENT_PREVIEW);
+            if w.truncated || preview.len() < content.len() {
+                format!(
+                    "- {} wrote `{key}`: {preview}… (truncated — call \
+                     swarm_read_blackboard(\"{key}\") for the full text)\n",
+                    w.from_agent
+                )
+            } else {
+                format!("- {} wrote `{key}`: {preview}\n", w.from_agent)
+            }
+        }
+        _ => format!("- {}: {}\n", w.from_agent, w.body),
+    }
+}
+
+/// `&s[..cap]` that never splits inside a UTF-8 char — the prompt is read by
+/// an LLM and a mid-char splice would surface as mojibake.
+fn preview_prefix(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod wake_continuation_tests {
+    use super::*;
+
+    fn wake_item(key: Option<&str>, content: Option<&str>, truncated: bool) -> ConsumeWakeItem {
+        ConsumeWakeItem {
+            id: 1,
+            from_agent: "system".into(),
+            sent_at: 1,
+            body: match key {
+                Some(k) => format!("共享区 `{k}` 有更新，请查看"),
+                None => "操作员唤醒——请先查收邮箱里的新消息".into(),
+            },
+            key: key.map(str::to_string),
+            content: content.map(str::to_string),
+            truncated,
+        }
+    }
+
+    fn resp_with(wakes: Vec<ConsumeWakeItem>) -> ConsumeWakesResponse {
+        ConsumeWakesResponse::assemble("cap".into(), wakes.iter().map(|w| w.id).collect(), wakes)
+    }
+
+    #[test]
+    fn reason_digests_inline_payloads_without_list_recipe() {
+        let resp = resp_with(vec![
+            wake_item(Some("design.md"), Some("# Design\nhello"), false),
+            wake_item(None, None, false),
+        ]);
+        let reason = resp.continuation();
+        assert!(
+            reason.contains("system wrote `design.md`: # Design\nhello"),
+            "{reason}"
+        );
+        assert!(reason.contains("操作员唤醒"), "{reason}");
+        assert!(
+            !reason.contains("A blackboard key you depend_on was likely written"),
+            "inline path must not fall back to the old go-list recipe: {reason}"
+        );
+        assert!(reason.contains("in_reply_to"), "{reason}");
+    }
+
+    #[test]
+    fn reason_points_truncated_content_at_read_blackboard() {
+        let resp = resp_with(vec![wake_item(Some("big.md"), Some("aaaa"), true)]);
+        let reason = resp.continuation();
+        assert!(
+            reason.contains("swarm_read_blackboard(\"big.md\") for the full text"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn reason_caps_preview_and_marks_oversize_content() {
+        let big = "x".repeat(REASON_CONTENT_PREVIEW * 3);
+        let resp = ConsumeWakesResponse {
+            wakes: vec![wake_item(Some("big.md"), Some(&big), false)],
+            count: 1,
+            ids: vec![1],
+            ..Default::default()
+        };
+        let reason = resp.continuation_prompt();
+        assert!(
+            reason.contains("swarm_read_blackboard(\"big.md\")"),
+            "oversize preview must degrade to a read pointer: {reason}"
+        );
+        assert!(
+            !reason.contains(&"x".repeat(REASON_CONTENT_PREVIEW + 1)),
+            "preview must be capped at REASON_CONTENT_PREVIEW bytes"
+        );
+    }
+
+    #[test]
+    fn reason_falls_back_to_list_recipe_without_payloads() {
+        let resp = ConsumeWakesResponse {
+            count: 2,
+            ids: vec![1, 2],
+            ..Default::default()
+        };
+        let reason = resp.continuation_prompt();
+        assert!(
+            reason.contains("A blackboard key you depend_on was likely written"),
+            "{reason}"
+        );
+        assert!(reason.contains("swarm_list_blackboard"), "{reason}");
+    }
+
+    #[test]
+    fn reason_notes_undigested_remainder() {
+        let wakes: Vec<_> = (0..15)
+            .map(|i| ConsumeWakeItem {
+                id: i,
+                ..wake_item(None, None, false)
+            })
+            .collect();
+        let reason = ConsumeWakesResponse {
+            count: 15,
+            ids: (0..15).collect(),
+            wakes,
+            ..Default::default()
+        }
+        .continuation_prompt();
+        assert!(
+            reason.contains("5 more wake(s) not digested here"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn preview_prefix_never_splits_a_char() {
+        assert_eq!(preview_prefix("界界界", 4), "界");
+        assert_eq!(preview_prefix("short", 64), "short");
+    }
+
+    #[test]
+    fn continuation_prefers_server_filled_reason() {
+        let resp = ConsumeWakesResponse {
+            count: 1,
+            reason: "server-authored".into(),
+            ..Default::default()
+        };
+        assert_eq!(resp.continuation(), "server-authored");
+    }
 }
 
 /// One row from `GET /api/blackboard-history/*path`. `content` is omitted by

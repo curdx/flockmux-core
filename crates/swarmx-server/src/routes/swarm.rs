@@ -6,15 +6,15 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::Deserialize;
+use serde_json::json;
 use swarmx_protocol::rest::{
-    BlackboardEntry, BlackboardHistoryEntry, BlackboardSnapshot, ConsumeWakeItem,
-    ConsumeWakesResponse, MarkReadRequest, MarkReadResponse, MessageRecord, SendMessageRequest,
-    ThoughtTrace, ThoughtTraceStep, WriteBlackboardRequest,
+    BlackboardEntry, BlackboardHistoryEntry, BlackboardSnapshot, ConsumeWakesResponse,
+    MarkReadRequest, MarkReadResponse, MessageRecord, SendMessageRequest, ThoughtTrace,
+    ThoughtTraceStep, WriteBlackboardRequest,
 };
 use swarmx_storage::{ListMessagesOpts, ThoughtTraceRecord as StoreThoughtTraceRecord};
 use swarmx_swarm::{path_safe, NewMessage, SwarmEvent};
-use serde::Deserialize;
-use serde_json::json;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ListMessagesQuery {
@@ -91,7 +91,8 @@ pub async fn list_messages(
 /// independent legitimate messages, not a retry.
 const MSG_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
-type MsgDedup = std::sync::Mutex<std::collections::HashMap<u64, (MessageRecord, std::time::Instant)>>;
+type MsgDedup =
+    std::sync::Mutex<std::collections::HashMap<u64, (MessageRecord, std::time::Instant)>>;
 
 fn msg_dedup() -> &'static MsgDedup {
     static D: std::sync::OnceLock<MsgDedup> = std::sync::OnceLock::new();
@@ -180,7 +181,9 @@ pub async fn send_message(
             let registry = state.registry.clone();
             let server_url = state.server_url.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::wake::deliver_manual_wake(&swarm, &registry, &server_url, &to).await {
+                if let Err(e) =
+                    crate::wake::deliver_manual_wake(&swarm, &registry, &server_url, &to).await
+                {
                     tracing::debug!(?e, agent = %to, "auto-wake on send_message failed (best-effort)");
                 }
             });
@@ -320,137 +323,10 @@ pub async fn consume_wakes(
     Query(q): Query<UnreadCountQuery>,
 ) -> Result<Json<ConsumeWakesResponse>, (StatusCode, Json<serde_json::Value>)> {
     let at = now_ms();
-    let ids = state
-        .store
-        .consume_wakes(q.to.clone(), at)
+    let resp = crate::wake_claim::claim(&state.swarm, &q.to, at)
         .await
         .map_err(internal_err)?;
-    // Broadcast message_read so the UI badge updates promptly. Match
-    // the shape that mark_messages_read emits — same event kind, same
-    // ids field — so the FE doesn't need a new handler.
-    if !ids.is_empty() {
-        use swarmx_protocol::ws_swarm::SwarmEvent;
-        state.swarm.publish_event(SwarmEvent::MessageRead {
-            ids: ids.clone(),
-            to_agent: q.to.clone(),
-            at,
-        });
-    }
-    let wakes = inline_wake_payloads(&state.swarm, &q.to, &ids).await;
-    Ok(Json(ConsumeWakesResponse {
-        to: q.to,
-        count: ids.len() as i64,
-        ids,
-        wakes,
-    }))
-}
-
-/// Per-entry inline payload cap (bytes). 64KB keeps one pathological
-/// blackboard write from blowing up the Stop-hook continuation prompt; the
-/// `truncated` flag tells the LLM to `swarm_read_blackboard` for the rest.
-const WAKE_PAYLOAD_ENTRY_CAP: usize = 64 * 1024;
-/// Total inline-content budget per response (bytes). Wakes are claimed in a
-/// batch after a long idle stretch, so cap the aggregate to keep the response
-/// — and the prompt built from it — sane. Fail-soft: entries past the budget
-/// carry `content: None`, never an error.
-const WAKE_PAYLOAD_TOTAL_CAP: usize = 256 * 1024;
-/// Max consumed wakes inlined per response. `ids`/`count` always reflect the
-/// full consumed set; only this inline array is bounded.
-const WAKE_PAYLOAD_MAX_ITEMS: usize = 50;
-
-/// Build the `wakes` inline array for `consume_wakes`. Pure enrichment over
-/// rows that are ALREADY marked read: any failure (page miss, vanished key,
-/// store error) just yields fewer/no items — the count-only contract still
-/// holds, so nothing here may propagate an error.
-async fn inline_wake_payloads(
-    swarm: &swarmx_swarm::Swarm,
-    to: &str,
-    ids: &[i64],
-) -> Vec<ConsumeWakeItem> {
-    if ids.is_empty() {
-        return Vec::new();
-    }
-    // Fetch the just-consumed rows back. `consume_wakes` already marked them
-    // read, but `list_messages` has no read filter, so one recent-page pull
-    // re-finds them. A consumed id that somehow fell out of the page
-    // (pathological backlog) simply gets no inline payload — fail-soft.
-    let records = match swarm
-        .store()
-        .list_messages(ListMessagesOpts {
-            to_agent: Some(to.to_string()),
-            from_agent: None,
-            thread_id: None,
-            only_undelivered: false,
-            limit: 200,
-        })
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!(?e, to, "consume_wakes payload enrichment failed; count-only response");
-            return Vec::new();
-        }
-    };
-    let mut by_id: std::collections::HashMap<i64, _> = records
-        .into_iter()
-        .filter(|r| r.kind == "wake")
-        .map(|r| (r.id, r))
-        .collect();
-    // Oldest-first, so the LLM reads the digests in arrival order.
-    let mut ordered: Vec<i64> = ids.to_vec();
-    ordered.sort_unstable();
-    let mut items = Vec::new();
-    let mut budget = WAKE_PAYLOAD_TOTAL_CAP;
-    for id in ordered.into_iter().take(WAKE_PAYLOAD_MAX_ITEMS) {
-        let Some(rec) = by_id.remove(&id) else {
-            continue;
-        };
-        let key = rec
-            .meta
-            .as_ref()
-            .and_then(|m| m.get("key"))
-            .and_then(|k| k.as_str())
-            .map(str::to_string);
-        let (body, mut truncated) = truncate_utf8(rec.body, WAKE_PAYLOAD_ENTRY_CAP);
-        let mut content = None;
-        if let Some(k) = &key {
-            if budget > 0 {
-                // Missing/unreadable key (deleted after the wake fired) is a
-                // None, not an error — the LLM still has the note body.
-                if let Ok(Some(c)) = swarm.read_blackboard(k).await {
-                    let (c, cut) = truncate_utf8(c, WAKE_PAYLOAD_ENTRY_CAP.min(budget));
-                    budget = budget.saturating_sub(c.len());
-                    truncated = truncated || cut;
-                    content = Some(c);
-                }
-            }
-        }
-        items.push(ConsumeWakeItem {
-            id,
-            from_agent: rec.from_agent,
-            sent_at: rec.sent_at,
-            body,
-            key,
-            content,
-            truncated,
-        });
-    }
-    items
-}
-
-/// Cut `s` to at most `cap` bytes on a char boundary. Returns `(cut, true)`
-/// when anything was dropped. The continuation prompt this feeds is read by
-/// an LLM, so a mid-char splice would be silently mojibake — never split
-/// inside a UTF-8 sequence.
-fn truncate_utf8(s: String, cap: usize) -> (String, bool) {
-    if s.len() <= cap {
-        return (s, false);
-    }
-    let mut end = cap;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (s[..end].to_string(), true)
+    Ok(Json(resp))
 }
 
 /// Effective row cap for the search branch of `list_messages`:
@@ -717,155 +593,26 @@ mod tests {
         // Any change → different key: a genuinely different message is NOT deduped.
         let base = msg_fingerprint("worker-1", &a);
         assert_ne!(base, msg_fingerprint("worker-2", &a), "sender");
-        assert_ne!(base, msg_fingerprint("worker-1", &req("orch2", "reply", "done", Some(3))), "to");
-        assert_ne!(base, msg_fingerprint("worker-1", &req("orch", "chat", "done", Some(3))), "kind");
-        assert_ne!(base, msg_fingerprint("worker-1", &req("orch", "reply", "done2", Some(3))), "body");
-        assert_ne!(base, msg_fingerprint("worker-1", &req("orch", "reply", "done", None)), "in_reply_to");
-    }
-
-    // ── B1: consume_wakes inline payload ─────────────────────────────────
-
-    async fn fresh_swarm() -> (tempfile::TempDir, std::sync::Arc<swarmx_swarm::Swarm>) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("swarmx.db");
-        let bb_root = dir.path().join("blackboard");
-        std::fs::create_dir_all(&bb_root).unwrap();
-        let store = std::sync::Arc::new(swarmx_storage::Store::open(&db_path).await.unwrap());
-        (dir, swarmx_swarm::Swarm::new(store, bb_root))
-    }
-
-    /// Mirror of wake.rs::write_wake_mailbox's note shape (body + meta.key).
-    async fn send_wake(swarm: &swarmx_swarm::Swarm, to: &str, key: Option<&str>) -> i64 {
-        let meta = key
-            .map(|k| serde_json::json!({"subtype": "wake", "reason": "blackboard", "key": k}));
-        let rec = swarm
-            .send_message(NewMessage {
-                from_agent: "system".into(),
-                to_agent: to.into(),
-                kind: "wake".into(),
-                body: match key {
-                    Some(k) => format!("共享区 `{k}` 有更新，请查看"),
-                    None => "操作员唤醒——请先查收邮箱里的新消息".into(),
-                },
-                sent_at: 1,
-                in_reply_to: None,
-                meta,
-            })
-            .await
-            .unwrap();
-        rec.id
-    }
-
-    #[tokio::test]
-    async fn inline_payload_carries_blackboard_snapshot() {
-        let (_dir, swarm) = fresh_swarm().await;
-        swarm
-            .write_blackboard(Some("worker-1".into()), "design.md", "# Design\nhello")
-            .await
-            .unwrap();
-        let id = send_wake(&swarm, "cap", Some("design.md")).await;
-        let ids = swarm.store().consume_wakes("cap".into(), 2).await.unwrap();
-        assert_eq!(ids, vec![id]);
-
-        let items = inline_wake_payloads(&swarm, "cap", &ids).await;
-        assert_eq!(items.len(), 1);
-        let it = &items[0];
-        assert_eq!(it.id, id);
-        assert_eq!(it.from_agent, "system");
-        assert_eq!(it.key.as_deref(), Some("design.md"));
-        assert_eq!(it.content.as_deref(), Some("# Design\nhello"));
-        assert!(it.body.contains("design.md"));
-        assert!(!it.truncated);
-    }
-
-    #[tokio::test]
-    async fn inline_payload_truncates_oversized_entry() {
-        let (_dir, swarm) = fresh_swarm().await;
-        let big = "a".repeat(70 * 1024);
-        swarm
-            .write_blackboard(Some("w".into()), "big.md", &big)
-            .await
-            .unwrap();
-        send_wake(&swarm, "cap", Some("big.md")).await;
-        let ids = swarm.store().consume_wakes("cap".into(), 2).await.unwrap();
-
-        let items = inline_wake_payloads(&swarm, "cap", &ids).await;
-        assert_eq!(items.len(), 1);
-        let content = items[0].content.as_deref().unwrap();
-        assert_eq!(content.len(), WAKE_PAYLOAD_ENTRY_CAP);
-        assert!(items[0].truncated, "oversized entry must carry the truncated flag");
-    }
-
-    #[tokio::test]
-    async fn inline_payload_total_budget_is_fail_soft() {
-        let (_dir, swarm) = fresh_swarm().await;
-        // 7 × 40KB = 280KB > 256KB budget: the first 6 fit whole, the 7th is
-        // cut to the remaining 16KB — and nothing errors out.
-        let chunk = "x".repeat(40 * 1024);
-        for i in 0..7 {
-            let key = format!("k{i}.md");
-            swarm
-                .write_blackboard(Some("w".into()), &key, &chunk)
-                .await
-                .unwrap();
-            send_wake(&swarm, "cap", Some(&key)).await;
-        }
-        let ids = swarm.store().consume_wakes("cap".into(), 2).await.unwrap();
-        assert_eq!(ids.len(), 7);
-
-        let items = inline_wake_payloads(&swarm, "cap", &ids).await;
-        assert_eq!(items.len(), 7);
-        for it in &items[..6] {
-            assert_eq!(it.content.as_deref().unwrap().len(), 40 * 1024);
-            assert!(!it.truncated);
-        }
-        let last = &items[6];
-        assert_eq!(
-            last.content.as_deref().unwrap().len(),
-            WAKE_PAYLOAD_TOTAL_CAP - 6 * 40 * 1024
+        assert_ne!(
+            base,
+            msg_fingerprint("worker-1", &req("orch2", "reply", "done", Some(3))),
+            "to"
         );
-        assert!(last.truncated);
-    }
-
-    #[tokio::test]
-    async fn inline_payload_missing_key_degrades_to_none() {
-        let (_dir, swarm) = fresh_swarm().await;
-        // Wake points at a key that was never written (or deleted since).
-        send_wake(&swarm, "cap", Some("gone.md")).await;
-        let ids = swarm.store().consume_wakes("cap".into(), 2).await.unwrap();
-
-        let items = inline_wake_payloads(&swarm, "cap", &ids).await;
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].key.as_deref(), Some("gone.md"));
-        assert_eq!(items[0].content, None, "missing key is fail-soft, not an error");
-        assert!(!items[0].truncated);
-        assert!(items[0].body.contains("gone.md"));
-    }
-
-    #[tokio::test]
-    async fn inline_payload_caps_item_count() {
-        let (_dir, swarm) = fresh_swarm().await;
-        for _ in 0..(WAKE_PAYLOAD_MAX_ITEMS + 5) {
-            send_wake(&swarm, "cap", None).await;
-        }
-        let ids = swarm.store().consume_wakes("cap".into(), 2).await.unwrap();
-        assert_eq!(ids.len(), WAKE_PAYLOAD_MAX_ITEMS + 5, "ids stay the full consumed set");
-
-        let items = inline_wake_payloads(&swarm, "cap", &ids).await;
-        assert_eq!(items.len(), WAKE_PAYLOAD_MAX_ITEMS);
-        // Oldest-first ordering.
-        assert!(items.windows(2).all(|w| w[0].id < w[1].id));
-    }
-
-    #[test]
-    fn truncate_utf8_never_splits_a_char() {
-        // '界' is 3 bytes; a cap landing mid-char must back off to the boundary.
-        let (cut, truncated) = truncate_utf8("界".repeat(1000), 1001);
-        assert!(truncated);
-        assert_eq!(cut.len(), 999);
-        let (full, truncated) = truncate_utf8("short".into(), 64);
-        assert!(!truncated);
-        assert_eq!(full, "short");
+        assert_ne!(
+            base,
+            msg_fingerprint("worker-1", &req("orch", "chat", "done", Some(3))),
+            "kind"
+        );
+        assert_ne!(
+            base,
+            msg_fingerprint("worker-1", &req("orch", "reply", "done2", Some(3))),
+            "body"
+        );
+        assert_ne!(
+            base,
+            msg_fingerprint("worker-1", &req("orch", "reply", "done", None)),
+            "in_reply_to"
+        );
     }
 
     #[test]

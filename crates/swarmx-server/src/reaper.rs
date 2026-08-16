@@ -582,6 +582,7 @@ mod tests {
             tui_http_port: None,
             serve_http_port: None,
             zulu: None,
+            live_delivery: crate::input_delivery::LiveDelivery::Keystroke,
         }
     }
 

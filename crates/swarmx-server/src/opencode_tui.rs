@@ -11,8 +11,9 @@
 //! keystrokes: deterministic and size-independent.
 //!
 //! Used for BOTH the first-turn bootstrap and every wake "kick" for opencode
-//! agents (claude/codex keep their keystroke path). A slot exposes its port via
-//! `AgentSlot::tui_http_port()`; `Some(port)` is the signal to deliver here.
+//! agents (claude/codex keep their keystroke path). The live channel is
+//! `AgentSlot::live_delivery`; this module's HTTP helpers are only called
+//! when that channel is Opencode (the `--port` is a handle, not the discriminant).
 //!
 //! TIMING (the load-bearing subtlety): opencode's TUI takes several seconds to
 //! cold-start, and a `/tui/submit-prompt` sent before it's fully ready returns
@@ -102,7 +103,11 @@ async fn newest_started_turn(c: &reqwest::Client, base: &str, workspace_dir: &st
                 .and_then(|i| i.as_i64())
                 .is_some_and(|i| i > 0)
         })
-        .filter_map(|s| s.get("time").and_then(|t| t.get("created")).and_then(|c| c.as_i64()))
+        .filter_map(|s| {
+            s.get("time")
+                .and_then(|t| t.get("created"))
+                .and_then(|c| c.as_i64())
+        })
         .max()
 }
 

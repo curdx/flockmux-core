@@ -1087,6 +1087,52 @@ async fn consume_wakes_atomically_returns_wake_ids_and_marks_read() {
 }
 
 #[tokio::test]
+async fn unread_wake_ids_lists_pending_oldest_first_without_marking_read() {
+    let (_dir, store) = fresh_store().await;
+    let first = store
+        .insert_message(NewMessage {
+            from_agent: "system".into(),
+            to_agent: "cap".into(),
+            kind: "wake".into(),
+            body: "a".into(),
+            sent_at: ts(1),
+            in_reply_to: None,
+            meta: None,
+        })
+        .await
+        .unwrap();
+    let _note = store
+        .insert_message(NewMessage {
+            from_agent: "w".into(),
+            to_agent: "cap".into(),
+            kind: "note".into(),
+            body: "skip".into(),
+            sent_at: ts(2),
+            in_reply_to: None,
+            meta: None,
+        })
+        .await
+        .unwrap();
+    let second = store
+        .insert_message(NewMessage {
+            from_agent: "system".into(),
+            to_agent: "cap".into(),
+            kind: "wake".into(),
+            body: "b".into(),
+            sent_at: ts(3),
+            in_reply_to: None,
+            meta: None,
+        })
+        .await
+        .unwrap();
+    let ids = store.unread_wake_ids("cap".into()).await.unwrap();
+    assert_eq!(ids, vec![first.id, second.id]);
+    assert_eq!(store.count_unread("cap".into()).await.unwrap(), 3);
+    let _ = store.consume_wakes("cap".into(), ts(10)).await.unwrap();
+    assert!(store.unread_wake_ids("cap".into()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn insert_and_list_round_trip_in_reply_to() {
     let (_dir, store) = fresh_store().await;
     let parent = store

@@ -5,13 +5,13 @@ use crate::pty_stream::PtyStream;
 use crate::registry::{AgentChannel, AgentSlot, Lifecycle, LifecycleEvent};
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use swarmx_pty::{PtyBridge, PtyHandles, SpawnOpts};
-use swarmx_recorder::RecorderHandle;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use swarmx_pty::{PtyBridge, PtyHandles, SpawnOpts};
+use swarmx_recorder::RecorderHandle;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -306,7 +306,6 @@ pub fn spawn_agent(
         }
     }
 
-
     // (`CommandBuilder::env_clear`), so the worker sees ONLY what we insert
     // here. We forward what a CLI legitimately needs (HOME for OAuth creds,
     // PATH, locale, proxy/TLS, and the provider's own config/keys) but NOT
@@ -494,16 +493,17 @@ pub fn spawn_agent(
         // `.subscribe()`; `send_replace` updates the retained value even before
         // any subscriber exists, so an early ping is never lost.
         mcp_ready: tokio::sync::watch::channel(false).0,
-        // Set for opencode (drives its TUI over /tui/* HTTP); None for the
-        // keystroke CLIs. Allocated above when input_delivery is opencode-tui-http.
         tui_http_port,
-        // Set for reasonix (drives `reasonix serve` over HTTP+SSE); None
-        // otherwise. Allocated above when input_delivery is reasonix-serve-http.
+        // reasonix *and* zulu listen here; the discriminant is `live_delivery`.
         serve_http_port,
-        // Set for zulu (Comate): per-agent conversation handle carrying the
-        // serve port + resolved model + license + cwd. `Some(_)` routes
-        // bootstrap/wakes through `crate::zulu_serve`. None otherwise.
-        zulu: zulu_conv,
+        zulu: zulu_conv.clone(),
+        live_delivery: crate::input_delivery::LiveDelivery::at_spawn(
+            plugin.input_delivery,
+            tui_http_port,
+            serve_http_port,
+            zulu_conv,
+            &workspace.to_string_lossy(),
+        ),
     };
 
     Ok(AgentSpawn {
@@ -699,7 +699,13 @@ impl HealthScanner {
         let needles: Vec<(Vec<u8>, String, String)> = needles
             .iter()
             .filter(|n| !n.needle.is_empty())
-            .map(|n| (n.needle.clone().into_bytes(), n.reason.clone(), n.kind.clone()))
+            .map(|n| {
+                (
+                    n.needle.clone().into_bytes(),
+                    n.reason.clone(),
+                    n.kind.clone(),
+                )
+            })
             .collect();
         if needles.is_empty() {
             return None;

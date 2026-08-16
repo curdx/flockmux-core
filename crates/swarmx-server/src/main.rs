@@ -45,6 +45,7 @@ mod spells;
 mod tokens;
 mod transcript;
 mod wake;
+mod wake_claim;
 // Git worktree helpers for thread isolation, wired into the thread REST
 // handlers (rename → background `worktree add`). `is_git_repo` stays as a
 // documented helper even though the current flow relies on idempotent init.
