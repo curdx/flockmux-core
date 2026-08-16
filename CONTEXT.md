@@ -21,6 +21,24 @@ Pushing an idle or mid-turn Agent to notice mailbox / blackboard work.
 Mailbox `kind=wake` is the source of truth; engine kick is best-effort.
 Blackboard subscription wakes and operator ⚡ share the same delivery plane.
 
+## Handoff
+
+Server-minted blackboard key a worker writes on success. Format:
+
+- First live producer of a role in a direction (class key):
+  `<workspace>/<thread>/<role>.<kind>`
+- Additional parallel producers (instance key):
+  `<workspace>/<thread>/<role>.<instance>.<kind>`
+
+`consumes: {from_role, kind}` binds to **currently live** producers of that
+role (AND: wait for all of them). If none are live, the consumer reserves
+the class key — the next first producer will write it. Already-spawned
+consumers are not retrofitted when a later same-role worker appears.
+A producer that exits without writing the success key gets `<signal>.error`;
+that write is the replan signal (same-role replacement spawn is allowed —
+it mints a new instance key). Agents never name keys. EngineAdapter does
+not mint Handoff keys.
+
 ## EngineAdapter (`CliAdapter`)
 
 Per-CLI **pre-spawn** patches only (MCP inject, trust, stop hook, argv/env

@@ -46,6 +46,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// A live producer the consumer can bind to. `handoff_signal` is already minted
+/// (class key or instance key); [`consume_keys`] remints the requested `kind`
+/// with the same instance token so a worker that produces `spec`+`done` still
+/// binds the right path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveProducer {
+    pub role_slug: String,
+    pub handoff_signal: String,
+}
+
 /// A typed upstream dependency: "this role consumes the `kind` output of
 /// `from_role`". Resolved at spawn time to the producer's *minted* blackboard
 /// key (see [`mint_handoff_key`]) so the consumer never hand-types a key.
@@ -273,16 +283,103 @@ impl RoleRegistry {
 /// Mint the canonical blackboard key a role writes for one output kind. This
 /// is the SINGLE source of truth for a handoff key: both the producer's prompt
 /// injection and the consumer's resolved `depends_on` derive from it, so the
-/// two sides cannot drift (the F3 bug class). Format matches the per-direction
-/// blackboard namespace documented in the orchestrator role:
-/// `<workspace_id>/<thread_slug>/<role_slug>.<kind>`.
+/// two sides cannot drift (the F3 bug class).
+///
+/// - First live producer of `role_slug` in a direction (`instance = None`):
+///   `<workspace_id>/<thread_slug>/<role_slug>.<kind>` — the **class key**, so
+///   a consumer spawned before its producer still waits on a deterministic path.
+/// - Additional parallel producers (`instance = Some(token)`):
+///   `<workspace_id>/<thread_slug>/<role_slug>.<token>.<kind>`.
 pub fn mint_handoff_key(
     workspace_id: &str,
     thread_slug: &str,
     role_slug: &str,
     kind: &str,
+    instance: Option<&str>,
 ) -> String {
-    format!("{workspace_id}/{thread_slug}/{role_slug}.{kind}")
+    match instance.filter(|s| !s.is_empty()) {
+        Some(id) => format!("{workspace_id}/{thread_slug}/{role_slug}.{id}.{kind}"),
+        None => format!("{workspace_id}/{thread_slug}/{role_slug}.{kind}"),
+    }
+}
+
+/// Short unique token for a parallel same-role producer. Hex group from a
+/// UUID — no dots, so [`instance_of_handoff`] can split on `.kind`.
+pub fn new_handoff_instance() -> String {
+    uuid::Uuid::new_v4().to_string()[..8].to_string()
+}
+
+/// Class key when this is the first live/reserved producer of the role;
+/// instance token otherwise. `existing` counts live siblings **plus** in-flight
+/// reservations, so two concurrent `spawn_worker` calls cannot both mint the
+/// class key.
+pub fn pick_handoff_instance(existing_same_role: usize) -> Option<String> {
+    if existing_same_role == 0 {
+        None
+    } else {
+        Some(new_handoff_instance())
+    }
+}
+
+/// Recover the instance token from a minted key, or `None` for a class key.
+pub fn instance_of_handoff(
+    key: &str,
+    workspace_id: &str,
+    thread_slug: &str,
+    role_slug: &str,
+) -> Option<String> {
+    let prefix = format!("{workspace_id}/{thread_slug}/{role_slug}.");
+    let rest = key.strip_prefix(&prefix)?;
+    match rest.rsplit_once('.') {
+        Some((inst, _kind)) if !inst.is_empty() => Some(inst.to_string()),
+        _ => None,
+    }
+}
+
+/// Progress-breadcrumb path for a worker. Parallel same-role workers must not
+/// share `{role}.progress.md` or the Ledger 近况 pane last-writes-wins.
+pub fn mint_progress_key(
+    workspace_id: &str,
+    thread_slug: &str,
+    role_slug: &str,
+    instance: Option<&str>,
+) -> String {
+    match instance.filter(|s| !s.is_empty()) {
+        Some(id) => format!("{workspace_id}/{thread_slug}/{role_slug}.{id}.progress.md"),
+        None => format!("{workspace_id}/{thread_slug}/{role_slug}.progress.md"),
+    }
+}
+
+/// Resolve `consumes: {from_role, kind}` against currently live producers of
+/// that role. Zero live → class key (the next first producer will write it).
+/// One or more live → one key per producer, reminted for `kind` with that
+/// producer's instance. Callers treat "the class" as AND: wait for every
+/// currently live producer.
+pub fn consume_keys(
+    workspace_id: &str,
+    thread_slug: &str,
+    from_role: &str,
+    kind: &str,
+    live: &[LiveProducer],
+) -> Vec<String> {
+    let mut keys: Vec<String> = live
+        .iter()
+        .filter(|p| p.role_slug == from_role)
+        .map(|p| {
+            let inst = instance_of_handoff(&p.handoff_signal, workspace_id, thread_slug, from_role);
+            mint_handoff_key(workspace_id, thread_slug, from_role, kind, inst.as_deref())
+        })
+        .collect();
+    if keys.is_empty() {
+        keys.push(mint_handoff_key(
+            workspace_id,
+            thread_slug,
+            from_role,
+            kind,
+            None,
+        ));
+    }
+    keys
 }
 
 /// Locate the `roles/` directory: env override > workspace-relative.
@@ -514,13 +611,93 @@ system_prompt_template = "ok"
     #[test]
     fn mint_handoff_key_format() {
         assert_eq!(
-            mint_handoff_key("ws_ab12", "dark-mode", "frontend", "done"),
+            mint_handoff_key("ws_ab12", "dark-mode", "frontend", "done", None),
             "ws_ab12/dark-mode/frontend.done"
         );
         // Deterministic / idempotent: same inputs → same key (no Date/rand).
         assert_eq!(
-            mint_handoff_key("w", "main", "backend", "spec"),
-            mint_handoff_key("w", "main", "backend", "spec")
+            mint_handoff_key("w", "main", "backend", "spec", None),
+            mint_handoff_key("w", "main", "backend", "spec", None)
+        );
+        assert_eq!(
+            mint_handoff_key("w", "main", "researcher", "done", Some("a1b2c3d4")),
+            "w/main/researcher.a1b2c3d4.done"
+        );
+        assert_ne!(
+            mint_handoff_key("w", "main", "researcher", "done", Some("aaa")),
+            mint_handoff_key("w", "main", "researcher", "done", Some("bbb")),
+        );
+    }
+
+    #[test]
+    fn instance_of_class_vs_parallel_key() {
+        assert_eq!(
+            instance_of_handoff("ws/main/backend.done", "ws", "main", "backend"),
+            None
+        );
+        assert_eq!(
+            instance_of_handoff("ws/main/backend.a1b2c3d4.done", "ws", "main", "backend"),
+            Some("a1b2c3d4".into())
+        );
+        assert_eq!(
+            pick_handoff_instance(0),
+            None,
+            "first producer keeps the class key"
+        );
+        assert!(pick_handoff_instance(1).is_some());
+        assert!(pick_handoff_instance(2).is_some());
+    }
+
+    #[test]
+    fn consume_keys_class_when_no_live_producer() {
+        let keys = consume_keys("ws", "main", "backend", "done", &[]);
+        assert_eq!(keys, vec!["ws/main/backend.done".to_string()]);
+    }
+
+    #[test]
+    fn consume_keys_binds_every_live_instance() {
+        let live = vec![
+            LiveProducer {
+                role_slug: "researcher".into(),
+                handoff_signal: "ws/t/researcher.done".into(),
+            },
+            LiveProducer {
+                role_slug: "researcher".into(),
+                handoff_signal: "ws/t/researcher.aabbccdd.done".into(),
+            },
+            LiveProducer {
+                role_slug: "backend".into(),
+                handoff_signal: "ws/t/backend.done".into(),
+            },
+        ];
+        let keys = consume_keys("ws", "t", "researcher", "done", &live);
+        assert_eq!(
+            keys,
+            vec![
+                "ws/t/researcher.done".to_string(),
+                "ws/t/researcher.aabbccdd.done".to_string(),
+            ]
+        );
+        // Non-primary kind remints with the same instance token.
+        let spec = consume_keys("ws", "t", "researcher", "notes", &live);
+        assert_eq!(
+            spec,
+            vec![
+                "ws/t/researcher.notes".to_string(),
+                "ws/t/researcher.aabbccdd.notes".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mint_progress_key_distinguishes_parallel_workers() {
+        assert_eq!(
+            mint_progress_key("ws", "t", "researcher", None),
+            "ws/t/researcher.progress.md"
+        );
+        assert_eq!(
+            mint_progress_key("ws", "t", "researcher", Some("aabbccdd")),
+            "ws/t/researcher.aabbccdd.progress.md"
         );
     }
 

@@ -31,8 +31,14 @@ deliberate deviations.
 handoff key:
 
 ```
-<workspace_id>/<thread_slug>/<role_slug>.<kind>
+<workspace_id>/<thread_slug>/<role_slug>.<kind>                  # class key
+<workspace_id>/<thread_slug>/<role_slug>.<instance>.<kind>       # parallel producer
 ```
+
+The **class key** (no instance token) is used for the first live producer of
+that role in the direction, so a consumer spawned *before* its producer still
+waits on a deterministic path. Additional same-role workers mint a unique
+`<instance>` token (8 hex chars) so they cannot overwrite each other.
 
 Both the producer's prompt injection ("write your completion summary to THIS
 key, then STOP") and the consumer's resolved dependency list derive from this
@@ -47,10 +53,13 @@ At `swarm_spawn_worker` time (`routes/rest.rs`) the server:
    (`resolve_consumes_to_deps`): unknown producer role → rejected with a
    did-you-mean; kind the producer doesn't declare → rejected; self-dependency
    → rejected. Typos fail LOUD at spawn, never as a silent never-wake.
+   Live producers of `from_role` bind by instance (wait for all of them);
+   if none are live, the class key is reserved.
 3. Guards the runtime DAG: a `consumes` cycle among live workers in the
-   direction is rejected (W0-4), and a second live worker of the same role in
-   the same direction is rejected — two producers would mint the identical
-   key and overwrite each other (the minted key has no per-worker component).
+   direction is rejected (W0-4). Parallel same-role workers are allowed —
+   they mint distinct instance keys. Cycle detection is keyed by handoff
+   node, not role slug, so two researchers do not clobber each other in
+   the graph.
 
 ## WakeCoordinator: a write becomes a wakeup
 
@@ -73,7 +82,9 @@ swarm broadcast and reacts to `SwarmEvent::BlackboardChanged`:
 4. **Failure aliases fan out**: writing `<key>.error` or `<key>.failed` also
    wakes the base key's subscribers (`base_key_aliases`), so a failure signal
    unblocks exactly the agents waiting on the success key — no separate
-   wiring.
+   wiring. The mailbox/kick body is the **replan signal**, not "an update":
+   same-role replacement spawn is allowed (new instance key). Live-stall
+   TTL nudges were removed on purpose (false-positive mid-thought).
 5. **Post-handoff auto-kill**: a write matching a live agent's registered
    handoff signal means that worker is done; after a 5s grace (final
    scrollback + recording flush) its PTY is torn down so the UI returns to

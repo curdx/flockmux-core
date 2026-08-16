@@ -30,8 +30,10 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// load, far beyond the 5s READ budget. Timing them out at 5s made the agent see
 /// a "failed" result for a spawn/send that had actually SUCCEEDED, then retry it,
 /// producing a duplicate worker/message. A longer budget removes that
-/// false-failure retry trigger; the server's idempotency window (send) and the
-/// same-role producer guard (spawn) are the backstop for a genuine retry.
+/// false-failure retry trigger; the server's send-path idempotency window
+/// is the backstop for a genuine retry. Same-role spawn is allowed (parallel
+/// researchers mint distinct instance keys) — a second same-role worker is
+/// not treated as a duplicate.
 fn mutating_client() -> &'static Client {
     static C: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
     C.get_or_init(|| {

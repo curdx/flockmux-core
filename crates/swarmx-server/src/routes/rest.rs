@@ -1,27 +1,27 @@
 //! REST endpoints. Loopback-only; no auth (per user decision — local single-user).
 
-use crate::AppState;
 use crate::plugins::{CliPlugin, PluginRegistry};
 use crate::registry::LifecycleEvent;
-use crate::spawn::{WorkspaceLayout, spawn_agent};
+use crate::spawn::{spawn_agent, WorkspaceLayout};
 use crate::spells;
+use crate::AppState;
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
+use serde_json::json;
+use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
 use swarmx_protocol::rest::{
     AgentActivityRecord, AgentInfo, CliInstallHint, CliPluginInfo, RunSpellAgent, RunSpellRequest,
-    RunSpellResponse, SpawnAgentRequest, SpawnAgentResponse, SpawnWorkerRequest, SpawnWorkerResponse,
-    SpellAgentInfo, SpellInfo,
+    RunSpellResponse, SpawnAgentRequest, SpawnAgentResponse, SpawnWorkerRequest,
+    SpawnWorkerResponse, SpellAgentInfo, SpellInfo,
 };
 use swarmx_protocol::ws_swarm::{AgentState, SwarmEvent};
 use swarmx_recorder::{Recorder, RecorderConfig};
 use swarmx_storage::{NewAgent, NewRecording, NewSpellRun, NewWorker, ThreadRecord};
-use serde_json::json;
-use std::collections::HashMap;
-use std::path::{Path as FsPath, PathBuf};
 use uuid::Uuid;
 
 /// First-response watchdog window: how long after `ShimReady` an agent may
@@ -103,27 +103,81 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// See `crate::agent_lifecycle::first_unsatisfied_dep`.
+/// In-flight handoff claims so two concurrent `spawn_worker` calls cannot both
+/// mint the class key for the same role before either persists a worker row.
+struct HandoffClaim {
+    workspace_id: String,
+    thread_slug: String,
+    role_slug: String,
+    handoff_signal: String,
+}
 
-/// The by-role `consumes` model assumes ≤1 live producer per role in a
-/// direction. Return the handoff key an already-live sibling of `role_slug`
-/// produces (the collision), if any — spawning a second same-role worker would
-/// mint the identical key (see `mint_handoff_key`) and overwrite it. Pure, so
-/// the invariant is unit-tested without an HTTP server.
-fn conflicting_producer<'a>(
-    workers: impl IntoIterator<Item = &'a swarmx_storage::WorkerRecord>,
-    role_slug: &str,
-) -> Option<String> {
-    workers
-        .into_iter()
-        .find(|w| w.role_slug == role_slug)
-        .map(|w| {
-            if w.handoff_signal.is_empty() {
-                format!("{role_slug} (no handoff key)")
-            } else {
-                w.handoff_signal.clone()
-            }
-        })
+fn handoff_claims() -> &'static std::sync::Mutex<Vec<HandoffClaim>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<Vec<HandoffClaim>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+struct HandoffReservationGuard {
+    key: String,
+}
+
+impl Drop for HandoffReservationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut claims) = handoff_claims().lock() {
+            claims.retain(|c| c.handoff_signal != self.key);
+        }
+    }
+}
+
+fn lock_claims() -> std::sync::MutexGuard<'static, Vec<HandoffClaim>> {
+    handoff_claims().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Unique graph node for cycle detection. Must NOT be `role_slug` — two parallel
+/// researchers share a role and would clobber each other in a HashMap.
+fn handoff_graph_node(role_slug: &str, handoff_signal: &str) -> String {
+    if handoff_signal.is_empty() {
+        role_slug.to_string()
+    } else {
+        handoff_signal.to_string()
+    }
+}
+
+/// Live (not killed / not exited) workers in this workspace direction.
+async fn live_direction_workers(
+    state: &AppState,
+    workspace_id: &str,
+    thread_id: Option<&str>,
+) -> Vec<swarmx_storage::WorkerRecord> {
+    let sibling_ids: Vec<String> = match state.store.list_agents().await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|a| {
+                a.killed_at.is_none()
+                    && a.workspace_id.as_deref() == Some(workspace_id)
+                    && a.thread_id.as_deref() == thread_id
+                    && a.role != "orchestrator"
+            })
+            .map(|a| a.id)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "handoff: list_agents failed; treating sibling set as empty"
+            );
+            return Vec::new();
+        }
+    };
+    if sibling_ids.is_empty() {
+        return Vec::new();
+    }
+    match state.store.list_workers_by_ids(sibling_ids).await {
+        Ok(map) => map.into_values().collect(),
+        Err(e) => {
+            tracing::warn!(?e, "handoff: list_workers_by_ids failed");
+            Vec::new()
+        }
+    }
 }
 
 /// Live orchestrator in this direction, if any. Thread match is exact on the
@@ -146,15 +200,18 @@ async fn live_orchestrator_in_direction(
 
 /// Spawn-time dependency-graph validation + key minting (P0-A), pure so it can
 /// be unit-tested without an HTTP server. Resolves each typed `consumes` ref to
-/// the producer's minted blackboard key, after verifying the producer role
-/// exists and declares the requested output kind. Returns the minted
-/// `depends_on` keys, or a human error (mapped to 400 by the caller).
+/// the producer's minted blackboard key(s), after verifying the producer role
+/// exists and declares the requested output kind. Bindings follow
+/// [`crate::roles::consume_keys`]: currently live producers, or the class key
+/// if none. Returns the minted `depends_on` keys, or a human error (mapped to
+/// 400 by the caller).
 fn resolve_consumes_to_deps(
     registry: &crate::roles::RoleRegistry,
     role_slug: &str,
     consumes: &[swarmx_protocol::rest::ConsumeRef],
     workspace_id: &str,
     thread_slug: &str,
+    live: &[crate::roles::LiveProducer],
 ) -> Result<Vec<String>, String> {
     let mut depends_on = Vec::with_capacity(consumes.len());
     for c in consumes {
@@ -187,11 +244,12 @@ fn resolve_consumes_to_deps(
                 "role '{from}' does not produce kind '{kind}' — it produces {producer_kinds:?}"
             ));
         }
-        depends_on.push(crate::roles::mint_handoff_key(
+        depends_on.extend(crate::roles::consume_keys(
             workspace_id,
             thread_slug,
             from,
             kind,
+            live,
         ));
     }
     Ok(depends_on)
@@ -211,6 +269,7 @@ fn build_worker_prompt(
     error_key: &str,
     dep_keys: &[String],
     done_checks: &[String],
+    progress_key: Option<&str>,
 ) -> String {
     let mut out = base.to_string();
 
@@ -254,6 +313,16 @@ fn build_worker_prompt(
              • On SUCCESS (only when the task is actually done), write your result to:\n{keys}\n\
              • On FAILURE/abort, write to `{error_key}` instead, so dependents \
              fail loudly rather than hang forever.\n"
+        ));
+    }
+
+    if let Some(progress_key) = progress_key {
+        out.push_str(&format!(
+            "\n──────────────────────────────────────────────────────────────\n\
+             PROGRESS BREADCRUMBS (managed by swarmx — copy this key VERBATIM):\n\
+             After each meaningful milestone, overwrite `{progress_key}` with one line \
+             `<HH:MM> <status>`. Parallel workers of the same role must not share a \
+             progress key; this path is unique to you.\n"
         ));
     }
 
@@ -349,7 +418,7 @@ async fn cli_plugin_info(p: &CliPlugin) -> CliPluginInfo {
 }
 
 async fn probe_cli_version(binary: &FsPath) -> Option<String> {
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     let output = crate::runtime_path::tool_command_async(binary)
         .arg("--version")
@@ -488,10 +557,12 @@ pub async fn install_plugin(
     let (tx, rx) = futures::channel::mpsc::unbounded::<axum::response::sse::Event>();
     tokio::spawn(async move {
         use tokio::io::AsyncBufReadExt;
-        let _ = tx.unbounded_send(sse_event(json!({"type": "line", "text": format!("$ {cmd}")})));
+        let _ = tx.unbounded_send(sse_event(
+            json!({"type": "line", "text": format!("$ {cmd}")}),
+        ));
 
-        let home = crate::runtime_path::swarmx_home()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let home =
+            crate::runtime_path::swarmx_home().unwrap_or_else(|| std::path::PathBuf::from("."));
         let spawned = crate::runtime_path::shell_command_async(&cmd)
             .current_dir(&home)
             .stdout(std::process::Stdio::piped())
@@ -510,8 +581,14 @@ pub async fn install_plugin(
         // Stream stdout + stderr line-by-line as they arrive.
         let mut readers = Vec::new();
         for pipe in [
-            child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
-            child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
         ]
         .into_iter()
         .flatten()
@@ -1081,12 +1158,10 @@ pub(crate) async fn spawn_with_bookkeeping(
                         let agent_wd = agent_for_task.clone();
                         let watchdog_ms = first_response_watchdog_ms(&engine_for_task);
                         tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(watchdog_ms))
-                                .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(watchdog_ms)).await;
                             match store_wd.agent_silent_since_ready(agent_wd.clone()).await {
                                 Ok(true) => {
-                                    let reason =
-                                        "启动后无响应（可能未登录或卡住）".to_string();
+                                    let reason = "启动后无响应（可能未登录或卡住）".to_string();
                                     let at = now_ms();
                                     if let Err(e) = store_wd
                                         .record_agent_error(
@@ -1485,8 +1560,7 @@ pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
                     if it.handoff_signal.is_empty() {
                         continue;
                     }
-                    let error_present =
-                        present.contains(&format!("{}.error", it.handoff_signal));
+                    let error_present = present.contains(&format!("{}.error", it.handoff_signal));
                     let success_present = present.contains(&it.handoff_signal);
                     // Failed only if it errored and was never (fallback-)delivered.
                     it.handoff_failed = error_present && !success_present;
@@ -1496,8 +1570,7 @@ pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
                     // may still deliver). This is the failure the chat surfaces
                     // because, unlike handoff_failed, there's no `.error` trail.
                     let exited = it.killed_at.is_some() || it.shim_exit.is_some();
-                    it.handoff_missing =
-                        exited && !success_present && !error_present;
+                    it.handoff_missing = exited && !success_present && !error_present;
                 }
             }
             Err(e) => {
@@ -1646,7 +1719,14 @@ pub async fn wake_agent(
             Json(json!({"error": format!("agent {agent_id} not found")})),
         );
     }
-    match crate::wake::deliver_manual_wake(&state.swarm, &state.registry, &state.server_url, &agent_id).await {
+    match crate::wake::deliver_manual_wake(
+        &state.swarm,
+        &state.registry,
+        &state.server_url,
+        &agent_id,
+    )
+    .await
+    {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))),
         Err(e) => {
             tracing::warn!(?e, agent = %agent_id, "manual wake failed");
@@ -1990,30 +2070,97 @@ pub async fn spawn_worker(
         }
     }
 
-    // Mint the canonical handoff key(s) this worker writes (one per kind), plus
-    // the single primary signal (the "done" kind if present, else the first).
-    let minted_produces: Vec<String> = produces
-        .iter()
-        .map(|k| crate::roles::mint_handoff_key(&req.workspace_id, &thread_slug, &role_slug, k))
-        .collect();
+    // Sibling set drives instance minting (parallel same-role) AND consume
+    // binding (wait for currently live producers, else the class key).
+    let sibling_workers =
+        live_direction_workers(&state, &req.workspace_id, thread_id.as_deref()).await;
+
     let primary_kind = if produces.iter().any(|k| k == "done") {
         "done"
     } else {
         produces[0].as_str()
     };
-    let handoff_signal =
-        crate::roles::mint_handoff_key(&req.workspace_id, &thread_slug, &role_slug, primary_kind);
-    // The failure key is the primary handoff key + `.error`, so the existing
-    // `base_key_aliases` fan-out (`<key>.error` → `<key>`) wakes exactly the
-    // consumers that wait on the success key — no separate wiring needed.
+    // Claims mutex: two concurrent spawn_worker calls that both listed zero
+    // siblings must not both mint the class key.
+    let (instance, _handoff_claim, handoff_signal, minted_produces) = {
+        let mut claims = lock_claims();
+        let reserved_same = claims
+            .iter()
+            .filter(|c| {
+                c.workspace_id == req.workspace_id
+                    && c.thread_slug == thread_slug
+                    && c.role_slug == role_slug
+            })
+            .count();
+        let live_same = sibling_workers
+            .iter()
+            .filter(|w| w.role_slug == role_slug)
+            .count();
+        let instance = crate::roles::pick_handoff_instance(live_same + reserved_same);
+        let minted_produces: Vec<String> = produces
+            .iter()
+            .map(|k| {
+                crate::roles::mint_handoff_key(
+                    &req.workspace_id,
+                    &thread_slug,
+                    &role_slug,
+                    k,
+                    instance.as_deref(),
+                )
+            })
+            .collect();
+        let handoff_signal = crate::roles::mint_handoff_key(
+            &req.workspace_id,
+            &thread_slug,
+            &role_slug,
+            primary_kind,
+            instance.as_deref(),
+        );
+        claims.push(HandoffClaim {
+            workspace_id: req.workspace_id.clone(),
+            thread_slug: thread_slug.clone(),
+            role_slug: role_slug.clone(),
+            handoff_signal: handoff_signal.clone(),
+        });
+        (
+            instance,
+            HandoffReservationGuard {
+                key: handoff_signal.clone(),
+            },
+            handoff_signal,
+            minted_produces,
+        )
+    };
     let error_key = format!("{handoff_signal}.error");
+    let progress_key = crate::roles::mint_progress_key(
+        &req.workspace_id,
+        &thread_slug,
+        &role_slug,
+        instance.as_deref(),
+    );
 
-    // ── Spawn-time dependency-graph validation (fail LOUD, not silent) ───
-    // Resolve each typed `consumes` ref to the producer's minted key, after
-    // verifying the producer role exists AND declares that output kind. This
-    // is the structural fix for the F3 drift class: a typo/unknown dep is
-    // rejected here with valid options, never a silent never-wake. Pure logic
-    // lives in `resolve_consumes_to_deps` (unit-tested).
+    let mut live_producers: Vec<crate::roles::LiveProducer> = sibling_workers
+        .iter()
+        .filter(|w| !w.role_slug.is_empty() && !w.handoff_signal.is_empty())
+        .map(|w| crate::roles::LiveProducer {
+            role_slug: w.role_slug.clone(),
+            handoff_signal: w.handoff_signal.clone(),
+        })
+        .collect();
+    {
+        let claims = lock_claims();
+        for c in claims.iter().filter(|c| {
+            c.workspace_id == req.workspace_id
+                && c.thread_slug == thread_slug
+                && c.handoff_signal != handoff_signal
+        }) {
+            live_producers.push(crate::roles::LiveProducer {
+                role_slug: c.role_slug.clone(),
+                handoff_signal: c.handoff_signal.clone(),
+            });
+        }
+    }
+
     let role_consumes: Vec<swarmx_protocol::rest::ConsumeRef> = manifest
         .consumes
         .iter()
@@ -2033,79 +2180,36 @@ pub async fn spawn_worker(
         &effective_consumes,
         &req.workspace_id,
         &thread_slug,
+        &live_producers,
     )
     .map_err(|msg| (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))))?;
 
-    // ── W0-4: runtime DAG cycle guard (fail LOUD, not a 300s deadlock) ──
-    // `consumes` resolves to role-deterministic minted keys, so across
-    // separately-spawned workers the orchestrator CAN form a cycle: spawn
-    // role A consuming B, then role B consuming A — both would then sit on
-    // the readiness gate until the 300s timeout. `run_spell` already cycle-
-    // checks the static spell DAG; do the same for the dynamic spawn path.
-    // Build the role→handoff / role→depends graph from the live workers in
-    // THIS direction plus the worker we're about to add, and reject a loop.
+    // W0-4: cycle guard keyed by unique handoff node, not role slug — two
+    // parallel researchers must not clobber each other in the HashMap.
     {
-        let sibling_ids: Vec<String> = match state.store.list_agents().await {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|a| {
-                    a.killed_at.is_none()
-                        && a.workspace_id.as_deref() == Some(req.workspace_id.as_str())
-                        && a.thread_id == thread_id
-                        && a.role != "orchestrator"
-                })
-                .map(|a| a.id)
-                .collect(),
-            // Don't block a spawn on a transient store read error — the
-            // readiness-gate timeout is still a backstop. Log and skip.
-            Err(e) => {
-                tracing::warn!(?e, "cycle-guard: list_agents failed; skipping cycle check");
-                Vec::new()
-            }
-        };
         let mut role_handoff: HashMap<String, String> = HashMap::new();
         let mut role_depends: HashMap<String, Vec<String>> = HashMap::new();
-        if !sibling_ids.is_empty() {
-            if let Ok(workers) = state.store.list_workers_by_ids(sibling_ids).await {
-                // Producer uniqueness — the invariant the by-role `consumes`
-                // model assumes but nothing enforced. A second LIVE worker of the
-                // same role in this direction would mint the IDENTICAL handoff key
-                // (mint_handoff_key has no per-worker component) and silently
-                // overwrite the first's product; a `consumes:{from_role}`
-                // dependent could then be satisfied by the wrong one. Reject —
-                // true parallel same-role work needs per-instance keys (a larger
-                // model change), not two producers racing one key.
-                if let Some(existing) = conflicting_producer(workers.values(), &role_slug) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": format!(
-                            "spawn rejected: a '{role_slug}' worker is already live in this \
-                             direction producing '{existing}'. Two same-role workers mint the \
-                             same handoff key and would overwrite each other — use a different \
-                             role, or a separate direction, for parallel work."
-                        ) })),
-                    ));
-                }
-                for w in workers.values() {
-                    if w.role_slug.is_empty() {
-                        continue;
-                    }
-                    if !w.handoff_signal.is_empty() {
-                        role_handoff.insert(w.role_slug.clone(), w.handoff_signal.clone());
-                    }
-                    let deps: Vec<String> =
-                        serde_json::from_str(&w.depends_on_json).unwrap_or_default();
-                    role_depends
-                        .entry(w.role_slug.clone())
-                        .or_default()
-                        .extend(deps);
-                }
+        for w in &sibling_workers {
+            if w.role_slug.is_empty() {
+                continue;
             }
+            let node = handoff_graph_node(&w.role_slug, &w.handoff_signal);
+            if !w.handoff_signal.is_empty() {
+                role_handoff.insert(node.clone(), w.handoff_signal.clone());
+            }
+            let deps: Vec<String> = serde_json::from_str(&w.depends_on_json).unwrap_or_default();
+            role_depends.entry(node).or_default().extend(deps);
         }
-        // The worker we're about to spawn.
-        role_handoff.insert(role_slug.clone(), handoff_signal.clone());
+        for p in &live_producers {
+            let node = handoff_graph_node(&p.role_slug, &p.handoff_signal);
+            role_handoff
+                .entry(node.clone())
+                .or_insert_with(|| p.handoff_signal.clone());
+        }
+        let pending = handoff_graph_node(&role_slug, &handoff_signal);
+        role_handoff.insert(pending.clone(), handoff_signal.clone());
         role_depends
-            .entry(role_slug.clone())
+            .entry(pending)
             .or_default()
             .extend(depends_on.iter().cloned());
 
@@ -2139,6 +2243,7 @@ pub async fn spawn_worker(
         &error_key,
         &depends_on,
         &done_checks,
+        Some(&progress_key),
     );
     let produces_json = serde_json::to_string(&produces).unwrap_or_else(|_| "[]".to_string());
     let consumes_json =
@@ -2451,7 +2556,13 @@ pub async fn resume(
     slot.lock()
         .paused
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    if let Err(e) = crate::wake::deliver_manual_wake(&state.swarm, &state.registry, &state.server_url, &agent_id).await
+    if let Err(e) = crate::wake::deliver_manual_wake(
+        &state.swarm,
+        &state.registry,
+        &state.server_url,
+        &agent_id,
+    )
+    .await
     {
         tracing::warn!(?e, agent = %agent_id, "resume: manual wake failed (paused already cleared)");
         return (
@@ -2816,8 +2927,8 @@ pub async fn run_spell(
     // Captain singleton (zero-burden): init / any orch-only spell reuses the
     // live captain instead of spawning a twin that sits silent and burns
     // quota. Model-switch paths kill first, then hit this with an empty room.
-    let orch_only = !resolved_agents.is_empty()
-        && resolved_agents.iter().all(|a| a.role == "orchestrator");
+    let orch_only =
+        !resolved_agents.is_empty() && resolved_agents.iter().all(|a| a.role == "orchestrator");
     if orch_only {
         if let Some(existing) =
             live_orchestrator_in_direction(&state, &workspace.id, thread_id.as_deref()).await
@@ -3198,7 +3309,9 @@ pub async fn optimize_prompt(
         Err(crate::pty_query::OneShotError::Auth) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "优化失败：claude 未登录或未授权，请先在终端 `claude` 登录" })),
+                Json(
+                    json!({ "error": "优化失败：claude 未登录或未授权，请先在终端 `claude` 登录" }),
+                ),
             )
                 .into_response();
         }
@@ -3334,7 +3447,9 @@ pub async fn compact_blackboard(
         Err(crate::pty_query::OneShotError::Auth) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "压缩失败：claude 未登录或未授权，请先在终端 `claude` 登录" })),
+                Json(
+                    json!({ "error": "压缩失败：claude 未登录或未授权，请先在终端 `claude` 登录" }),
+                ),
             )
                 .into_response();
         }
@@ -3661,6 +3776,7 @@ mod p0_tests {
             &[consume("backend", "done"), consume("frontend", "done")],
             "ws1",
             "dark-mode",
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -3673,30 +3789,42 @@ mod p0_tests {
     }
 
     #[test]
-    fn conflicting_producer_rejects_duplicate_live_role() {
-        let mk = |role: &str, key: &str| swarmx_storage::NewWorker {
-            agent_id: format!("a-{role}"),
-            parent_agent_id: "orch".into(),
-            role_label: role.into(),
-            system_prompt: String::new(),
-            handoff_signal: key.into(),
-            depends_on_json: "[]".into(),
-            spawned_at: 0,
-            role_slug: role.into(),
-            produces_json: String::new(),
-            consumes_json: String::new(),
-        };
-        let workers = vec![
-            mk("backend", "ws1/main/backend.done"),
-            mk("frontend", "ws1/main/frontend.done"),
+    fn resolve_consumes_binds_all_live_same_role_producers() {
+        let reg = RoleRegistry::builtin();
+        let live = vec![
+            crate::roles::LiveProducer {
+                role_slug: "researcher".into(),
+                handoff_signal: "ws1/t/researcher.done".into(),
+            },
+            crate::roles::LiveProducer {
+                role_slug: "researcher".into(),
+                handoff_signal: "ws1/t/researcher.aabbccdd.done".into(),
+            },
         ];
-        // A second 'backend' would mint the same key the live one already produces.
+        let deps = resolve_consumes_to_deps(
+            &reg,
+            "orchestrator",
+            &[consume("researcher", "done")],
+            "ws1",
+            "t",
+            &live,
+        )
+        .unwrap();
         assert_eq!(
-            conflicting_producer(workers.iter(), "backend"),
-            Some("ws1/main/backend.done".to_string())
+            deps,
+            vec![
+                "ws1/t/researcher.done".to_string(),
+                "ws1/t/researcher.aabbccdd.done".to_string(),
+            ]
         );
-        // A distinct role in the same direction is fine.
-        assert_eq!(conflicting_producer(workers.iter(), "tester"), None);
+        assert!(crate::roles::pick_handoff_instance(live.len()).is_some());
+    }
+
+    #[test]
+    fn handoff_graph_node_keeps_parallel_researchers_distinct() {
+        let a = handoff_graph_node("researcher", "ws/t/researcher.done");
+        let b = handoff_graph_node("researcher", "ws/t/researcher.aabbccdd.done");
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -3708,6 +3836,7 @@ mod p0_tests {
             &[consume("bakend", "done")],
             "ws1",
             "main",
+            &[],
         )
         .unwrap_err();
         assert!(err.contains("unknown role 'bakend'"), "got: {err}");
@@ -3724,6 +3853,7 @@ mod p0_tests {
             &[consume("backend", "spec")],
             "ws1",
             "main",
+            &[],
         )
         .unwrap_err();
         assert!(err.contains("does not produce kind 'spec'"), "got: {err}");
@@ -3738,6 +3868,7 @@ mod p0_tests {
             &[consume("frontend", "done")],
             "ws1",
             "main",
+            &[],
         )
         .unwrap_err();
         assert!(err.contains("self-dependency"), "got: {err}");
@@ -3746,8 +3877,9 @@ mod p0_tests {
     #[test]
     fn resolve_consumes_rejects_empty_from_role() {
         let reg = RoleRegistry::builtin();
-        let err = resolve_consumes_to_deps(&reg, "frontend", &[consume("", "done")], "ws1", "main")
-            .unwrap_err();
+        let err =
+            resolve_consumes_to_deps(&reg, "frontend", &[consume("", "done")], "ws1", "main", &[])
+                .unwrap_err();
         assert!(err.contains("empty from_role"), "got: {err}");
     }
 
@@ -3774,15 +3906,32 @@ mod p0_tests {
             "ws1/main/frontend.done.error",
             &[],
             &[],
+            None,
         );
         assert!(p.starts_with("do the thing"));
         assert!(p.contains("ws1/main/frontend.done"));
         assert!(p.contains("ws1/main/frontend.done.error"));
         assert!(p.contains("VERBATIM"));
         assert!(!p.contains("INPUTS"), "no deps → no inputs gate");
-        assert!(!p.contains("VERIFY GATE"), "no done_checks → no verify gate");
+        assert!(
+            !p.contains("VERIFY GATE"),
+            "no done_checks → no verify gate"
+        );
+        let with_progress = build_worker_prompt(
+            "do the thing",
+            &["ws1/t/researcher.aabb.done".to_string()],
+            "ws1/t/researcher.aabb.done.error",
+            &[],
+            &[],
+            Some("ws1/t/researcher.aabb.progress.md"),
+        );
+        assert!(with_progress.contains("ws1/t/researcher.aabb.progress.md"));
+        assert!(with_progress.contains("PROGRESS BREADCRUMBS"));
         // No keys at all → prompt returned unchanged (fire-and-forget, no deps).
-        assert_eq!(build_worker_prompt("x", &[], "x.error", &[], &[]), "x");
+        assert_eq!(
+            build_worker_prompt("x", &[], "x.error", &[], &[], None),
+            "x"
+        );
     }
 
     #[test]
@@ -3795,6 +3944,7 @@ mod p0_tests {
             "ws1/main/backend.done.error",
             &[],
             &["cargo test".to_string(), "cargo clippy".to_string()],
+            None,
         );
         assert!(p.contains("VERIFY GATE"));
         assert!(p.contains("- cargo test"));
@@ -3913,6 +4063,7 @@ mod p0_tests {
             "ws1/main/reviewer.done.error",
             &["ws1/main/backend.done".to_string()],
             &[],
+            None,
         );
         // The wait-gate must name the dep and forbid acting / writing handoff early.
         assert!(p.contains("INPUTS"));
@@ -3922,7 +4073,14 @@ mod p0_tests {
         // Still carries its own handoff block.
         assert!(p.contains("ws1/main/reviewer.done"));
         // A dep-only worker with no produces still gets the inputs gate.
-        let q = build_worker_prompt("x", &[], "x.error", &["ws1/main/dep.done".to_string()], &[]);
+        let q = build_worker_prompt(
+            "x",
+            &[],
+            "x.error",
+            &["ws1/main/dep.done".to_string()],
+            &[],
+            None,
+        );
         assert!(q.contains("INPUTS"));
         assert!(q.contains("ws1/main/dep.done"));
     }
@@ -3982,9 +4140,21 @@ mod p0_tests {
         let registry = test_registry();
         let err = select_spawn_plugin_with(&registry, "claud", &|_| true).unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
-        assert!(err.1.contains("unknown cli plugin: claud"), "msg: {}", err.1);
-        assert!(err.1.contains("did you mean 'claude'"), "missing suggestion: {}", err.1);
-        assert!(err.1.contains("valid engines:"), "missing valid list: {}", err.1);
+        assert!(
+            err.1.contains("unknown cli plugin: claud"),
+            "msg: {}",
+            err.1
+        );
+        assert!(
+            err.1.contains("did you mean 'claude'"),
+            "missing suggestion: {}",
+            err.1
+        );
+        assert!(
+            err.1.contains("valid engines:"),
+            "missing valid list: {}",
+            err.1
+        );
     }
 
     #[test]
@@ -4002,15 +4172,13 @@ mod p0_tests {
         let err = select_spawn_plugin_with(&registry, "claude", &|_| false).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("Claude Code CLI binary `claude`"));
-        assert!(
-            err.1
-                .contains("curl -fsSL https://claude.ai/install.sh | bash")
-        );
+        assert!(err
+            .1
+            .contains("curl -fsSL https://claude.ai/install.sh | bash"));
         assert!(err.1.contains("Other supported AI engines"));
-        assert!(
-            err.1
-                .contains("Codex CLI: curl -fsSL https://chatgpt.com/codex/install.sh | sh")
-        );
+        assert!(err
+            .1
+            .contains("Codex CLI: curl -fsSL https://chatgpt.com/codex/install.sh | sh"));
     }
 
     #[test]
@@ -4082,8 +4250,12 @@ mod bootstrap_needle_tests {
         let stream = Arc::new(crate::pty_stream::PtyStream::new());
         stream.append(Bytes::from_static(b"some other output"));
         assert!(
-            !wait_for_pty_needle(&stream, b"never-appearing-banner", Duration::from_millis(150),)
-                .await
+            !wait_for_pty_needle(
+                &stream,
+                b"never-appearing-banner",
+                Duration::from_millis(150),
+            )
+            .await
         );
     }
 

@@ -204,7 +204,8 @@ pub struct NewWorker {
     /// 注入给 worker 的完整 system prompt,留档便于回放。
     pub system_prompt: String,
     /// 完成后该写的黑板 key;无 handoff 留空字符串。P0-A 起由服务端 mint
-    /// (`<workspace_id>/<thread_slug>/<role>.<kind>`),不再是 LLM 自选串。
+    /// (`<workspace_id>/<thread_slug>/<role>.<kind>`, parallel same-role 另加
+    /// `.<instance>`),不再是 LLM 自选串。
     pub handoff_signal: String,
     /// JSON 序列化的 string array,等待的黑板 key。空数组 = 无依赖。P0-A 起
     /// 由 `consumes_json` 解析成的 minted keys 填入。
@@ -610,4 +611,3 @@ pub struct NewFusionBatch {
     #[serde(default)]
     pub check_cmd: Option<String>,
 }
-

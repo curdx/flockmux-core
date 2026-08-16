@@ -270,7 +270,7 @@ pub struct SpawnWorkerRequest {
     #[serde(default)]
     pub model: Option<String>,
     /// 本 worker 产出的 typed output-kinds(P0-A)。空 → 取 role.produces →
-    /// 再空则 ["done"]。服务端按 (workspace,thread,role,kind) mint 黑板 key。
+    /// 再空则 ["done"]。服务端按 (workspace,thread,role,kind[,instance]) mint 黑板 key。
     #[serde(default)]
     pub produces: Vec<String>,
     /// typed 上游依赖(P0-A):本 worker 等的「某角色的某产出种类」。服务端

@@ -224,7 +224,9 @@ b. **Decide scale** (Anthropic scaling rules):
    → swarm_spawn_worker(role="researcher", system_prompt="调研 CrewAI …")
    → swarm_spawn_worker(role="researcher", system_prompt="调研 AutoGen …")
    → 三个都不传 consumes(立刻并跑);各自把结论写到 server 为它 mint 的
-       handoff key(server 已在它们的 prompt 里替你交代好了)
+       **不同** handoff key(第一个 researcher 写 class key
+       `<ws>/<thread>/researcher.done`,后续的带 instance token,互不覆盖。
+       server 已在它们的 prompt 里替你交代好了)
    → 你 STOP,三个写完后 WakeCoordinator 会逐个 wake 你
    → swarm_list_blackboard 看到三个结论 key,读取并综合给用户一份对比
    ```
@@ -266,13 +268,12 @@ c. **Spawn workers by registry ROLE — not hand-typed plumbing.** Once
      automatically — do NOT add any key plumbing here yourself.)
 
      PROGRESS BREADCRUMBS (重要):
-     Every time you complete a meaningful milestone (e.g. "scaffold
-     done", "deps installed", "core code written", "build passing",
-     "tests written") — BEFORE moving to the next step — write a
-     one-line progress note to the blackboard at:
-       `{workspace_id}/{thread_slug}/<role>.progress.md`
-     overwriting the previous content. Format: just `<HH:MM> <short
-     human-readable status>`, no markdown headers. Examples:
+     The server appends the exact blackboard key for this worker's heartbeat
+     (class key `<workspace_id>/<thread_slug>/<role>.progress.md`, or an
+     instance-scoped path when several of the same role run in parallel).
+     Copy that key VERBATIM — do not invent one, or two researchers will
+     overwrite each other in the Ledger 近况 pane. Format: just
+     `<HH:MM> <short human-readable status>`, no markdown headers. Examples:
        "20:08 npm create vite 完成,装依赖中"
        "20:11 依赖装好,开始写 App.jsx"
        "20:13 代码写完,跑 build"
@@ -312,7 +313,8 @@ c. **Spawn workers by registry ROLE — not hand-typed plumbing.** Once
                         consumes=[{"from_role":"backend","kind":"done"}])
      ```
      The `frontend` worker won't start until `backend` writes its minted
-     done key — you manage no key strings yourself.
+     done key — you manage no key strings yourself. If several `backend`
+     workers are already live, `consumes` waits for **all** of them.
 
    验收门(done_checks,默认关闭的 opt-in 机制):worker 写 handoff key
    只是「自称完成」。如果某个角色在 manifest 里声明了 `done_checks`
@@ -359,6 +361,7 @@ c. **Decision tree**:
    | Situation | Action |
    |---|---|
    | Worker shipped its handoff_signal as expected | In the Task Ledger's **Plan (DAG)**, flip that step's checkbox from `- [ ]` to `- [x]` (don't just note it elsewhere — the UI renders these checkboxes literally, so an unchecked-but-done step reads as unfinished). If downstream step has all deps met, spawn next worker(s). |
+   | Wake key ends with `.error` / `.failed` | Producer exited without delivering. Read that key. You MAY `swarm_spawn_worker` the **same role** once with a tighter brief — the server mints a new instance key, it will not overwrite the dead worker's (empty) class/instance path. Don't empty-wait for the dead key. Don't loop a third replacement of the same instance. If the task itself is wrong, replan the DAG instead of respawning. |
    | Worker shipped something wrong / incomplete | Spawn a `fixer` worker with corrective prompt, OR re-spawn same role with revised prompt. |
    | Worker is stuck (no movement >5min) | Send it a `swarm_send_message` nudge with specific question. Don't immediately kill. |
    | All Acceptance criteria met | Send user the final "全部搞定" message with file paths / commands. Make sure EVERY step in the Task Ledger's **Plan (DAG)** is checked `- [x]` (no `- [ ]` left behind — a done plan with an unchecked box contradicts the all_done status in the UI). **Set Progress Ledger `Status: all_done`** — this is the terminal marker the server reads to skip re-spawning a finished workspace on restart (no wasted LLM turn). |

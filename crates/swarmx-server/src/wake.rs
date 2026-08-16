@@ -37,11 +37,11 @@
 use anyhow::{anyhow, Result};
 #[allow(unused_imports)] // used by wake tests' live_pty_slot signatures
 use bytes::Bytes;
-use swarmx_protocol::ws_swarm::SwarmEvent;
-use swarmx_swarm::{NewMessage, Swarm};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use dashmap::DashMap;
+use swarmx_protocol::ws_swarm::SwarmEvent;
+use swarmx_swarm::{NewMessage, Swarm};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
 
@@ -132,6 +132,21 @@ fn base_key_aliases(path: &str) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+/// Mailbox / kick prose for a blackboard wake. Failure aliases (`.error` /
+/// `.failed`) are not "an update" — they are the replan signal: same-role
+/// replacement spawn is allowed because Handoff mints a new instance key.
+pub fn wake_mailbox_body(key: &str) -> String {
+    if let Some(base) = base_key_aliases(key).into_iter().next() {
+        format!(
+            "失败：`{key}`（上游 `{base}` 没交付就退出了）。等待方走失败路径，不要空等变绿。\
+             规划可再 swarm_spawn_worker 同角色顶上一次——server 会 mint 新 instance key，\
+             不会覆盖已有产物。先读 `{key}` 看谁挂了。"
+        )
+    } else {
+        format!("共享区 `{key}` 有更新，请查看")
+    }
 }
 
 /// Inserts `agent_id → keys` into the subscription table. No-op when
@@ -315,7 +330,7 @@ pub async fn inject_wake_kick(
     agent_id: &str,
     key: &str,
 ) -> Result<()> {
-    let kick_text = format!("共享区 `{key}` 有更新，请查看");
+    let kick_text = wake_mailbox_body(key);
     inject_with_kick_text(registry, server_url, agent_id, &kick_text, key, None).await
 }
 
@@ -371,7 +386,16 @@ pub async fn deliver_manual_wake(
     // intervention worth recording), distinct from the high-volume
     // auto blackboard wakes the UI filters out.
     let meta = serde_json::json!({ "subtype": "wake", "reason": "manual" });
-    deliver_wake_with_body(swarm, registry, server_url, target, body, meta, "manual wake").await
+    deliver_wake_with_body(
+        swarm,
+        registry,
+        server_url,
+        target,
+        body,
+        meta,
+        "manual wake",
+    )
+    .await
 }
 
 /// Shared delivery engine behind `deliver_manual_wake` and the W2-1 verify
@@ -420,7 +444,11 @@ async fn deliver_wake_with_body(
     // kick's turn / the engine's post-turn drain / the next Stop hook.
     let lock = kick_lock_for(target);
     let Ok(_kick) = lock.try_lock() else {
-        tracing::debug!(target, label, "wake coalesced with an in-flight kick (mailbox delivered)");
+        tracing::debug!(
+            target,
+            label,
+            "wake coalesced with an in-flight kick (mailbox delivered)"
+        );
         return Ok(());
     };
 
@@ -811,10 +839,7 @@ impl WakeCoordinator {
                 swarm.unregister_agent(&agent_id);
                 unregister_wake_subs(&subs, &agent_id).await;
                 unregister_exit_key(&exit_keys, &agent_id).await;
-                if let Err(e) = store
-                    .record_agent_kill(agent_id.clone(), now_ms())
-                    .await
-                {
+                if let Err(e) = store.record_agent_kill(agent_id.clone(), now_ms()).await {
                     tracing::warn!(?e, agent = %agent_id, "auto-kill: record_agent_kill failed");
                 }
                 swarm.publish_event(SwarmEvent::AgentState {
@@ -1158,9 +1183,16 @@ async fn verify_gate_before_kill(
             "key": signal,
             "attempt": attempts,
         });
-        if let Err(e) =
-            deliver_wake_with_body(swarm, registry, server_url, agent_id, &body, meta, "verify bounce")
-                .await
+        if let Err(e) = deliver_wake_with_body(
+            swarm,
+            registry,
+            server_url,
+            agent_id,
+            &body,
+            meta,
+            "verify bounce",
+        )
+        .await
         {
             // Fail-loud even here: the row failed to persist, so the ONLY
             // record of the bounce is this log line.
@@ -1174,7 +1206,12 @@ async fn verify_gate_before_kill(
 /// Write the wake mailbox note (source of truth) for `(target, key)`. Returns
 /// `false` when the agent is paused (auto-wakes are swallowed, mailbox NOT
 /// written) or the write failed — in both cases the caller skips the kick.
-async fn write_wake_mailbox(swarm: &Arc<Swarm>, registry: &Registry, target: &str, key: &str) -> bool {
+async fn write_wake_mailbox(
+    swarm: &Arc<Swarm>,
+    registry: &Registry,
+    target: &str,
+    key: &str,
+) -> bool {
     // M-pause: if the operator paused this agent, swallow auto-wakes. The
     // mailbox is intentionally NOT written either — paused means "leave me
     // alone, don't accumulate noise I'll have to hand-trim on resume." On resume
@@ -1194,7 +1231,7 @@ async fn write_wake_mailbox(swarm: &Arc<Swarm>, registry: &Registry, target: &st
         from_agent: "system".into(),
         to_agent: target.into(),
         kind: "wake".into(),
-        body: format!("共享区 `{key}` 有更新，请查看"),
+        body: wake_mailbox_body(key),
         sent_at: now,
         in_reply_to: None,
         // Auto wake fired by a blackboard change → redundant with the
@@ -1271,7 +1308,7 @@ async fn kick_agent(
         };
         crate::reasonix_serve::wake_reason(consumed.max(1) as i64)
     } else {
-        format!("共享区 `{key}` 有更新，请查看")
+        wake_mailbox_body(key)
     };
 
     match crate::input_delivery::deliver_wake_turn(
@@ -1314,10 +1351,7 @@ async fn kick_agent(
         Err(err) => {
             tracing::warn!(?err, target, key, "wake kick failed");
             // PTY-missing / agent-gone: drop stale subscription so we don't churn.
-            if matches!(
-                delivery,
-                crate::input_delivery::LiveDelivery::Keystroke
-            ) {
+            if matches!(delivery, crate::input_delivery::LiveDelivery::Keystroke) {
                 unregister_wake_subs(subs, target).await;
             }
         }
@@ -1409,7 +1443,10 @@ mod tests {
             "concurrent same-agent kick must be skipped (single-flight)"
         );
         drop(held);
-        assert!(lock.try_lock().is_ok(), "after release, next kick may proceed");
+        assert!(
+            lock.try_lock().is_ok(),
+            "after release, next kick may proceed"
+        );
     }
 
     #[test]
@@ -1964,7 +2001,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(msgs.len(), 1, "one bounce message");
-        assert!(msgs[0].body.contains("VERIFY GATE"), "got: {}", msgs[0].body);
+        assert!(
+            msgs[0].body.contains("VERIFY GATE"),
+            "got: {}",
+            msgs[0].body
+        );
         assert!(
             msgs[0].body.contains("re-write") && msgs[0].body.contains("ws/a.done"),
             "the bounce names the key to re-deliver: {}",
@@ -2271,6 +2312,25 @@ mod tests {
         // anyone subscribed to. Empty Vec → no fan-out.
         assert!(base_key_aliases(".error").is_empty());
         assert!(base_key_aliases(".failed").is_empty());
+    }
+
+    #[test]
+    fn wake_mailbox_body_success_vs_failure() {
+        assert_eq!(
+            wake_mailbox_body("ws/t/researcher.done"),
+            "共享区 `ws/t/researcher.done` 有更新，请查看"
+        );
+        let fail = wake_mailbox_body("ws/t/researcher.a4f1fcf3.done.error");
+        assert!(fail.contains("失败"), "{fail}");
+        assert!(
+            fail.contains("ws/t/researcher.a4f1fcf3.done.error"),
+            "{fail}"
+        );
+        assert!(fail.contains("instance key"), "{fail}");
+        assert!(!fail.contains("有更新"), "{fail}");
+        let failed = wake_mailbox_body("ws/t/backend.done.failed");
+        assert!(failed.contains("失败"), "{failed}");
+        assert!(failed.contains("ws/t/backend.done"), "{failed}");
     }
 
     #[test]
