@@ -58,3 +58,15 @@ How a *running* Agent accepts turns (zulu serve / reasonix serve / opencode TUI
 they do not re-derive the channel from `serve_http_port` / `tui_http_port` /
 `zulu` — those Options are handles only, and zulu and reasonix share
 `serve_http_port`. Implementation detail of TurnDelivery — not a public seam.
+
+## SwarmProjection
+
+In-memory reduction of `/ws/swarm`. One snapshot (live messages/read, activity,
+stages, reasoning, user-unread, generation counters). Views read fields or gens;
+they do not each re-reduce `SwarmEvent`. Agent roster and workspaces stay REST.
+The pump is immortal for the dashboard lifetime — tearing it down on route
+change is how Chat and SwarmPanel drifted. Raw `useSwarmFeed` remains only for
+adapters that must see the event itself (notifications, wizard scan-done,
+desktop notify).
+Unread hydrate: REST is truth for ids it returned; live-only unread (socket
+counted, last-N window missed) is kept. A message id is counted at most once.

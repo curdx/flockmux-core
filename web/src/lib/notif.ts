@@ -11,7 +11,28 @@
 import type { MessageMeta, Workspace } from "@/api/types";
 import { resolveRole } from "@/lib/agent";
 
+/** Shared with the bell badge so popover / center / red-dot never drift. */
+export const NOTIF_READ_KEY = "swarmx:notif:read:v1";
+export const NOTIF_READ_EVENT = "swarmx:notif-read";
+
 type Tr = (k: string, opts?: Record<string, unknown>) => string;
+
+export function isNoisyBlackboard(path: string): boolean {
+  return path.endsWith(".progress.md");
+}
+
+export function blackboardWorkspaceId(path: string): string | undefined {
+  const segs = path.split("/").filter(Boolean);
+  return segs.length >= 3 ? segs[0] : undefined;
+}
+
+export function notifyNotifReadChanged(): void {
+  try {
+    window.dispatchEvent(new Event(NOTIF_READ_EVENT));
+  } catch {
+    /* ignore */
+  }
+}
 
 /** Human label for an agent id in a notification: "你"/"系统" for the
  *  user/system pseudo-agents, else the role ("orchestrator", "Backend
@@ -90,12 +111,15 @@ export function humanizeBlackboard(
   }
   const [wsid, slug] = segs;
   const file = segs.slice(2).join("/");
+  const leaf = segs[segs.length - 1] ?? "";
   const title =
     file === "task.ledger.md"
       ? t("notifications.bb.taskLedger")
       : file === "progress.ledger.md"
         ? t("notifications.bb.progressLedger")
-        : t("notifications.bb.update", { name: segs[segs.length - 1] });
+        : leaf.endsWith(".error") || leaf === "error"
+          ? t("notifications.bb.failed")
+          : t("notifications.bb.update", { name: leaf });
   // Prefer an exact workspace-id match; fall back to locating the direction by
   // its (workspace-unique) slug so this still resolves if the id scheme drifts.
   const ws =

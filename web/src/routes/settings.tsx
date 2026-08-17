@@ -59,6 +59,13 @@ import {
 } from "lucide-react";
 import { toast } from "@/lib/toast";
 import { ApiError } from "@/api/http";
+import {
+  clearStats,
+  readStats,
+  setTelemetryDisabled,
+  track,
+  type StatsBlob,
+} from "@/lib/telemetry";
 import { Button } from "@/components/ui/button";
 import {
   checkForUpdate,
@@ -83,6 +90,7 @@ import {
 } from "@/components/ConfirmActionDialog";
 import { cn } from "@/lib/cn";
 import { formatShortcutChord, getClientPlatformInfo } from "@/lib/platform";
+import { isTauriWindow } from "@/lib/tauriWindowChrome";
 
 const STORAGE_KEY = "swarmx:settings:v1";
 
@@ -95,6 +103,8 @@ interface SettingsState {
   openMainOnLaunch: boolean;
   desktopNotify: boolean;
   killOthersOnFail: boolean;
+  /** R3:实验室功能总开关(竞赛/多模对比),默认 OFF。lib/appSettings.ts 只读。 */
+  labFeatures: boolean;
 }
 
 const DEFAULTS: SettingsState = {
@@ -103,6 +113,7 @@ const DEFAULTS: SettingsState = {
   openMainOnLaunch: true,
   desktopNotify: true,
   killOthersOnFail: false,
+  labFeatures: false,
 };
 
 function loadSettings(): SettingsState {
@@ -340,12 +351,14 @@ function GeneralPanel({
         hint={t("settings.general.launchHint")}
       >
         <div className="flex flex-col gap-3">
-          <ToggleRow
-            label={t("settings.general.openMain")}
-            hint={t("settings.general.openMainHint")}
-            value={settings.openMainOnLaunch}
-            onChange={(v) => update("openMainOnLaunch", v)}
-          />
+          {isTauriWindow() && (
+            <ToggleRow
+              label={t("settings.general.openMain")}
+              hint={t("settings.general.openMainHint")}
+              value={settings.openMainOnLaunch}
+              onChange={(v) => update("openMainOnLaunch", v)}
+            />
+          )}
           <ToggleRow
             label={t("settings.general.desktopNotify")}
             hint={t("settings.general.desktopNotifyHint")}
@@ -364,6 +377,30 @@ function GeneralPanel({
           hint={t("settings.general.killOthersHint")}
           value={settings.killOthersOnFail}
           onChange={(v) => update("killOthersOnFail", v)}
+        />
+      </Field>
+
+      {/* R3 形态收敛:竞赛/多模对比默认藏进实验室,陌生人先只看到核心循环。
+          关掉时 tab 栏隐藏 + 深链给诚实空态(LabGate),功能本身不删。 */}
+      <Field
+        label={t("settings.general.lab", { defaultValue: "实验室功能" })}
+        hint={t("settings.general.labFieldHint", {
+          defaultValue: "实验中的功能，默认关闭",
+        })}
+      >
+        <ToggleRow
+          label={t("settings.general.labToggle", {
+            defaultValue: "显示实验室功能",
+          })}
+          hint={t("settings.general.labToggleHint", {
+            defaultValue:
+              "开启后，工作区顶部会出现「竞赛」「多模对比」标签；随时可关，功能数据不受影响。",
+          })}
+          value={settings.labFeatures}
+          onChange={(v) => {
+            update("labFeatures", v);
+            track(v ? "settings.lab.on" : "settings.lab.off");
+          }}
         />
       </Field>
     </div>
@@ -1404,6 +1441,58 @@ function PrivacyPanel() {
   const { t } = useTranslation();
   const [toast, setToast] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<ConfirmActionState | null>(null);
+  // R9 本机统计的读出。存取全在 lib/telemetry.ts(localStorage,不上传);
+  // 这里只是快照 + 操作后重读。
+  const [stats, setStats] = useState<StatsBlob>(() => readStats());
+  const refreshStats = () => setStats(readStats());
+
+  /** 事件名 → 人话标签。未来新增的事件没有标签就原样显示,不藏。 */
+  const statsEventLabel = (event: string): string => {
+    const map: Record<string, { key: string; fb: string }> = {
+      "palette.open": {
+        key: "settings.privacy.statsEvent.paletteOpen",
+        fb: "打开命令面板",
+      },
+      "report.export": {
+        key: "settings.privacy.statsEvent.reportExport",
+        fb: "导出战报",
+      },
+      "settings.lab.on": {
+        key: "settings.privacy.statsEvent.labOn",
+        fb: "开启实验室功能",
+      },
+      "settings.lab.off": {
+        key: "settings.privacy.statsEvent.labOff",
+        fb: "关闭实验室功能",
+      },
+      "tab.chat": {
+        key: "settings.privacy.statsEvent.tabChat",
+        fb: "切换到「对话」标签",
+      },
+      "tab.dag": {
+        key: "settings.privacy.statsEvent.tabDag",
+        fb: "切换到「协作图」标签",
+      },
+      "tab.ledger": {
+        key: "settings.privacy.statsEvent.tabLedger",
+        fb: "切换到「工作记录」标签",
+      },
+      "tab.fusion": {
+        key: "settings.privacy.statsEvent.tabFusion",
+        fb: "切换到「竞赛」标签",
+      },
+      "tab.consult": {
+        key: "settings.privacy.statsEvent.tabConsult",
+        fb: "切换到「多模对比」标签",
+      },
+      "tab.replays": {
+        key: "settings.privacy.statsEvent.tabReplays",
+        fb: "切换到「录像」标签",
+      },
+    };
+    const meta = map[event];
+    return meta ? t(meta.key, { defaultValue: meta.fb }) : event;
+  };
 
   const exportJson = () => {
     const data: Record<string, unknown> = {};
@@ -1466,6 +1555,89 @@ function PrivacyPanel() {
           <span className="font-mono text-xs text-foreground-primary">
             {t("settings.privacy.approvalCurrent")}
           </span>
+        </div>
+      </Field>
+
+      <Field
+        label={t("settings.privacy.statsTitle", { defaultValue: "本机统计" })}
+        hint={t("settings.privacy.statsHint", {
+          defaultValue: "使用计数只存在本机，从不上传。",
+        })}
+      >
+        <div className="flex flex-col gap-3">
+          <ToggleRow
+            label={t("settings.privacy.statsCollect", {
+              defaultValue: "收集使用计数",
+            })}
+            hint={t("settings.privacy.statsCollectHint", {
+              defaultValue:
+                "只记次数（例如打开命令面板的次数），不含任何内容；只存在本机，从不上传。关闭后不再记录。",
+            })}
+            value={!stats.disabled}
+            onChange={(v) => {
+              setTelemetryDisabled(!v);
+              refreshStats();
+            }}
+          />
+          <div className="rounded-lg border border-border-subtle bg-surface-elevated px-4 py-3">
+            {Object.keys(stats.total).length === 0 ? (
+              <p className="font-caption text-xs text-foreground-tertiary">
+                {t("settings.privacy.statsEmpty", {
+                  defaultValue: "还没有任何记录。",
+                })}
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-1.5">
+                {Object.entries(stats.total)
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([event, count]) => (
+                    <li
+                      key={event}
+                      className="flex items-baseline justify-between gap-3"
+                    >
+                      <span className="font-caption text-xs text-foreground-secondary">
+                        {statsEventLabel(event)}
+                      </span>
+                      <span className="font-mono text-xs text-foreground-primary">
+                        {count}
+                      </span>
+                    </li>
+                  ))}
+              </ul>
+            )}
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="self-start"
+            disabled={Object.keys(stats.total).length === 0}
+            onClick={() =>
+              setConfirm({
+                title: t("settings.privacy.statsClearTitle", {
+                  defaultValue: "清零本机统计",
+                }),
+                description: t("settings.privacy.statsClearConfirm", {
+                  defaultValue:
+                    "删除所有已记录的使用计数，此操作不可撤销。「收集开关」不受影响。",
+                }),
+                confirmLabel: t("settings.privacy.statsClear", {
+                  defaultValue: "清零",
+                }),
+                variant: "destructive",
+                onConfirm: () => {
+                  clearStats();
+                  refreshStats();
+                  setToast(
+                    t("settings.privacy.statsCleared", {
+                      defaultValue: "本机统计已清零",
+                    }),
+                  );
+                },
+              })
+            }
+          >
+            {t("settings.privacy.statsClear", { defaultValue: "清零" })}
+          </Button>
         </div>
       </Field>
 

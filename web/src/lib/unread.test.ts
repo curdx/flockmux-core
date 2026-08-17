@@ -28,4 +28,8 @@ describe("countsAsUserUnread — canonical user-unread predicate", () => {
   it("still counts an agent reply that carries unrelated meta", () => {
     expect(countsAsUserUnread("claude-abc", "reply", { reason: "manual" })).toBe(true);
   });
+
+  it("excludes cron prompts (they are operator instructions, not chat)", () => {
+    expect(countsAsUserUnread("cron", "note", null)).toBe(false);
+  });
 });

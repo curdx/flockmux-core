@@ -82,13 +82,14 @@ import {
   type EmptyStateCliReadiness,
 } from "@/components/chat/EmptyState";
 import { SystemCard } from "@/components/chat/SystemCard";
-import { getClientPlatformInfo } from "@/lib/platform";
+import { formatShortcutChord, getClientPlatformInfo } from "@/lib/platform";
 import {
   buildRows,
   formatClock,
   formatDivider,
   formatElapsed,
   formatFullStamp,
+  isOperatorChatNoise,
   resolveRole,
 } from "../lib/messageRows";
 import { useRoleLookup } from "../lib/useRoleLookup";
@@ -233,7 +234,7 @@ export function MessagesPanel({
   emptyStateOverride,
 }: Props) {
   const aliveForInference = allAliveAgents ?? activeMembers;
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [items, setItems] = useState<MessageRecord[]>([]);
   const [filter, setFilter] = useState("");
   const [filterOpen, setFilterOpen] = useState(false);
@@ -277,6 +278,9 @@ export function MessagesPanel({
   const listRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef<Map<number, HTMLDivElement | null>>(new Map());
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  // 消息搜索框:⌘F/Ctrl+F 聚焦用(autoFocus 只管首次挂载,管不到"已开着
+  // 但焦点不在"的再按一次)。
+  const filterInputRef = useRef<HTMLInputElement>(null);
   const [highlightId, setHighlightId] = useState<number | null>(null);
 
   // NeedsYouBar：死掉的 handoff 不打开尸体抽屉，改发这个事件把焦点拉回输入框。
@@ -572,6 +576,7 @@ export function MessagesPanel({
   const visible = useMemo(() => {
     const f = filter.toLowerCase();
     const filtered = items.filter((m) => {
+      if (isOperatorChatNoise(m)) return false;
       if (!passesScope(m)) return false;
       if (!f) return true;
       return (
@@ -861,6 +866,20 @@ export function MessagesPanel({
     setBody((b) => b.replace(/@(\S*)$/, `@${a.role} `));
     requestAnimationFrame(() => composerRef.current?.focus());
   };
+  // @mention 键盘导航:活跃下标 + Esc dismiss。Esc 只藏弹层(不动已输入的
+  // @token);query 一变(继续敲字/删掉 @/选中完成)就自动复位 —— Slack 同款。
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [mentionDismissed, setMentionDismissed] = useState(false);
+  useEffect(() => {
+    setMentionIndex(0);
+    setMentionDismissed(false);
+  }, [mentionQuery]);
+  const mentionOpen = mentionMatches.length > 0 && !mentionDismissed;
+  // activeMembers 可能在弹层开着时刷新(成员上/下线使候选变短),下标钳回界内。
+  const activeMentionIdx = Math.min(
+    mentionIndex,
+    Math.max(0, mentionMatches.length - 1),
+  );
 
   const send = async () => {
     const trimmed = body.trim();
@@ -1294,12 +1313,65 @@ export function MessagesPanel({
     await send();
   };
 
+  // ⌘F(mac)/Ctrl+F 打开并聚焦消息搜索。挂在面板根 div 的冒泡阶段而不是
+  // window —— 焦点在聊天面板外(终端/其他面板)时,浏览器原生查找不受影响。
+  const openFilterSearch = () => {
+    setFilterOpen(true);
+    // input 的 autoFocus 只覆盖首次挂载;已开着时再按 ⌘F = 重新聚焦并全选
+    // 现有 query(浏览器查找框的惯例)。
+    requestAnimationFrame(() => {
+      filterInputRef.current?.focus();
+      filterInputRef.current?.select();
+    });
+  };
+  const closeFilterSearch = () => {
+    // 与 ✕ 按钮同语义(清空 + 关闭):藏着生效过滤的消息列表看起来像丢消息。
+    setFilter("");
+    setFilterOpen(false);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  };
+  const onPanelKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (
+      (e.metaKey || e.ctrlKey) &&
+      !e.shiftKey &&
+      !e.altKey &&
+      (e.key === "f" || e.key === "F")
+    ) {
+      e.preventDefault();
+      openFilterSearch();
+    }
+  };
+
   const onComposerKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Universal chat convention: Enter sends, Shift+Enter inserts a newline.
     // On touch-first platforms the soft keyboard already exposes an explicit
     // send affordance, so Enter should stay as newline instead of surprise-send.
     const platform = getClientPlatformInfo();
     if (platform.isMobileLike) return;
+    // @mention 弹层开着时键盘先服务弹层:↑/↓ 移动活跃项、Enter/Tab 选中、
+    // Esc 仅藏弹层。Enter 只在此时是「选中成员」;弹层关着时发送行为不变。
+    // isComposing(IME 组词中)整体放行:↑/↓/Enter/Esc 都是输入法在候选窗里的
+    // 按键,既不是选 mention 也不是发送。
+    if (mentionOpen && !e.nativeEvent.isComposing) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const delta = e.key === "ArrowDown" ? 1 : -1;
+        setMentionIndex(
+          (i) => (i + delta + mentionMatches.length) % mentionMatches.length,
+        );
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMentionDismissed(true);
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        pickMention(mentionMatches[activeMentionIdx]);
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       // ⌘/Ctrl+Enter while the captain is mid-reply interrupts it first, then
@@ -1371,7 +1443,10 @@ export function MessagesPanel({
     // — not the page — absorbs overflow. `h-full` forced 100% of the parent
     // regardless of siblings, pushing the composer below the viewport once
     // the plan card appeared (the "no input box" bug).
-    <div className="flex min-h-0 flex-1 flex-col bg-surface-primary">
+    <div
+      className="flex min-h-0 flex-1 flex-col bg-surface-primary"
+      onKeyDown={onPanelKeyDown}
+    >
       {/* ── slim top bar ─────────────────────────────────────────────── */}
       {/* No own border-b: the WorkspaceToolbar's divider directly above is
           the canonical header separator. A second hairline 36px below it
@@ -1384,9 +1459,17 @@ export function MessagesPanel({
             <Search className="size-3.5 text-foreground-tertiary" />
             <input
               autoFocus
+              ref={filterInputRef}
               name="message-filter"
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
+              onKeyDown={(e) => {
+                // Esc = 等价点 ✕(清空 + 关闭),再把焦点还给输入框。
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  closeFilterSearch();
+                }
+              }}
               placeholder={t("messages.filter")}
               className="min-w-0 flex-1 bg-transparent text-xs text-foreground-primary placeholder:text-foreground-tertiary focus:outline-none"
             />
@@ -1418,7 +1501,10 @@ export function MessagesPanel({
               variant="ghost"
               size="icon"
               onClick={() => setFilterOpen(true)}
-              title={t("messages.filter")}
+              title={t("messages.filterWithShortcut", {
+                chord: formatShortcutChord("F", platform),
+                defaultValue: "搜索消息 ({{chord}})",
+              })}
               className="size-8 text-foreground-tertiary"
             >
               <Search className="size-3.5" />
@@ -1599,7 +1685,7 @@ export function MessagesPanel({
                       className={cn(
                         highlighted && "rounded-lg ring-1 ring-accent-primary",
                       )}
-                      title={`#${m.id} · ${m.kind} · ${formatFullStamp(m.sent_at)}`}
+                      title={`#${m.id} · ${m.kind} · ${formatFullStamp(m.sent_at, i18n.language)}`}
                     >
                       <SystemCard
                         message={m}
@@ -1636,7 +1722,7 @@ export function MessagesPanel({
                       else rowRefs.current.delete(m.id);
                     }}
                     className="group/msg mx-auto flex w-full flex-col items-end px-6 py-2.5"
-                    title={`#${m.id} · ${m.kind} · ${formatFullStamp(m.sent_at)}`}
+                    title={`#${m.id} · ${m.kind} · ${formatFullStamp(m.sent_at, i18n.language)}`}
                   >
                     <div className="mb-1 flex items-center gap-2 pr-1">
                       <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover/msg:opacity-100">
@@ -1652,7 +1738,7 @@ export function MessagesPanel({
                         {t("messages.you")}
                       </span>
                       <span className="font-caption text-[10.5px] tabular-nums text-foreground-tertiary">
-                        {formatClock(m.sent_at)}
+                        {formatClock(m.sent_at, i18n.language)}
                       </span>
                     </div>
                     <div className="flex max-w-[min(86%,600px)] flex-col items-end">
@@ -1706,7 +1792,7 @@ export function MessagesPanel({
                     else rowRefs.current.delete(m.id);
                   }}
                   className="group/msg mx-auto grid w-full grid-cols-[36px_minmax(0,1fr)] gap-3 px-6 py-2.5"
-                  title={`#${m.id} · ${m.kind} · ${formatFullStamp(m.sent_at)}`}
+                  title={`#${m.id} · ${m.kind} · ${formatFullStamp(m.sent_at, i18n.language)}`}
                 >
                   <div className="flex justify-center pt-1">
                     <button
@@ -1735,7 +1821,7 @@ export function MessagesPanel({
                         </span>
                       )}
                       <span className="font-caption text-[10.5px] tabular-nums text-foreground-tertiary">
-                        {formatClock(m.sent_at)}
+                        {formatClock(m.sent_at, i18n.language)}
                       </span>
                       {isUnread && (
                         <span
@@ -1934,18 +2020,32 @@ export function MessagesPanel({
           </div>
         )}
         {/* @mention autocomplete — appears while typing `@<token>` at the end
-            of the input; selecting routes the message to that worker. */}
-        {mentionMatches.length > 0 && (
-          <div className="mb-1 overflow-hidden rounded-lg border border-border-subtle bg-surface-elevated shadow-lg">
-            {mentionMatches.map((a) => (
+            of the input; selecting routes the message to that worker.
+            键盘:↑/↓ 移动活跃项、Enter/Tab 选中、Esc 仅藏弹层;鼠标点选不变。 */}
+        {mentionOpen && (
+          <div
+            id="mention-listbox"
+            role="listbox"
+            aria-label={t("messages.mentionListboxLabel", {
+              defaultValue: "选择要 @ 的成员",
+            })}
+            className="mb-1 overflow-hidden rounded-lg border border-border-subtle bg-surface-elevated shadow-lg"
+          >
+            {mentionMatches.map((a, i) => (
               <button
                 key={a.agent_id}
+                id={`mention-option-${a.agent_id}`}
+                role="option"
+                aria-selected={i === activeMentionIdx}
                 type="button"
                 onMouseDown={(e) => {
                   e.preventDefault();
                   pickMention(a);
                 }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-surface-tertiary"
+                className={cn(
+                  "flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-surface-tertiary",
+                  i === activeMentionIdx && "bg-surface-tertiary",
+                )}
               >
                 <span className="font-medium text-foreground-primary">@{a.role}</span>
                 <span className="font-mono text-[10px] text-foreground-tertiary">
@@ -1990,6 +2090,14 @@ export function MessagesPanel({
               onPaste={onComposerPaste}
               onDrop={onComposerDrop}
               aria-label={t("messages.composerLabel")}
+              // @mention 弹层的 activedescendant:textarea 隐式 textbox 角色
+              // 允许持有它;弹层关闭时两个属性都不渲染(避免指向不存在的节点)。
+              aria-controls={mentionOpen ? "mention-listbox" : undefined}
+              aria-activedescendant={
+                mentionOpen
+                  ? `mention-option-${mentionMatches[activeMentionIdx].agent_id}`
+                  : undefined
+              }
               placeholder={composerPlaceholder}
               disabled={!canCompose}
               minRows={1}
@@ -2135,11 +2243,12 @@ export function MessagesPanel({
 }
 
 function TimeDivider({ ms }: { ms: number }) {
+  const { i18n } = useTranslation();
   return (
     <div className="my-2 flex w-full items-center gap-2">
       <span className="h-px flex-1 bg-border-subtle" />
       <span className="font-caption text-[10px] tabular-nums text-foreground-tertiary">
-        {formatDivider(ms)}
+        {formatDivider(ms, i18n.language)}
       </span>
       <span className="h-px flex-1 bg-border-subtle" />
     </div>

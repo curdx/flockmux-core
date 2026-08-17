@@ -4,6 +4,7 @@ import type { MessageMeta } from "../api/types";
  *  the USER's unread badge?". A message counts only if it's a real agent→user
  *  reply, NOT:
  *    - coordination noise (`kind === "wake"`),
+ *    - cron prompts (`from === "cron"`),
  *    - a system event card (`from === "system"`),
  *    - a worker's delivery card (`meta.subtype === "completion"`, which renders
  *      as a status card via SystemCard, not an unread "message").
@@ -26,6 +27,7 @@ export function countsAsUserUnread(
 ): boolean {
   return (
     fromAgent !== "system" &&
+    fromAgent !== "cron" &&
     kind !== "wake" &&
     meta?.subtype !== "completion"
   );

@@ -1,9 +1,15 @@
 import * as React from "react"
 import { Dialog as DialogPrimitive } from "radix-ui"
+import { useTranslation } from "react-i18next"
+import { XIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
-import { XIcon } from "lucide-react"
+
+function CloseLabel() {
+  const { t } = useTranslation()
+  return <span className="sr-only">{t("common.close")}</span>
+}
 
 function Dialog({
   ...props
@@ -72,9 +78,8 @@ function DialogContent({
               className="absolute top-2 right-2"
               size="icon-sm"
             >
-              <XIcon
-              />
-              <span className="sr-only">Close</span>
+              <XIcon />
+              <CloseLabel />
             </Button>
           </DialogPrimitive.Close>
         )}

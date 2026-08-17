@@ -231,6 +231,8 @@ pub struct AgentInfo {
 pub struct AgentActivityRecord {
     pub agent_id: String,
     /// "tool" | "system" — mirrors `SwarmEvent::AgentActivity::kind`.
+    /// ("watchdog" nudges are live-only: they are published, never recorded
+    /// into the tailer's ring this endpoint backfills from.)
     pub kind: String,
     /// One-line human label, e.g. `Edit src/foo.rs`.
     pub label: String,

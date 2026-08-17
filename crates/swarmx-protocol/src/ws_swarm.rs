@@ -81,7 +81,9 @@ pub enum SwarmEvent {
     AgentActivity {
         agent_id: String,
         /// "tool" (a real tool call) | "system" (compacting context, wrapping
-        /// up, waiting…). Open string so callers can extend later.
+        /// up, waiting…, server-side error marks) | "watchdog" (an S5
+        /// stuck-watchdog nudge — 系统正在唤醒它). Open string so callers can
+        /// extend later.
         kind: String,
         /// Human-facing one-liner, e.g. `Edit src/foo.rs` or `整理上下文`.
         label: String,
@@ -120,6 +122,22 @@ pub enum SwarmEvent {
         /// "shim_ready" | "mcp_ready" | "bootstrap_injected". Open string so
         /// future stages don't need a schema bump.
         stage: String,
+        at: i64,
+    },
+    /// A workspace's budget brake changed state: TRIPPED (estimated all-time
+    /// spend crossed the cap → the server paused the workspace's live agents)
+    /// or LIFTED (budget raised above the estimate, or cleared → the agents
+    /// the brake paused get resumed). Subscribers refetch
+    /// `GET /api/workspaces/:id/budget` instead of caching the numbers. Every
+    /// amount here is an ESTIMATE from transcript scraping, never the
+    /// subscription invoice.
+    BudgetChanged {
+        workspace_id: String,
+        exceeded: bool,
+        /// The cap now in force (None = unlimited / cleared).
+        budget_usd: Option<f64>,
+        /// Estimated all-time spend at event time.
+        cost_usd: f64,
         at: i64,
     },
 }

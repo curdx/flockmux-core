@@ -1,5 +1,10 @@
 /**
- * CreateWizard — 极简两步：起名字 + 选项目文件夹。
+ * CreateWizard — 极简三步：确认引擎能干活 + 起名字 + 选项目文件夹。
+ *
+ * 步 1 引擎体检 (UX-006)：「已安装」≠「能干活」—— 没登录的引擎要到派活时
+ * 才露馅，是 onboarding 头号杀手。所以开工前先摆出诚实四态（未安装 / 已安装
+ * 未验证 / 需登录 / 可干活）；全部不能干活时拦住「开始」并说明原因，和 footer
+ * 既有的"为什么还点不了"是同一套诚实逻辑。
  *
  * UI 走 shadcn primitives (Dialog / Button / Input / Label)。Dialog 自带
  * focus trap + portal + aria-modal + ESC 关闭。我们额外禁掉 backdrop 点
@@ -23,22 +28,29 @@ import {
   ChevronDown,
   ChevronRight,
   Check,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
   Folder,
   FolderOpen,
   FolderPlus,
   Layers3,
   Loader2,
+  PlugZap,
   Plus,
+  RefreshCw,
   Trash2,
 } from "lucide-react";
 import { api, ApiError } from "../../api/http";
-import type { CliPluginInfo, SpellInfo, SwarmEvent, Workspace } from "../../api/types";
+import type { CliPluginInfo, EngineReadiness, SpellInfo, SwarmEvent, Workspace } from "../../api/types";
 import { useSwarmFeed } from "../../hooks/useSwarmFeed";
+import { useEngineReadiness, type EngineReadinessState } from "../../hooks/useEngineReadiness";
 import {
   ACCENT_OPTIONS,
   isScanDoneBlackboardPath,
 } from "../../lib/workspace";
 import { notifySpawnFallbacks } from "../../lib/engineFallback";
+import { engineStatusKey } from "../../lib/engineEvidence";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -204,6 +216,11 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
   const submittingRef = useRef(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // 步 1 引擎体检 (UX-006)。组件只在 wizard 打开时才挂载（调用方都是
+  // `wizardOpen && <CreateWizard/>`)，所以 hook 的首次拉取不会白跑；
+  // 真实检测（几十秒）只在用户点「重新检测」时触发，绝不自动探测。
+  const readiness = useEngineReadiness();
+
   // useSwarmFeed 必须无条件调用 — 但只在 scan 进行中才处理事件。
   // ref 让 onEvent 闭包永远拿到最新的 scan 引用，不重开 WS。
   const scanRef = useRef<ScanState | null>(null);
@@ -286,13 +303,32 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
   const attachedErrorCount = dirs.filter(
     (d) => d.id !== 0 && d.path.trim() && pathChecks[d.id]?.state === "error",
   ).length;
+  // 门禁哲学：至少一个引擎「可干活 / 已安装未验证」就放行（未验证是诚实中态，
+  // 不是红）；全部「未安装 / 需登录 / 无法启动」才拦 —— 那时建了空间也没人
+  // 能干活。状态还在读 / 一个引擎都没返回时不拦（best-effort，和 captain 引擎
+  // 列表拉取失败就退化成默认选项的既有做法一致）。
+  const engineBlocked =
+    !readiness.loading &&
+    readiness.engines.length > 0 &&
+    !readiness.engines.some((e) => e.state === "usable" || e.state === "unknown");
   const canSubmit =
-    name.trim().length > 0 && mainPath.length > 0 && !scan && !invalidPath && !checkingPath;
+    name.trim().length > 0 && mainPath.length > 0 && !scan && !invalidPath && !checkingPath && !engineBlocked;
   const hasInitSpell = spells.some((s) => s.name === INIT_SPELL);
   // Tell the user WHY Start is grey — a silent disabled button is the #1
   // "is this broken?" moment in the create flow.
   const submitBlockReason = useMemo(() => {
     if (scan || isSubmitting) return null;
+    // 引擎门禁排在最前：它是步 1，先修它再谈名字和路径。
+    if (engineBlocked) {
+      return readiness.probing
+        ? t("wizard.engineProbeWait", {
+            defaultValue: "正在检测引擎，等结果出来再继续…",
+          })
+        : t("wizard.noUsableEngine", {
+            defaultValue:
+              "还没有能干活的 AI 引擎——去「设置」页装一个，或去「终端」页登录后点「重新检测」",
+          });
+    }
     if (!name.trim()) return t("wizard.needName", "先起个名字");
     if (!mainPath) return t("wizard.needPath", "先填项目路径");
     if (checkingPath) return t("wizard.checkingPath", "正在检查路径…");
@@ -309,6 +345,8 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
   }, [
     scan,
     isSubmitting,
+    engineBlocked,
+    readiness.probing,
     name,
     mainPath,
     checkingPath,
@@ -563,13 +601,16 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
               </div>
             )}
 
-            {/* Step 1: name + accent */}
+            {/* Step 1: engine readiness — 开工前一眼看清谁能干活 */}
+            <EngineStep readiness={readiness} />
+
+            {/* Step 2: name + accent */}
             <section className="flex flex-col gap-3">
-              <StepHeader n={1} label={t("wizard.step1")} />
+              <StepHeader n={2} label={t("wizard.step1")} />
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
                 <div className="flex min-w-0 flex-1 flex-col gap-1">
                   <Label htmlFor="wizard-name" className="sr-only">
-                    {t("wizard.step1")}
+                    {t("wizard.nameLabel", { defaultValue: "名称" })}
                   </Label>
                   <Input
                     id="wizard-name"
@@ -613,10 +654,10 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
               </div>
             </section>
 
-            {/* Step 2: dirs */}
+            {/* Step 3: dirs */}
             <section className="flex flex-col gap-3">
               <StepHeader
-                n={2}
+                n={3}
                 label={t("wizard.step2")}
                 hint={t("wizard.step2Hint")}
               />
@@ -904,7 +945,7 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value={CAPTAIN_DEFAULT}>
-                            {t("wizard.captainDefault", "默认（Claude）")}
+                            {t("wizard.captainDefault", "自动选择")}
                           </SelectItem>
                           {plugins.map((p) => (
                             <SelectItem
@@ -984,24 +1025,9 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
               </Button>
               <Button
                 onClick={() => {
-                  // Path may have been created on disk after a failed check —
-                  // re-validate once so Start isn't stuck on a stale "不存在".
-                  if (!canSubmit && (invalidPath || checkingPath)) {
-                    for (const d of cleanDirs) {
-                      void validatePath(d.path).then((res) => {
-                        setPathChecks((prev) => ({ ...prev, [d.id]: res }));
-                        if (res.state === "ok") setError(null);
-                      });
-                    }
-                    return;
-                  }
                   void submit();
                 }}
-                disabled={
-                  isSubmitting ||
-                  checkingPath ||
-                  (!canSubmit && !invalidPath)
-                }
+                disabled={isSubmitting || !canSubmit}
                 title={submitBlockReason ?? undefined}
               >
                 {isSubmitting ? (
@@ -1016,6 +1042,141 @@ export function CreateWizard({ open, onClose, onCreated }: Props) {
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** 步 1 引擎体检 —— 每个引擎一行：状态图标 + 名字 + chip（engineStatusKey 的
+ *  证据标签），问题态附一句人话指引。视觉与 chat EmptyState 的引擎卡一致
+ * （同一套图标/配色）；全部可用时就是一张一眼确认的卡，不加任何操作负担。 */
+function EngineStep({ readiness }: { readiness: EngineReadinessState }) {
+  const { t } = useTranslation();
+  const { loading, probing, engines, probe, error } = readiness;
+  return (
+    <section className="flex flex-col gap-3">
+      <StepHeader
+        n={1}
+        label={t("wizard.stepEngines", { defaultValue: "确认 AI 引擎能干活" })}
+        hint={t("wizard.stepEnginesHint", {
+          defaultValue: "「重新检测」会真实启动各引擎，约几十秒",
+        })}
+      />
+      <div className="flex flex-col gap-2 rounded-lg border border-border-subtle bg-surface-elevated px-3.5 py-3 shadow-sm">
+        <div className="flex items-center justify-between gap-2">
+          <span className="font-caption text-[11px] leading-relaxed text-foreground-tertiary">
+            {t("wizard.engineStepIntro", {
+              defaultValue:
+                "「已安装」不代表能干活（可能没登录）。至少一个引擎能干活或已装好，才能继续。",
+            })}
+          </span>
+          <button
+            type="button"
+            onClick={probe}
+            disabled={probing || loading}
+            className="inline-flex shrink-0 items-center gap-1 font-caption text-[11px] text-foreground-tertiary transition-colors hover:text-foreground-secondary disabled:opacity-60"
+          >
+            {probing ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <RefreshCw className="size-3" />
+            )}
+            {probing
+              ? t("wizard.engineProbing", { defaultValue: "检测中…" })
+              : t("wizard.engineReprobe", { defaultValue: "重新检测" })}
+          </button>
+        </div>
+        {loading ? (
+          <span className="flex items-center gap-1.5 font-caption text-[11px] text-foreground-tertiary">
+            <Loader2 className="size-3 animate-spin" />
+            {t("wizard.engineLoading", { defaultValue: "正在查看本机引擎…" })}
+          </span>
+        ) : error ? (
+          <span
+            className="font-caption text-[11px] text-state-warning"
+            title={error}
+          >
+            {t("wizard.engineLoadFailed", {
+              defaultValue: "没能读到引擎状态。可以直接继续，或稍后点「重新检测」。",
+            })}
+          </span>
+        ) : (
+          engines.map((e) => <EngineReadinessRow key={e.id} engine={e} />)
+        )}
+      </div>
+    </section>
+  );
+}
+
+/** 一个引擎一行。图标/配色与 chat EmptyState 的 EngineRow 保持一致；
+ *  chip 文案走 engineStatusKey（usable 时给证据标签：已实测/使用中/仅启动）。 */
+function EngineReadinessRow({ engine }: { engine: EngineReadiness }) {
+  const { t } = useTranslation();
+  const { display_name: name, state, reason } = engine;
+  const variants = {
+    usable: {
+      icon: <CircleCheck className="size-3.5 text-status-success" />,
+      nameCls: "text-foreground-secondary",
+      chipCls: "bg-status-success-soft text-status-success",
+    },
+    unknown: {
+      icon: <PlugZap className="size-3.5 text-foreground-tertiary" />,
+      nameCls: "text-foreground-secondary",
+      chipCls: "bg-surface-tertiary text-foreground-tertiary",
+    },
+    needs_login: {
+      icon: <CircleAlert className="size-3.5 text-state-warning" />,
+      nameCls: "text-foreground-secondary",
+      chipCls: "bg-status-warning-soft text-status-warning",
+    },
+    not_usable: {
+      icon: <CircleX className="size-3.5 text-state-danger" />,
+      nameCls: "text-foreground-secondary",
+      chipCls: "bg-status-danger-soft text-state-danger",
+    },
+    not_installed: {
+      icon: <CircleX className="size-3.5 text-foreground-tertiary" />,
+      nameCls: "text-foreground-tertiary",
+      chipCls: "bg-surface-tertiary text-foreground-tertiary",
+    },
+  } as const;
+  const v = variants[state];
+  // 人话指引（不出现 CLI/PTY/spawn 这类词）：能干活的不说话，有问题的说怎么办。
+  const guide =
+    state === "needs_login"
+      ? t("wizard.engineNeedsLoginGuide", {
+          defaultValue: "去「终端」页登录它，然后点「重新检测」。",
+        })
+      : state === "not_installed"
+        ? t("wizard.engineMissingGuide", {
+            defaultValue: "去「设置」页一键安装，装好后点「重新检测」。",
+          })
+        : state === "not_usable"
+          ? t("wizard.engineNotUsableGuide", {
+              defaultValue:
+                "它没能启动（鼠标悬停可看原因）。处理好之后点「重新检测」。",
+            })
+          : state === "unknown"
+            ? t("wizard.engineUnverifiedGuide", {
+                defaultValue:
+                  "已装好、还没实测过。可以直接继续，也可以点「重新检测」确认。",
+              })
+            : null;
+  return (
+    <div className="flex flex-col gap-0.5" title={reason ?? undefined}>
+      <div className="flex items-center gap-1.5">
+        {v.icon}
+        <span className={`font-caption text-[12px] ${v.nameCls}`}>{name}</span>
+        <span
+          className={`rounded-full px-1.5 py-0.5 font-caption text-[10px] ${v.chipCls}`}
+        >
+          {t(engineStatusKey(engine))}
+        </span>
+      </div>
+      {guide && (
+        <span className="pl-5 font-caption text-[10px] leading-relaxed text-foreground-tertiary">
+          {guide}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -1063,7 +1224,10 @@ function ScanView({
           />
         </div>
         <span className="font-mono text-[10px] text-foreground-tertiary">
-          {t("wizard.scanningElapsed", { s: elapsedSec })}
+          {t("wizard.scanningElapsed", {
+            s: elapsedSec,
+            defaultValue: "已等待 {{s}}s · 通常需几十秒（预估，非实测进度）",
+          })}
         </span>
       </div>
     </div>

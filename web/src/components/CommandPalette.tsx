@@ -56,6 +56,7 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/cn";
 import { directionBase } from "@/lib/thread";
 import { DEBUG_ENABLED } from "@/lib/debug";
+import { track } from "@/lib/telemetry";
 import { formatShortcutChord, getClientPlatformInfo } from "@/lib/platform";
 import {
   CommandDialog,
@@ -187,6 +188,8 @@ export function CommandPalette() {
   // router state，避免 nav 流量轰炸 CommandPalette。
   useEffect(() => {
     if (!open) return;
+    // R9 本机统计:⌘K 打开次数(localStorage-only,不上传)。
+    track("palette.open");
     const m = window.location.pathname.match(/^\/chat\/([^/]+)(?:\/t\/([^/]+))?/);
     const ws = m ? m[1] : null;
     currentWsIdRef.current = ws;
@@ -204,7 +207,13 @@ export function CommandPalette() {
     [navigate, close],
   );
   const openWizard = useCallback(() => {
-    window.dispatchEvent(new CustomEvent("swarmx:open-wizard"));
+    // `detail.handled` lets the page-level wizard host (Home / WorkspaceShell)
+    // claim the event; AppShell's fallback host only opens when no page did.
+    // Listeners run synchronously in registration order, and child effects
+    // register before AppShell's — so page hosts always get first crack.
+    window.dispatchEvent(
+      new CustomEvent("swarmx:open-wizard", { detail: { handled: false } }),
+    );
     close();
   }, [close]);
 
@@ -265,22 +274,6 @@ export function CommandPalette() {
               <Plus />
               <span>{t("cmdk.newWorkspace")}</span>
               <CommandShortcut>{t("cmdk.openWizard")}</CommandShortcut>
-            </CommandItem>
-            <CommandItem
-              value={`quick chat workspace ${t("nav.chat")} ${t("cmdk.navHint.chat")}`}
-              onSelect={() => go(currentWsId ? `/chat/${currentWsId}` : "/chat")}
-            >
-              <MessageSquare />
-              <span>{t("nav.chat")}</span>
-              <CommandShortcut>{t("cmdk.navHint.chat")}</CommandShortcut>
-            </CommandItem>
-            <CommandItem
-              value={`quick mcp tools settings ${t("nav.mcp")} ${t("cmdk.navHint.mcp")}`}
-              onSelect={() => go("/mcp")}
-            >
-              <Boxes />
-              <span>{t("nav.mcp")}</span>
-              <CommandShortcut>{t("cmdk.navHint.mcp")}</CommandShortcut>
             </CommandItem>
           </CommandGroup>
 

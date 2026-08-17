@@ -213,8 +213,12 @@ export interface AgentInfo {
    *  failure card on a cold load, since the live AgentState::Error WS event is
    *  lossy with no resume. */
   last_error?: string | null;
-  /** Coarse class of `last_error` (auth | rate_limit | fatal | watchdog)
-   *  steering which remedy buttons the failure card offers. Null when healthy. */
+  /** Coarse class of `last_error` (auth | rate_limit | fatal | watchdog | stuck)
+   *  steering which remedy buttons the failure card offers. Null when healthy.
+   *  "stuck" is the S5 stuck-watchdog's soft 疑似卡住 mark (alive, owes a
+   *  handoff, ignored consecutive system wakes): NOT a confirmed failure —
+   *  the member rail / NeedsYou render it amber ("久无活动" / "疑似卡住"),
+   *  never red "异常退出", and any newer activity clears it. */
   last_error_kind?: string | null;
   /** Unix-ms the `last_error` was recorded. Null when healthy. */
   last_error_at?: number | null;
@@ -250,6 +254,8 @@ export interface MessageMeta {
   /** For "dispatch": billing surface of the engine that actually spawned
    *  (kebab-case token, e.g. "api-key" = billed per API key). */
   billing_surface?: string;
+  /** UI-only: consecutive same-role dispatches collapsed into this card. */
+  dispatch_count?: number;
 }
 
 export interface MessageRecord {
@@ -550,7 +556,9 @@ export type SwarmAgentState =
  *  member list shows the latest one as "what this worker is doing right now";
  *  the AgentDrawer activity tab streams the whole round.
  *
- *  - `kind`     — "tool" (Edit/Bash/…) or "system" (a non-tool step).
+ *  - `kind`     — "tool" (Edit/Bash/…), "system" (a non-tool step) or
+ *    "watchdog" (an S5 stuck-watchdog nudge; the label is ready-made Chinese
+ *    prose the member rail / activity feed render as-is).
  *  - `label`    — human-facing line, e.g. "Edit src/foo.rs".
  *  - `phase`    — "running" (in flight, no duration yet) → "ok" / "error".
  *  - `seq`      — monotonic per-agent activity index.
@@ -558,7 +566,7 @@ export type SwarmAgentState =
  *  - `at`       — unix-ms the event was emitted. */
 export interface AgentActivity {
   agent_id: string;
-  kind: "tool" | "system";
+  kind: "tool" | "system" | "watchdog";
   label: string;
   phase: "running" | "ok" | "error";
   seq: number;
@@ -631,7 +639,37 @@ export type SwarmEvent =
       agent_id: string;
       stage: string;
       at: number;
+    }
+  | {
+      // Budget brake tripped/lifted for a workspace. Subscribers refetch
+      // GET /api/workspaces/:id/budget instead of caching these numbers.
+      // Amounts are ESTIMATES (transcript scraping), never the invoice.
+      type: "budget_changed";
+      workspace_id: string;
+      exceeded: boolean;
+      budget_usd: number | null;
+      cost_usd: number;
+      at: number;
     };
+
+// ── workspace budget brake (GET/PUT /api/workspaces/:id/budget) ────────────
+/** Server-side budget status. All amounts are all-time ESTIMATES priced by
+ *  the server's table — the same numbers /api/usage shows, never the
+ *  subscription invoice. Copy must keep the 估算/不等于订阅账单 honesty label. */
+export interface WorkspaceBudget {
+  workspace_id: string;
+  /** The cap in force; null = unlimited. */
+  budget_usd: number | null;
+  /** Current all-time estimated spend (same total as /api/usage). */
+  current_cost_usd: number;
+  /** false ⇒ some models unpriced; real spend is ≥ the estimate. */
+  priced: boolean;
+  /** true = brake ON: agents paused, spawns/turns refused. */
+  exceeded: boolean;
+  /** Trip-time estimate + timestamp (null while not tripped). */
+  trip_cost_usd: number | null;
+  trip_at: number | null;
+}
 
 // ── F1 model settings: per-CLI tier→concrete-model mapping ──────────────────
 export interface CliModels {

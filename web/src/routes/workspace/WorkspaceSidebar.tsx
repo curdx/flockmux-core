@@ -557,21 +557,23 @@ export function WorkspaceList({
         <h2 className="font-heading text-xs font-semibold uppercase tracking-wider text-foreground-tertiary">
           {t("chat.workspaces")}
         </h2>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              onClick={onOpenWizard}
-              aria-label={t("chat.newWorkspace")}
-              className="size-8 text-foreground-tertiary hover:text-foreground-primary"
-            >
-              <Plus className="size-4" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">{t("chat.newWorkspace")}</TooltipContent>
-        </Tooltip>
+        {workspaces.length === 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                onClick={onOpenWizard}
+                aria-label={t("chat.newWorkspace")}
+                className="size-8 text-foreground-tertiary hover:text-foreground-primary"
+              >
+                <Plus className="size-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{t("chat.newWorkspace")}</TooltipContent>
+          </Tooltip>
+        )}
       </div>
       {showWsSearch && (
         <div className="px-2">

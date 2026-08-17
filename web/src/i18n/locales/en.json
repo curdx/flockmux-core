@@ -121,9 +121,6 @@
   },
   "nav": {
     "chat": "Chat",
-    "dag": "Flow",
-    "replays": "Replays",
-    "context": "Context",
     "notifications": "Notifications",
     "mcp": "MCP",
     "goals": "Goals",
@@ -139,7 +136,8 @@
       "dark": "Dark",
       "system": "System",
       "toggleHint": "Theme: {{current}} · click for {{next}}"
-    }
+    },
+    "more": "More"
   },
   "shell": {
     "cmdkHint": "Press {{shortcut}} to open the command palette",
@@ -305,7 +303,11 @@
     "gitInitNotice": "The first time you start a contest, if the project isn’t a git repo yet, it will be initialized with one commit; node_modules, target, and dist are skipped.",
     "synthesize": "Synthesize",
     "synthHint": "Send a reviewer to merge the best of each approach (not just pick one winner)",
-    "synthStarted": "Synthesizer dispatched — it'll combine the best and merge"
+    "synthStarted": "Synthesizer dispatched — it'll combine the best and merge",
+    "confirmPickTitle": "Pick winner and merge?",
+    "confirmPickDesc": "This merges \"{{name}}\"'s changes back into the mainline. It modifies your code and cannot be auto-undone.",
+    "confirmPickDescBranch": "This merges the changes from \"{{name}}\" (branch {{branch}}) back into the mainline. It modifies your code and cannot be auto-undone.",
+    "confirmPickConfirm": "Pick winner and merge"
   },
   "consult": {
     "title": "Compare models",
@@ -341,7 +343,7 @@
   },
   "error": {
     "title": "This view hit an error",
-    "body": "The rest of the app still works. Retry, or reload the page.",
+    "body": "Retry this page, or reload.",
     "retry": "Retry",
     "reload": "Reload page"
   },
@@ -371,7 +373,11 @@
       "failure": "Failure handling",
       "failureHint": "Cascading behaviour when one agent in a spell fails",
       "killOthers": "Kill sibling agents on failure",
-      "killOthersHint": "When on, if any agent exits abnormally the others in the same run are stopped too"
+      "killOthersHint": "When on, if any agent exits abnormally the others in the same run are stopped too",
+      "lab": "Lab features",
+      "labFieldHint": "Experimental features, off by default",
+      "labToggle": "Show lab features",
+      "labToggleHint": "When on, the workspace shows Fusion and Consult tabs; you can turn it off anytime."
     },
     "appearance": {
       "title": "Appearance",
@@ -463,8 +469,8 @@
       "title": "Privacy & Security",
       "hint": "Local data export / clear, shim tool-call mode",
       "approvalMode": "Tool-call approvals",
-      "approvalModeHint": "Currently shim launches CLIs with --dangerously-skip-permissions, so all tool calls pass through; product direction is to keep bypass always-on, no human-in-the-loop approval mode planned",
-      "approvalCurrent": "bypass (default)",
+      "approvalModeHint": "Members edit files and run commands without prompting you — same as using these AIs in your own terminal.",
+      "approvalCurrent": "Run directly (default)",
       "exportTitle": "Export local data",
       "exportHint": "Serialise every swarmx:* localStorage key as a downloadable JSON",
       "exportButton": "Export JSON",
@@ -472,7 +478,28 @@
       "clearHint": "Remove all swarmx:* localStorage keys (language / theme / notification read state / settings). Current window runtime is not affected; reload to fall back to defaults",
       "clearButton": "Clear swarmx:*",
       "clearConfirm": "Really clear? This can't be undone.",
-      "cleared": "Cleared {{count}} key(s)"
+      "cleared": "Cleared {{count}} key(s)",
+      "statsTitle": "Local stats",
+      "statsHint": "Usage counters live on this machine only, never uploaded.",
+      "statsCollect": "Collect usage counters",
+      "statsCollectHint": "Counts only (e.g. palette opens), no content; stored locally, never uploaded. Off = nothing recorded.",
+      "statsEmpty": "Nothing recorded yet.",
+      "statsClear": "Reset",
+      "statsClearTitle": "Reset local stats",
+      "statsClearConfirm": "Deletes all recorded counters; irreversible. The collection toggle is unaffected.",
+      "statsCleared": "Local stats cleared",
+      "statsEvent": {
+        "paletteOpen": "Opened command palette",
+        "reportExport": "Exported battle report",
+        "labOn": "Turned lab features on",
+        "labOff": "Turned lab features off",
+        "tabChat": "Switched to Chat tab",
+        "tabDag": "Switched to DAG tab",
+        "tabLedger": "Switched to Ledger tab",
+        "tabFusion": "Switched to Fusion tab",
+        "tabConsult": "Switched to Consult tab",
+        "tabReplays": "Switched to Replays tab"
+      }
     },
     "about": {
       "title": "About",
@@ -557,6 +584,7 @@
     },
     "dispatch": {
       "title": "Dispatched to {{role}}",
+      "titleCount": "Dispatched to {{role}} · {{count}}",
       "open": "Open {{role}}"
     },
     "delivery": {
@@ -624,7 +652,8 @@
       "replays": "Replays",
       "consult": "Consult",
       "advanced": "Advanced",
-      "advancedHint": "Flow, ledger, fusion, consult, replays"
+      "advancedHint": "Flow, ledger, fusion, consult, replays",
+      "advancedHintLabOff": "DAG, ledger, replays"
     },
     "backToChat": "← Back to {{name}}",
     "globalScopeHint": "Showing data from every workspace · pick one in chat to scope this view",
@@ -641,6 +670,7 @@
     "members": "Members",
     "selectWorkspace": "Pick a workspace to see its members",
     "noMembers": "No one is online yet. Send a message in chat and Plan will come up.",
+    "noMembersAway": "Members went offline. Send a message and Plan will come back.",
     "reviveOrchestrator": "Wake Plan manually",
     "reviving": "Waking…",
     "pmBadge": "Plan",
@@ -654,11 +684,13 @@
     "workspaceStatRoots": "{{count}} source(s)",
     "attachSource": "Attach source context",
     "workspaceStripOnline": "{{count}} AI online",
-    "workspaceStripIdle": "AI offline",
+    "workspaceStripIdle": "AI not started",
+    "workspaceStripAway": "AI went offline",
     "workspaceStripSources": "{{count}} source context(s)",
     "workspaceStripCliUsable": "AI engine usable: {{names}}",
     "workspaceStripCliInstalled": "AI engine installed: {{names}}",
     "workspaceStripCliMissing": "No AI engine is available yet. Install Codex or Claude before auto-wake can work.",
+    "costChipHint": "All-time estimated spend for this workspace (not your subscription bill) · click for usage details",
     "workspaceStripCliInstallHelp": "Settings shows official install, verify, and login commands.",
     "workspaceStripCliPartial": "Work can continue with {{names}}; missing {{missing}} can be added later.",
     "workspaceStripSetupCli": "Install AI engine",
@@ -761,7 +793,10 @@
     "handoffMissing": {
       "title": "{{count}} member(s) left without a result",
       "hint": "Send a message and Plan will help fill it in"
-    }
+    },
+    "costChipUncollectedOnly": "{{engines}} usage is not counted yet: actual spend is not shown and does not trigger the budget brake. Click to view usage",
+    "costChipNotCounted": "Not counted",
+    "costChipUncollectedHint": "{{engines}} usage is not counted; their actual spend is not included"
   },
   "dag": {
     "a11y": {
@@ -868,21 +903,6 @@
     "liveTruncatedHint": "Still recording — incomplete: playback only goes up to the bytes flushed so far and may cut off abruptly at the end. Reopen after it finalizes to see the full recording.",
     "popupBlocked": "Pop-up blocked"
   },
-  "context": {
-    "title": "Context board",
-    "subtitle": "{{count}} key(s) · read + history (written by agents)",
-    "search": "Search keys",
-    "empty": "Blackboard is empty",
-    "selectKey": "Pick a key on the left",
-    "rendered": "Rendered",
-    "raw": "Raw",
-    "noSelection": "Nothing selected",
-    "meta": "Metadata",
-    "size": "size",
-    "history": "History ({{count}})",
-    "noHistory": "No history yet",
-    "rightHint": "Pick a key to see metadata and history"
-  },
   "notifications": {
     "title": "Notifications",
     "subtitle": "from /ws/swarm · {{count}} unread",
@@ -899,6 +919,7 @@
       "completed": "Done"
     },
     "empty": "Nothing here yet",
+    "loading": "Loading notifications…",
     "emptyHint": "Notifications appear here automatically on member messages, progress updates, and state changes.",
     "loadError": "Failed to load notifications",
     "viewAll": "View all",
@@ -912,6 +933,7 @@
       "taskLedger": "Task ledger updated",
       "progressLedger": "Progress updated",
       "update": "{{name}} updated",
+      "failed": "A task failed",
       "mainDir": "main"
     },
     "fromUser": "You",
@@ -942,6 +964,7 @@
   },
   "agent": {
     "close": "Close (Esc)",
+    "drawerTitle": "{{role}}",
     "sendMessage": "Send message",
     "wake": "Nudge manually",
     "pause": "Pause",
@@ -958,10 +981,12 @@
       "resume": {
         "title": "Let {{role}} continue?",
         "desc": "This restores auto-nudges and asks them to pick up where they left off."
+      },
+      "kill": {
+        "title": "Stop {{role}}?",
+        "desc": "This ends its process immediately — the in-flight turn is lost. Work it already finished stays viewable in Recordings / Messages."
       }
     },
-    "restart": "Restart",
-    "notImplemented": "Not implemented yet",
     "terminalLoading": "Checking status…",
     "terminalExited": "This member has exited — terminal unavailable. See what they did in Recordings / Messages / Context.",
     "tabs": {
@@ -1009,10 +1034,14 @@
       "lived": "lived {{delta}}",
       "error": "Error · cannot work",
       "ended": "Ended",
-      "paused": "Paused"
+      "paused": "Paused",
+      "stuckSuspect": "possibly stuck · not responding to wakes"
     },
     "wakeOk": "Nudged {{role}}",
     "wakeFailed": "Nudge failed",
+    "kill": "Stop",
+    "killOk": "Stopped {{role}}",
+    "killFailed": "Stop failed",
     "resumeFailed": "Couldn't continue",
     "pauseFailed": "Couldn't pause",
     "deadNoAction": "This member has ended; no actions available",
@@ -1029,6 +1058,7 @@
     "title": "Create workspace",
     "subtitle": "Pick the primary project first; AI prepares the context",
     "step1": "Name the workspace",
+    "nameLabel": "Name",
     "namePlaceholder": "e.g. My Todo App",
     "aiNamed": "AI suggested",
     "errAbsolutePath": "Enter an absolute path, e.g. /Users/you/code/project",
@@ -1057,10 +1087,10 @@
     "addDir": "Add another folder",
     "pickFolder": "Pick a folder (open system dialog)",
     "pickFolderShort": "Browse…",
-    "pickFolderUnavailable": "Available inside the desktop app; paste the path manually in browser-dev mode",
+    "pickFolderUnavailable": "Desktop app can pick a folder; on the web, paste an absolute path",
     "accentLabel": "Color",
     "captainEngine": "Plan engine",
-    "captainDefault": "Default (Claude)",
+    "captainDefault": "Auto",
     "captainNotInstalled": " (not installed)",
     "accentTitle": "Accent color: {{name}}",
     "accentColors": {
@@ -1074,7 +1104,7 @@
     "needName": "Add a name first",
     "needPath": "Add a project path first",
     "checkingPath": "Checking path…",
-    "pathInvalid": "Path invalid or folder missing — create it, then hit Start to re-check",
+    "pathInvalid": "Path invalid or folder missing — create it before hitting Start",
     "fixAttached": "An attached folder has a problem — expand Advanced to fix, or collapse to ignore",
     "gitInitSummary": "About version control (optional)",
     "gitInitNotice": "Git is initialized (one full commit, excluding node_modules / target / dist) only when you name a direction or start a competition — not when you create the workspace.",
@@ -1088,7 +1118,20 @@
     "pathNotADirectory": "That path is a file, not a folder — enter the folder your project lives in.",
     "pathPermissionDenied": "You don't have permission to access that directory — pick one you can read, or grant access in your system settings.",
     "attachedErrorCount": "{{count}} attached directories have problems — expand to fix",
-    "pickFolderTitle": "Choose project folder"
+    "pickFolderTitle": "Choose project folder",
+    "stepEngines": "Make sure an AI engine can work",
+    "stepEnginesHint": "Re-check really starts each engine, ~tens of seconds",
+    "engineStepIntro": "\"Installed\" ≠ can work (maybe not logged in). At least one engine working or installed to continue.",
+    "engineProbing": "Checking…",
+    "engineReprobe": "Re-check",
+    "engineLoading": "Checking local engines…",
+    "engineLoadFailed": "Couldn't read engine status. Continue anyway, or re-check later.",
+    "engineNeedsLoginGuide": "Log in on the Terminal page, then Re-check.",
+    "engineMissingGuide": "One-click install in Settings, then Re-check.",
+    "engineNotUsableGuide": "It failed to start (hover for why). Fix, then Re-check.",
+    "engineUnverifiedGuide": "Installed, not yet verified. Continue, or Re-check to confirm.",
+    "noUsableEngine": "No working AI engine — install one in Settings, or log in on the Terminal page and Re-check",
+    "engineProbeWait": "Checking engines — continue when results arrive…"
   },
   "messages": {
     "filter": "Filter by sender / receiver / body",
@@ -1166,7 +1209,9 @@
     "previewError": "Render failed",
     "truncatedNotice": "Content too long — rendering the first {{n}} characters",
     "jumpNotVisible": "#{{id}} isn't in this conversation (it may belong to another room/direction, or has scrolled out of range)",
-    "jumpUnreadNone": "No more unread messages in this conversation"
+    "jumpUnreadNone": "No more unread messages in this conversation",
+    "filterWithShortcut": "Search messages ({{chord}})",
+    "mentionListboxLabel": "Mention a member"
   },
   "cron": {
     "title": "Scheduled jobs",
@@ -1205,6 +1250,7 @@
     "cancel": "Cancel",
     "enable": "Enable",
     "disable": "Disable",
+    "enabledState": "Enabled",
     "paused": "Paused",
     "lastRun": "last",
     "running": "Firing…",
@@ -1228,11 +1274,11 @@
     "previewHint": "Pick a file on the left to preview",
     "binary": "Binary file — no preview",
     "truncated": "truncated",
-    "browseAll": "Browse whole filesystem",
-    "jailBlocked": "Outside this workspace — turn on \"Browse whole filesystem\" to view.",
+    "browseAll": "Browse files outside this workspace",
+    "jailBlocked": "Outside this workspace — turn on \"Browse files outside this workspace\" to view.",
     "readFailed": "Failed to load file",
     "workspacesLoadFailed": "Failed to load workspaces — please retry",
-    "browseAllWarning": "Removes workspace isolation — lets you browse the whole machine. Use with care.",
+    "browseAllWarning": "Removes workspace isolation — lets you browse files outside this workspace. Use with care.",
     "previewCapped": "Preview limited to first {{size}}",
     "noWorkspace": "No workspace selected",
     "noWorkspaceHint": "Pick a workspace above to browse its directories and files.",
@@ -1252,7 +1298,7 @@
     "manual": "manual",
     "live": "Running",
     "delivered": "Delivered",
-    "undelivered": "No result yet",
+    "undelivered": "No deliverable yet",
     "failed": "Failed",
     "showAll": "Show all {{n}}",
     "collapse": "Collapse",
@@ -1395,7 +1441,10 @@
     "emptyAction": "Open chat",
     "loadError": "Failed to load usage data",
     "chartTableCaption": "Daily token usage (bucketed by UTC day)",
-    "day": "Date"
+    "day": "Date",
+    "notCountedHint": "{{engine}} usage is not collected yet: its actual spend is not shown and does not trigger the budget brake.",
+    "notCounted": "Not counted",
+    "uncollectedNote": "{{engines}} usage is not counted yet: these members' actual spend is not shown on this page and does not trigger the budget brake."
   },
   "terminal": {
     "confirmTitle": "Connect local terminal",
@@ -1594,7 +1643,27 @@
     "breadcrumbsCount": "{{n}} member(s)",
     "breadcrumbsEmpty": "No member updates yet",
     "breadcrumbsEmptyHint": "When a dispatched member finishes a step (install / build / writing code…), a line appears here.",
-    "readFailed": "Read failed: {{msg}}"
+    "readFailed": "Read failed: {{msg}}",
+    "report": {
+      "button": "Export report",
+      "exporting": "Exporting…",
+      "hint": "Export tasks, progress, roster and cost estimate as Markdown",
+      "failed": "Export failed",
+      "title": "Battle report",
+      "generatedAt": "Generated at",
+      "direction": "Direction",
+      "cost": "Cost (estimate)",
+      "tokens": "tokens (in/out)",
+      "events": "Events",
+      "usageUnavailable": "Unavailable",
+      "members": "Members",
+      "emptySection": "(none)",
+      "statusKilled": "Terminated",
+      "statusExited": "Exited (code {{code}})",
+      "statusRunning": "Running",
+      "statusStarting": "Starting",
+      "uncollectedCost": "Excludes {{engines}} spend (not collected yet)"
+    }
   },
   "home": {
     "deleteFailed": "Failed to delete workspace",
@@ -1603,7 +1672,8 @@
     "workspaceCount_other": "{{count}} workspaces",
     "loadingWorkspaces": "Loading workspaces…",
     "backendUnreachable": "Workspaces aren't available right now",
-    "backendUnreachableDesc": "The service isn't ready. If Restart is shown at the top, tap it; in development, make sure the backend is running, then retry."
+    "backendUnreachableDesc": "Can't reach the local service. In development, make sure the backend is running, then retry.",
+    "workspaceCount": "{{count}} workspaces"
   },
   "recordings": {
     "downloadFailed": "Failed to download recording",
@@ -1665,7 +1735,6 @@
     "more": "+{{count}}",
     "openAgent": "Open {{role}}",
     "askCaptain": "Tell Plan · {{role}}",
-    "askCaptainToast": "Just type below and tell Plan",
     "dismiss": "Hide {{role}}",
     "dismissAll": "Got it",
     "nudgeAgent": "Nudge {{role}}",
@@ -1675,7 +1744,37 @@
       "error": "something broke",
       "handoff": "no result",
       "stalled": "seems stuck",
-      "nudge": "Nudge"
+      "nudge": "Nudge",
+      "stuck": "possibly stuck"
     }
+  },
+  "budget": {
+    "bannerTitle": "Budget cap reached (estimate), members paused",
+    "bannerDetail": "Estimated {{cost}} at trip / cap {{budget}}; estimate only, not your subscription invoice. Raise or clear the cap to auto-resume.",
+    "bannerAction": "Adjust budget",
+    "editorTitle": "Budget brake (estimate)",
+    "editorHint": "At the cap, pause all members and refuse new spawns/turns; raising or clearing auto-resumes. Estimates only, not your subscription invoice.",
+    "capLabel": "Cap (USD)",
+    "unlimited": "Unlimited",
+    "clear": "Clear cap",
+    "currentEstimate": "Current estimate",
+    "currentCap": "Current cap",
+    "exceededNote": "Brake tripped (estimated {{cost}} at trip): members paused, new work refused. Raise or clear the cap to auto-resume.",
+    "invalidInput": "Enter a non-negative number (empty or 0 = unlimited)",
+    "saved": "Budget saved",
+    "cleared": "Budget cap cleared",
+    "uncollectedNote": "Note: {{engines}} usage is not counted yet — the budget brake does not cover these members (spend is neither shown nor braked).",
+    "bannerRaisedStillExceeded": "Raised to {{amount}}, but the latest estimate still exceeds the limit",
+    "bannerRaised": "Budget raised to {{amount}} — members resumed",
+    "bannerRaiseFailed": "Failed to raise budget",
+    "bannerRaiseResume": "Raise to {{amount}} and resume"
+  },
+  "lab": {
+    "gateTitle": "Lab feature is off",
+    "gateHint": "\"{{feature}}\" is experimental and hidden by default; enable it to use it.",
+    "gateAction": "Open settings"
+  },
+  "watchdog": {
+    "nudging": "System is nudging it"
   }
 }

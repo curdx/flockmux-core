@@ -7,6 +7,10 @@
  * sit behind an 「高级」disclosure so strangers aren't hit with a six-tab
  * author console on first open (road-to-100 上手建议).
  *
+ * R3 形态收敛:fusion / consult 进一步归「实验室功能」(设置→通用,默认 OFF)。
+ * 开关在 buildTabs 里读 —— Shell 的 ⌘1-6 用的也是这份列表,所以隐藏后
+ * 快捷键自动跳过它们,深链则由各 view 里的 LabGate 兜底成诚实空态。
+ *
  * `buildTabs` is exported because Shell registers the ⌘1-6 global shortcut that
  * navigates to these same tab targets — one definition, two consumers.
  */
@@ -37,16 +41,20 @@ import {
 import { cn } from "@/lib/cn";
 import { useSwarmFeedStatus } from "@/hooks/useSwarmFeed";
 import { formatShortcutChord, getClientPlatformInfo } from "@/lib/platform";
+import { loadAppSettings, useLabFeatures } from "@/lib/appSettings";
+import { track } from "@/lib/telemetry";
 
 interface TabDef {
+  /** 稳定 id —— R9 本机统计按它计数(`tab.<id>`),与 CommandPalette 的
+   *  WORKSPACE_VIEWS 保持一致。 */
+  id: string;
   to: string;
   labelKey: string;
   icon: typeof MessageSquare;
-  // ⌘1 / ⌘2 / … shortcut (1-based). Shell registers a global
-  // keydown handler that maps Meta/Ctrl + digit → navigate(tab.to).
-  shortcut: number;
   /** Hidden behind 「高级」 until the user expands or lands on the route. */
   advanced?: boolean;
+  /** 实验室功能:设置→通用的开关(默认 OFF)为关时从 tab 列表剔除。 */
+  lab?: boolean;
 }
 
 export function buildTabs(wsId: string, threadSlug?: string): TabDef[] {
@@ -54,44 +62,50 @@ export function buildTabs(wsId: string, threadSlug?: string): TabDef[] {
   // direction keeps the bare `/chat/:wsId/*` URLs. Tabs preserve whichever
   // direction is active so switching views never drops you back to main.
   const base = directionBase(wsId, threadSlug);
-  return [
-    { to: `${base}`, labelKey: "chat.tabs.chat", icon: MessageSquare, shortcut: 1 },
+  const tabs: TabDef[] = [
+    { id: "chat", to: `${base}`, labelKey: "chat.tabs.chat", icon: MessageSquare },
     {
+      id: "dag",
       to: `${base}/dag`,
       labelKey: "chat.tabs.dag",
       icon: GitBranch,
-      shortcut: 2,
       advanced: true,
     },
     {
+      id: "ledger",
       to: `${base}/ledger`,
       labelKey: "chat.tabs.ledger",
       icon: ClipboardList,
-      shortcut: 3,
       advanced: true,
     },
     {
+      id: "fusion",
       to: `${base}/fusion`,
       labelKey: "chat.tabs.fusion",
       icon: Swords,
-      shortcut: 4,
       advanced: true,
+      lab: true,
     },
     {
+      id: "consult",
       to: `${base}/consult`,
       labelKey: "chat.tabs.consult",
       icon: Users,
-      shortcut: 5,
       advanced: true,
+      lab: true,
     },
     {
+      id: "replays",
       to: `${base}/replays`,
       labelKey: "chat.tabs.replays",
       icon: Play,
-      shortcut: 6,
       advanced: true,
     },
   ];
+  // R3:实验室关 → 摘掉 lab tab。每次调用都现读(不走缓存),Shell 的 ⌘1-6
+  // 在挂载/切方向时重建这份列表,天然跟上开关;⌘ 序号按位置算(见渲染处)。
+  if (!loadAppSettings().labFeatures) return tabs.filter((tab) => !tab.lab);
+  return tabs;
 }
 
 export function WorkspaceToolbar({
@@ -115,6 +129,9 @@ export function WorkspaceToolbar({
   onOpenWorkspaceNav?: () => void;
 }) {
   const { t } = useTranslation();
+  // R3:订阅实验室开关(跨 tab storage 事件)——同窗口内在设置页翻转后,
+  // 回到工作区本组件重挂载,buildTabs 现读也是新的;这里主要保跨 tab 同步。
+  const labOn = useLabFeatures();
   const tabs = buildTabs(workspace.id, threadSlug);
   const primaryTabs = useMemo(() => tabs.filter((tab) => !tab.advanced), [tabs]);
   const advancedTabs = useMemo(() => tabs.filter((tab) => tab.advanced), [tabs]);
@@ -197,7 +214,7 @@ export function WorkspaceToolbar({
         )}
       </div>
       <nav className="flex h-10 items-center gap-1 px-3">
-        {visibleTabs.map((tab) => {
+        {visibleTabs.map((tab, tabIndex) => {
         const Icon = tab.icon;
         return (
           <NavLink
@@ -206,6 +223,8 @@ export function WorkspaceToolbar({
             // index route 必须 end，否则 /chat/:wsId 在 /chat/:wsId/dag 时
             // 也算 active。其他 tab 路径足够独特，end 无所谓但保持一致。
             end
+            // R9 本机统计:每个 tab 一个计数器(只记次数,localStorage)。
+            onClick={() => track(`tab.${tab.id}`)}
             className={({ isActive }) =>
               cn(
                 "relative flex min-h-8 shrink-0 items-center gap-1.5 px-3 py-2 text-xs transition-colors",
@@ -214,7 +233,9 @@ export function WorkspaceToolbar({
                   : "text-foreground-secondary hover:text-foreground-primary",
               )
             }
-            title={`${t(tab.labelKey)}  ${formatShortcutChord(tab.shortcut, platform)}`}
+            // ⌘ 序号按可见位置算,跟 Shell 的 tabs[n-1] 对应 —— 实验室关闭
+            // 摘掉两个 tab 后,固定编号会对不上,位置序号永远是对的。
+            title={`${t(tab.labelKey)}  ${formatShortcutChord(tabIndex + 1, platform)}`}
           >
             <Icon className="size-3.5 shrink-0" />
             {/* Label collapses to icon-only below lg so the bar never wraps the
@@ -229,9 +250,15 @@ export function WorkspaceToolbar({
           type="button"
           onClick={() => setUserExpanded((v) => !v)}
           aria-expanded={advancedOpen}
-          title={t("chat.tabs.advancedHint", {
-            defaultValue: "协作图、工作记录、竞赛、多模对比、录像",
-          })}
+          title={
+            labOn
+              ? t("chat.tabs.advancedHint", {
+                  defaultValue: "协作图、工作记录、竞赛、多模对比、录像",
+                })
+              : t("chat.tabs.advancedHintLabOff", {
+                  defaultValue: "协作图、工作记录、录像",
+                })
+          }
           className={cn(
             "relative flex min-h-8 shrink-0 items-center gap-1 px-2.5 py-2 text-xs transition-colors",
             advancedOpen

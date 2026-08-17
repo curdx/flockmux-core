@@ -6,6 +6,7 @@
  * silently drifting if the panel is ever rewritten.
  */
 import type { MessageRecord } from "../api/types";
+import { dateLocale } from "./dateLocale";
 
 /** Gap between adjacent messages beyond which a time-divider is inserted and
  *  the sender header is re-shown (same 5-min heuristic as Telegram). */
@@ -34,19 +35,25 @@ export function resolveRole(fromAgent: string, lookup: Map<string, string>): str
   return seg || "agent";
 }
 
-export function formatClock(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], {
+export function formatClock(ms: number, lang?: string): string {
+  const locale = dateLocale(lang);
+  return new Date(ms).toLocaleTimeString(locale, {
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit",
+    hour12: locale?.startsWith("zh") ? false : undefined,
   });
 }
 
-export function formatFullStamp(ms: number): string {
-  return new Date(ms).toLocaleString();
+export function formatFullStamp(ms: number, lang?: string): string {
+  const locale = dateLocale(lang);
+  return new Date(ms).toLocaleString(locale, {
+    hour12: locale?.startsWith("zh") ? false : undefined,
+  });
 }
 
-export function formatDivider(ms: number): string {
+export function formatDivider(ms: number, lang?: string): string {
+  const locale = dateLocale(lang);
+  const hour12 = locale?.startsWith("zh") ? false : undefined;
   const now = new Date();
   const d = new Date(ms);
   const sameDay =
@@ -54,13 +61,47 @@ export function formatDivider(ms: number): string {
     d.getMonth() === now.getMonth() &&
     d.getDate() === now.getDate();
   return sameDay
-    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : d.toLocaleString([], {
+    ? d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", hour12 })
+    : d.toLocaleString(locale, {
         month: "short",
         day: "numeric",
         hour: "2-digit",
         minute: "2-digit",
+        hour12,
       });
+}
+
+/** Cron prompts and coordination wakes are operator plumbing, not chat. */
+export function isOperatorChatNoise(m: Pick<MessageRecord, "from_agent" | "kind">): boolean {
+  return m.from_agent === "cron" || m.kind === "wake";
+}
+
+/** Collapse consecutive same-role dispatch cards into one (keeps the latest
+ *  worker so a click still opens someone). Stress-test / retry spawns used to
+ *  paint three identical 「派给 调研」 chips in a row. */
+export function collapseChatMessages(items: MessageRecord[]): MessageRecord[] {
+  const out: MessageRecord[] = [];
+  for (const m of items) {
+    if (isOperatorChatNoise(m)) continue;
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      prev.from_agent === "system" &&
+      m.from_agent === "system" &&
+      prev.meta?.subtype === "dispatch" &&
+      m.meta?.subtype === "dispatch" &&
+      (prev.meta.child_role ?? "") === (m.meta.child_role ?? "")
+    ) {
+      const count = (prev.meta.dispatch_count ?? 1) + 1;
+      out[out.length - 1] = {
+        ...m,
+        meta: { ...m.meta, dispatch_count: count },
+      };
+      continue;
+    }
+    out.push(m);
+  }
+  return out;
 }
 
 export function formatElapsed(ms: number): string {
@@ -85,7 +126,7 @@ export function formatElapsed(ms: number): string {
 export function buildRows(items: MessageRecord[]): Row[] {
   const rows: Row[] = [];
   let prev: MessageRecord | null = null;
-  for (const msg of items) {
+  for (const msg of collapseChatMessages(items)) {
     const gap = prev ? msg.sent_at - prev.sent_at : Infinity;
     const showDividerBefore = prev !== null && gap > GROUP_GAP_MS;
     rows.push({ msg, showHeader: true, showDividerBefore });

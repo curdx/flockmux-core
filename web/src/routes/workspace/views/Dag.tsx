@@ -40,12 +40,8 @@ import {
 import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { api } from "../../../api/http";
-import type {
-  AgentInfo,
-  BlackboardEntry,
-  SwarmEvent,
-} from "../../../api/types";
-import { useSwarmFeed } from "../../../hooks/useSwarmFeed";
+import type { AgentInfo, BlackboardEntry } from "../../../api/types";
+import { useSwarmRefresh } from "../../../hooks/useSwarmProjection";
 import { useWorkspaceContext } from "../Shell";
 import {
   ConfirmActionDialog,
@@ -452,14 +448,10 @@ export default function DagView() {
     refresh();
   }, [refresh]);
 
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (ev.type === "agent_state" || ev.type === "blackboard_changed") {
-        refresh();
-      }
-    },
-    onReconnect: () => refresh(),
-  });
+  useSwarmRefresh(
+    (s) => `${s.rosterGen}:${s.bbGen}:${s.reconnectGen}`,
+    refresh,
+  );
 
   // Scope the DAG to the ACTIVE direction (thread) by filtering DagView's OWN
   // allAgents with the shared predicate (folds `thread_id == null` into main).

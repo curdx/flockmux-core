@@ -136,6 +136,20 @@ fn with_busy_retry<T>(
     }
 }
 
+/// Outcome of [`Store::trip_workspace_budget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TripPersist {
+    /// This call set the marker (first trip) — the caller publishes the event.
+    Tripped,
+    /// The brake was already on (concurrent trip): marker kept, pause rows
+    /// still unioned in so the racing trip doesn't lose the agents it paused.
+    AlreadyTripped,
+    /// The stored cap no longer covers the checked cost (the user raised or
+    /// cleared it between the caller's cost check and this write) — NOTHING
+    /// was persisted; the caller must revert any pauses it just made.
+    BudgetMoved,
+}
+
 /// What a single [`Store::prune_expired`] pass removed. All counts are rows
 /// actually deleted; `recording_files_removed` is the subset of pruned
 /// recordings whose `.cast` file was also unlinked from disk (best-effort).
@@ -736,6 +750,71 @@ impl Store {
         })
         .await
         .context("spawn_blocking stalled_agents_with_unread")?
+    }
+
+    /// S5 stuck-watchdog liveness probe: for each given agent id, the newest
+    /// persisted sign of life (unix-ms) across every channel — tool-level
+    /// activity (`agents.last_activity_at`), mailbox sends (`messages.sent_at`
+    /// where the agent is the SENDER), token usage (`agent_usage.at`), and
+    /// blackboard writes (`blackboard_ops.at`). 0 when the agent has never
+    /// produced anything on any channel; unknown ids are simply absent.
+    ///
+    /// One batch query (chunked like `stalled_agents_with_unread`) so the
+    /// watchdog never does N+1 per tick. The caller still ORs each value with
+    /// the in-memory activity ring before judging silence: opencode /
+    /// reasonix / zulu push tool activity to the ring via the ingress POST
+    /// without touching `last_activity_at`, and any fresh signal anywhere
+    /// means "alive — leave it alone" (宁慢勿误).
+    pub async fn latest_liveness_signals(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(
+                &pool,
+                |conn| -> rusqlite::Result<std::collections::HashMap<String, i64>> {
+                    // 900 binds stay under SQLite's 999-var cap.
+                    const CHUNK: usize = 900;
+                    let mut out = std::collections::HashMap::new();
+                    for chunk in ids.chunks(CHUNK) {
+                        let placeholders = vec!["?"; chunk.len()].join(",");
+                        // Multi-arg MAX() is SQLite's scalar max; every arm is
+                        // COALESCEd so a channel with no rows reads as 0, not
+                        // NULL (which would poison the whole expression).
+                        let sql = format!(
+                            "SELECT a.id, MAX( \
+                                 COALESCE(a.last_activity_at, 0), \
+                                 COALESCE((SELECT MAX(m.sent_at) FROM messages m \
+                                           WHERE m.from_agent = a.id), 0), \
+                                 COALESCE((SELECT MAX(u.at) FROM agent_usage u \
+                                           WHERE u.agent_id = a.id), 0), \
+                                 COALESCE((SELECT MAX(b.at) FROM blackboard_ops b \
+                                           WHERE b.agent_id = a.id), 0) \
+                               ) \
+                             FROM agents a WHERE a.id IN ({placeholders})"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let binds: Vec<rusqlite::types::Value> =
+                            chunk.iter().map(|id| id.clone().into()).collect();
+                        let rows = stmt.query_map(
+                            rusqlite::params_from_iter(binds.iter()),
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                        )?;
+                        for r in rows {
+                            let (id, at) = r?;
+                            out.insert(id, at);
+                        }
+                    }
+                    Ok(out)
+                },
+            )
+        })
+        .await
+        .context("spawn_blocking latest_liveness_signals")?
     }
 
     /// Persist the agent's most recent tool-level activity time, called by the
@@ -2843,7 +2922,8 @@ impl Store {
                          VALUES (lower(hex(randomblob(16))), \
                                  substr(lower(hex(randomblob(16))), 1, 8), \
                                  ?1, ?2, ?3, ?4) \
-                         RETURNING id, slug, name, cwd, accent, created_at, deleted_at",
+                         RETURNING id, slug, name, cwd, accent, created_at, deleted_at, \
+                                 budget_usd, budget_exceeded_at, budget_exceeded_cost_usd",
                         )?;
                         let mut rows =
                             stmt.query(params![rec.name, rec.cwd, rec.accent, created_at])?;
@@ -2856,6 +2936,9 @@ impl Store {
                             accent: row.get(4)?,
                             created_at: row.get(5)?,
                             deleted_at: row.get(6)?,
+                            budget_usd: row.get(7)?,
+                            budget_exceeded_at: row.get(8)?,
+                            budget_exceeded_cost_usd: row.get(9)?,
                         })
                     })();
                     match result {
@@ -2883,11 +2966,13 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             with_busy_retry(&pool, |conn| -> rusqlite::Result<Vec<WorkspaceRecord>> {
                 let sql = if include_deleted {
-                    "SELECT id, slug, name, cwd, accent, created_at, deleted_at \
+                    "SELECT id, slug, name, cwd, accent, created_at, deleted_at, \
+                            budget_usd, budget_exceeded_at, budget_exceeded_cost_usd \
                  FROM workspaces \
                  ORDER BY created_at DESC"
                 } else {
-                    "SELECT id, slug, name, cwd, accent, created_at, deleted_at \
+                    "SELECT id, slug, name, cwd, accent, created_at, deleted_at, \
+                            budget_usd, budget_exceeded_at, budget_exceeded_cost_usd \
                  FROM workspaces WHERE deleted_at IS NULL \
                  ORDER BY created_at DESC"
                 };
@@ -2901,6 +2986,9 @@ impl Store {
                         accent: row.get(4)?,
                         created_at: row.get(5)?,
                         deleted_at: row.get(6)?,
+                        budget_usd: row.get(7)?,
+                        budget_exceeded_at: row.get(8)?,
+                        budget_exceeded_cost_usd: row.get(9)?,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -2918,7 +3006,8 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             with_busy_retry(&pool, |conn| -> rusqlite::Result<Option<WorkspaceRecord>> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, slug, name, cwd, accent, created_at, deleted_at \
+                    "SELECT id, slug, name, cwd, accent, created_at, deleted_at, \
+                            budget_usd, budget_exceeded_at, budget_exceeded_cost_usd \
                  FROM workspaces WHERE id = ?1",
                 )?;
                 let mut rows = stmt.query(params![id])?;
@@ -2931,6 +3020,9 @@ impl Store {
                         accent: row.get(4)?,
                         created_at: row.get(5)?,
                         deleted_at: row.get(6)?,
+                        budget_usd: row.get(7)?,
+                        budget_exceeded_at: row.get(8)?,
+                        budget_exceeded_cost_usd: row.get(9)?,
                     }))
                 } else {
                     Ok(None)
@@ -2981,6 +3073,208 @@ impl Store {
         })
         .await
         .context("spawn_blocking get_workspace_id_for_agent")?
+    }
+
+    // ── workspace budget brake (migration 0030) ─────────────────────────
+
+    /// Set or clear a workspace's all-time estimated-spend cap (USD).
+    /// `None` = unlimited. Returns the updated row, or `None` when the id
+    /// doesn't exist. Never touches the exceeded marker or pause ledger —
+    /// trip/lift is the server's call (it owns the live cost estimate and
+    /// the registry of live agents).
+    pub async fn set_workspace_budget(
+        &self,
+        id: String,
+        budget_usd: Option<f64>,
+    ) -> Result<Option<WorkspaceRecord>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<Option<WorkspaceRecord>> {
+                let mut stmt = conn.prepare(
+                    "UPDATE workspaces SET budget_usd = ?2 WHERE id = ?1 \
+                     RETURNING id, slug, name, cwd, accent, created_at, deleted_at, \
+                               budget_usd, budget_exceeded_at, budget_exceeded_cost_usd",
+                )?;
+                let mut rows = stmt.query(params![id, budget_usd])?;
+                if let Some(row) = rows.next()? {
+                    Ok(Some(WorkspaceRecord {
+                        id: row.get(0)?,
+                        slug: row.get(1)?,
+                        name: row.get(2)?,
+                        cwd: row.get(3)?,
+                        accent: row.get(4)?,
+                        created_at: row.get(5)?,
+                        deleted_at: row.get(6)?,
+                        budget_usd: row.get(7)?,
+                        budget_exceeded_at: row.get(8)?,
+                        budget_exceeded_cost_usd: row.get(9)?,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
+        })
+        .await
+        .context("spawn_blocking set_workspace_budget")?
+    }
+
+    /// Persist a budget-brake trip: set the exceeded marker (with the
+    /// trip-time cost estimate) and record exactly which agents the brake
+    /// paused, atomically. Guards against the raise/clear race: the marker is
+    /// only written when the CURRENT stored cap is set and <= `cost_usd`
+    /// (`BudgetMoved` otherwise). The FIRST trip wins the marker; pause rows
+    /// always union in while the brake is on (INSERT OR IGNORE) so a racing
+    /// second trip can't lose the agents it paused.
+    pub async fn trip_workspace_budget(
+        &self,
+        id: String,
+        cost_usd: f64,
+        at_ms: i64,
+        paused_agent_ids: Vec<String>,
+    ) -> Result<TripPersist> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<TripPersist> {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let n = tx.execute(
+                    "UPDATE workspaces \
+                     SET budget_exceeded_at = ?2, budget_exceeded_cost_usd = ?3 \
+                     WHERE id = ?1 AND budget_exceeded_at IS NULL \
+                       AND budget_usd IS NOT NULL AND budget_usd > 0 AND budget_usd <= ?3",
+                    params![id, at_ms, cost_usd],
+                )?;
+                let brake_on = if n > 0 {
+                    true
+                } else {
+                    // Either a concurrent trip beat us (brake on) or the cap
+                    // moved out from under the check (brake off) — distinguish
+                    // by re-reading the marker inside the same tx.
+                    tx.query_row(
+                        "SELECT budget_exceeded_at IS NOT NULL FROM workspaces WHERE id = ?1",
+                        params![id],
+                        |row| row.get(0),
+                    )?
+                };
+                if !brake_on {
+                    tx.rollback()?;
+                    return Ok(TripPersist::BudgetMoved);
+                }
+                {
+                    let mut ins = tx.prepare(
+                        "INSERT OR IGNORE INTO workspace_budget_pauses \
+                           (workspace_id, agent_id, paused_at) VALUES (?1, ?2, ?3)",
+                    )?;
+                    for agent_id in &paused_agent_ids {
+                        ins.execute(params![id, agent_id, at_ms])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(if n > 0 {
+                    TripPersist::Tripped
+                } else {
+                    TripPersist::AlreadyTripped
+                })
+            })
+        })
+        .await
+        .context("spawn_blocking trip_workspace_budget")?
+    }
+
+    /// Lift the brake: clear the exceeded marker AND consume the pause
+    /// ledger, returning the agent ids the brake had paused — the caller
+    /// resumes exactly those (operator-paused agents were never recorded,
+    /// so they stay paused). Empty vec when the brake wasn't on. Idempotent.
+    pub async fn lift_workspace_budget(&self, id: String) -> Result<Vec<String>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<Vec<String>> {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let paused: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT agent_id FROM workspace_budget_pauses WHERE workspace_id = ?1 \
+                         ORDER BY paused_at ASC",
+                    )?;
+                    let collected = stmt
+                        .query_map(params![id], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    collected
+                };
+                tx.execute(
+                    "DELETE FROM workspace_budget_pauses WHERE workspace_id = ?1",
+                    params![id],
+                )?;
+                tx.execute(
+                    "UPDATE workspaces \
+                     SET budget_exceeded_at = NULL, budget_exceeded_cost_usd = NULL \
+                     WHERE id = ?1",
+                    params![id],
+                )?;
+                tx.commit()?;
+                Ok(paused)
+            })
+        })
+        .await
+        .context("spawn_blocking lift_workspace_budget")?
+    }
+
+    /// Gate state for one workspace (the spawn gate). `None` = no such
+    /// workspace row.
+    pub async fn budget_gate_for_workspace(
+        &self,
+        workspace_id: String,
+    ) -> Result<Option<crate::models::BudgetGate>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<Option<crate::models::BudgetGate>> {
+                let mut stmt = conn.prepare(
+                    "SELECT id, budget_usd, budget_exceeded_at FROM workspaces WHERE id = ?1",
+                )?;
+                let mut rows = stmt.query(params![workspace_id])?;
+                if let Some(row) = rows.next()? {
+                    Ok(Some(crate::models::BudgetGate {
+                        workspace_id: row.get(0)?,
+                        budget_usd: row.get(1)?,
+                        exceeded_at: row.get(2)?,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
+        })
+        .await
+        .context("spawn_blocking budget_gate_for_workspace")?
+    }
+
+    /// Gate state for the workspace that owns `agent_id` (the turn-delivery
+    /// gates + the transcript usage hook). `None` when the agent row is
+    /// missing or carries no workspace (legacy orphans are ungated — same
+    /// posture as `interrupt_all`).
+    pub async fn budget_gate_for_agent(
+        &self,
+        agent_id: String,
+    ) -> Result<Option<crate::models::BudgetGate>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            with_busy_retry(&pool, |conn| -> rusqlite::Result<Option<crate::models::BudgetGate>> {
+                let mut stmt = conn.prepare(
+                    "SELECT w.id, w.budget_usd, w.budget_exceeded_at \
+                     FROM agents a JOIN workspaces w ON w.id = a.workspace_id \
+                     WHERE a.id = ?1",
+                )?;
+                let mut rows = stmt.query(params![agent_id])?;
+                if let Some(row) = rows.next()? {
+                    Ok(Some(crate::models::BudgetGate {
+                        workspace_id: row.get(0)?,
+                        budget_usd: row.get(1)?,
+                        exceeded_at: row.get(2)?,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
+        })
+        .await
+        .context("spawn_blocking budget_gate_for_agent")?
     }
 
     // ── threads (per-workspace directions) ──────────────────────────────

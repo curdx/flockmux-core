@@ -1,8 +1,8 @@
 /**
  * AgentActivityLog — 单 worker 的步骤级活动流（drawer「活动」tab）。
  *
- * 纯展示组件：活动数据由 useWorkspaceShellData 在全局唯一的 swarm 订阅里累积
- * （agentActivityById，有界），Shell 把该 agent 的活动列表作为 props 传进来。
+ * 纯展示组件：活动数据由 SwarmProjection 累积（agentActivityById，有界），
+ * Shell 把该 agent 的活动列表作为 props 传进来。
  * 这样切 tab / 关开抽屉 / 组件 remount 都不丢历史——数据不住在本组件里，
  * 不再 ephemeral（之前组件级订阅，未提前打开就看不到 worker 已经干过的事）。
  *

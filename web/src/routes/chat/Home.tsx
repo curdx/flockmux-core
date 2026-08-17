@@ -12,9 +12,9 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import { FolderOpen } from "lucide-react";
-import { api } from "../../api/http";
-import type { AgentInfo, SwarmEvent, Workspace } from "../../api/types";
-import { useSwarmFeed } from "../../hooks/useSwarmFeed";
+import { api, networkErrorCopy } from "../../api/http";
+import type { AgentInfo, Workspace } from "../../api/types";
+import { useSwarmRefresh } from "../../hooks/useSwarmProjection";
 import { accentToCssVar } from "../../lib/workspace";
 import { Welcome } from "../../components/Welcome";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -52,9 +52,13 @@ export default function ChatHome() {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
-  // CommandPalette → 新建 workspace 走 window event。
+  // CommandPalette → 新建 workspace 走 window event。标记 handled，免得
+  // AppShell 的全局兜底宿主再开一次（事件同步派发，本监听器先注册先执行）。
   useEffect(() => {
-    const onOpen = () => setWizardOpen(true);
+    const onOpen = (e: Event) => {
+      (e as CustomEvent<{ handled: boolean }>).detail.handled = true;
+      setWizardOpen(true);
+    };
     window.addEventListener("swarmx:open-wizard", onOpen as EventListener);
     return () =>
       window.removeEventListener("swarmx:open-wizard", onOpen as EventListener);
@@ -88,17 +92,12 @@ export default function ChatHome() {
     refreshWorkspaces();
   }, []);
 
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (ev.type === "agent_state") refreshAgents();
-      // workspace name / accent / membership now derived from the
-      // workspaces table + agents.workspace_id, so we don't need to
-      // listen for blackboard events here any more.
-    },
-    onReconnect: () => {
-      refreshAgents();
-      refreshWorkspaces();
-    },
+  useSwarmRefresh((s) => s.rosterGen, () => {
+    void refreshAgents();
+  });
+  useSwarmRefresh((s) => s.reconnectGen, () => {
+    void refreshAgents();
+    void refreshWorkspaces();
   });
 
   const workspaces = useMemo<WorkspaceSummary[]>(() => {
@@ -224,10 +223,7 @@ export default function ChatHome() {
                 {t("home.backendUnreachable", { defaultValue: "连接不上后端服务" })}
               </p>
               <p className="max-w-sm font-caption text-xs text-foreground-tertiary">
-                {t("home.backendUnreachableDesc", {
-                  defaultValue:
-                    "服务还没准备好。若顶部有「重启」请点一下；开发时请确认后端已启动，然后重试。",
-                })}
+                {networkErrorCopy()}
               </p>
               <Button
                 variant="secondary"

@@ -26,7 +26,7 @@ import { api, ApiError } from "../../../api/http";
 import { downloadRecordingCast } from "@/lib/download";
 import { getCachedCastPreview, loadCastPreview } from "@/lib/castPreview";
 import type { AgentInfo, RecordingInfo } from "../../../api/types";
-import { useSwarmFeed } from "../../../hooks/useSwarmFeed";
+import { useSwarmRefresh } from "../../../hooks/useSwarmProjection";
 import { Button } from "@/components/ui/button";
 import { AgentChip } from "@/components/agent/AgentChip";
 import { EmptyState } from "@/components/EmptyState";
@@ -167,12 +167,8 @@ export default function ReplaysView() {
     [],
   );
 
-  useSwarmFeed({
-    onEvent: (ev) => {
-      if (ev.type === "agent_state" && ev.state === "exited") debouncedRefresh();
-    },
-    onReconnect: () => refresh(),
-  });
+  useSwarmRefresh((s) => s.recordingsGen, debouncedRefresh);
+  useSwarmRefresh((s) => s.reconnectGen, refresh);
 
   const scopedToWorkspace = useMemo(() => {
     return items.filter((r) => {

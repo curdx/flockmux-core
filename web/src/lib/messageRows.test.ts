@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { GROUP_GAP_MS, buildRows, formatElapsed, resolveRole } from "./messageRows";
+import {
+  GROUP_GAP_MS,
+  buildRows,
+  collapseChatMessages,
+  formatElapsed,
+  isOperatorChatNoise,
+  resolveRole,
+} from "./messageRows";
 import type { MessageRecord } from "../api/types";
 
 function msg(partial: Partial<MessageRecord>): MessageRecord {
@@ -57,6 +64,47 @@ describe("resolveRole", () => {
   it("falls back to the first id segment", () => {
     expect(resolveRole("claude-abc", new Map())).toBe("claude");
     expect(resolveRole("_writer_xyz", new Map())).toBe("writer");
+  });
+});
+
+describe("isOperatorChatNoise", () => {
+  it("hides cron and wake rows", () => {
+    expect(isOperatorChatNoise(msg({ from_agent: "cron", kind: "note" }))).toBe(true);
+    expect(isOperatorChatNoise(msg({ from_agent: "system", kind: "wake" }))).toBe(true);
+    expect(isOperatorChatNoise(msg({ from_agent: "claude-1", kind: "reply" }))).toBe(false);
+  });
+});
+
+describe("collapseChatMessages", () => {
+  it("drops cron rows and collapses consecutive same-role dispatches", () => {
+    const rows = collapseChatMessages([
+      msg({ id: 1, from_agent: "cron", kind: "note", body: "don't spawn", sent_at: 1 }),
+      msg({
+        id: 2,
+        from_agent: "system",
+        kind: "system",
+        sent_at: 2,
+        meta: { subtype: "dispatch", child_role: "researcher", child_agent: "a" },
+      }),
+      msg({
+        id: 3,
+        from_agent: "system",
+        kind: "system",
+        sent_at: 3,
+        meta: { subtype: "dispatch", child_role: "researcher", child_agent: "b" },
+      }),
+      msg({
+        id: 4,
+        from_agent: "system",
+        kind: "system",
+        sent_at: 4,
+        meta: { subtype: "dispatch", child_role: "writer", child_agent: "c" },
+      }),
+    ]);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].meta?.child_agent).toBe("b");
+    expect(rows[0].meta?.dispatch_count).toBe(2);
+    expect(rows[1].meta?.child_role).toBe("writer");
   });
 });
 

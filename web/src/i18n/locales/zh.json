@@ -121,9 +121,6 @@
   },
   "nav": {
     "chat": "对话",
-    "dag": "协作图",
-    "replays": "录像库",
-    "context": "上下文",
     "notifications": "通知",
     "mcp": "MCP",
     "goals": "目标",
@@ -139,7 +136,8 @@
       "dark": "深色",
       "system": "跟随系统",
       "toggleHint": "主题:{{current}} · 点击切换到{{next}}"
-    }
+    },
+    "more": "更多"
   },
   "shell": {
     "cmdkHint": "按 {{shortcut}} 打开命令面板",
@@ -305,7 +303,11 @@
     "gitInitNotice": "第一次开竞赛时，如果项目还不是 git 仓库，会在项目目录初始化并提交一次；node_modules、target、dist 会跳过。",
     "synthesize": "综合最优",
     "synthHint": "派一位评审把各家优点合成一版再合并（不是只挑一个赢家）",
-    "synthStarted": "已派出综合者，会把各家优点合成一版再合并"
+    "synthStarted": "已派出综合者，会把各家优点合成一版再合并",
+    "confirmPickTitle": "选为赢家并合并？",
+    "confirmPickDesc": "将把「{{name}}」的改动合并回主线。这会直接改动代码，无法自动撤销。",
+    "confirmPickDescBranch": "将把「{{name}}」分支（{{branch}}）的改动合并回主线。这会直接改动代码，无法自动撤销。",
+    "confirmPickConfirm": "选为赢家并合并"
   },
   "consult": {
     "title": "多模对比",
@@ -341,7 +343,7 @@
   },
   "error": {
     "title": "这个视图出错了",
-    "body": "其它部分仍可正常使用。可以重试，或刷新整个页面。",
+    "body": "可以重试当前页面，或刷新整个页面。",
     "retry": "重试",
     "reload": "刷新页面"
   },
@@ -371,7 +373,11 @@
       "failure": "失败处理",
       "failureHint": "有成员出错时，要不要把同一批一起停掉",
       "killOthers": "失败时停掉同一批其他成员",
-      "killOthersHint": "开启后，只要有一个成员异常退出，同一次任务里的其他人会一起停掉"
+      "killOthersHint": "开启后，只要有一个成员异常退出，同一次任务里的其他人会一起停掉",
+      "lab": "实验室功能",
+      "labFieldHint": "实验中的功能，默认关闭",
+      "labToggle": "显示实验室功能",
+      "labToggleHint": "开启后，工作区顶部会出现「竞赛」「多模对比」标签；随时可关，功能数据不受影响。"
     },
     "appearance": {
       "title": "外观",
@@ -472,7 +478,28 @@
       "clearHint": "清掉语言、主题、已读通知等。刷新后恢复默认。",
       "clearButton": "清空本机偏好",
       "clearConfirm": "确定清空？此操作不可撤销。",
-      "cleared": "已清空 {{count}} 项"
+      "cleared": "已清空 {{count}} 项",
+      "statsTitle": "本机统计",
+      "statsHint": "使用计数只存在本机，从不上传。",
+      "statsCollect": "收集使用计数",
+      "statsCollectHint": "只记次数（例如打开命令面板的次数），不含任何内容；只存在本机，从不上传。关闭后不再记录。",
+      "statsEmpty": "还没有任何记录。",
+      "statsClear": "清零",
+      "statsClearTitle": "清零本机统计",
+      "statsClearConfirm": "删除所有已记录的使用计数，此操作不可撤销。「收集开关」不受影响。",
+      "statsCleared": "本机统计已清零",
+      "statsEvent": {
+        "paletteOpen": "打开命令面板",
+        "reportExport": "导出战报",
+        "labOn": "开启实验室功能",
+        "labOff": "关闭实验室功能",
+        "tabChat": "切换到「对话」标签",
+        "tabDag": "切换到「协作图」标签",
+        "tabLedger": "切换到「工作记录」标签",
+        "tabFusion": "切换到「竞赛」标签",
+        "tabConsult": "切换到「多模对比」标签",
+        "tabReplays": "切换到「录像」标签"
+      }
     },
     "about": {
       "title": "关于",
@@ -557,6 +584,7 @@
     },
     "dispatch": {
       "title": "派给 {{role}}",
+      "titleCount": "派给 {{role}} · {{count}}",
       "open": "查看 {{role}}"
     },
     "delivery": {
@@ -624,7 +652,8 @@
       "replays": "录像",
       "consult": "多模对比",
       "advanced": "高级",
-      "advancedHint": "协作图、工作记录、竞赛、多模对比、录像"
+      "advancedHint": "协作图、工作记录、竞赛、多模对比、录像",
+      "advancedHintLabOff": "协作图、工作记录、录像"
     },
     "backToChat": "← 返回 {{name}}",
     "globalScopeHint": "当前显示所有工作空间的数据 · 在聊天中选择某个工作空间可仅查看该工作空间",
@@ -641,6 +670,7 @@
     "members": "成员",
     "selectWorkspace": "选中一个工作空间查看成员",
     "noMembers": "还没有成员在线。在对话里发一条消息，规划就会上线。",
+    "noMembersAway": "成员已下线。再发一条消息，规划会回来。",
     "reviveOrchestrator": "手动唤醒规划",
     "reviving": "唤醒中…",
     "pmBadge": "规划",
@@ -654,11 +684,13 @@
     "workspaceStatRoots": "{{count}} 源码",
     "attachSource": "挂载源码上下文",
     "workspaceStripOnline": "{{count}} 个 AI 在线",
-    "workspaceStripIdle": "AI 未在线",
+    "workspaceStripIdle": "AI 未上线",
+    "workspaceStripAway": "AI 已下线",
     "workspaceStripSources": "{{count}} 个源码上下文",
     "workspaceStripCliUsable": "AI 引擎可用：{{names}}",
     "workspaceStripCliInstalled": "AI 引擎已安装：{{names}}",
     "workspaceStripCliMissing": "还没有可用 AI 引擎。安装 Codex 或 Claude 后才能自动上线。",
+    "costChipHint": "本工作空间累计估算花费（不等于订阅账单）· 点击查看用量",
     "workspaceStripCliInstallHelp": "设置页会给出官方安装、验证和登录命令。",
     "workspaceStripCliPartial": "可继续工作：会使用 {{names}}；缺失的 {{missing}} 可稍后补齐。",
     "workspaceStripSetupCli": "安装 AI 引擎",
@@ -761,7 +793,10 @@
     "handoffMissing": {
       "title": "{{count}} 个成员离开时没交结果",
       "hint": "发一条消息，让规划帮你补上就行"
-    }
+    },
+    "costChipUncollectedOnly": "{{engines}} 引擎暂不纳入用量统计:实际花费不显示,也不触发预算刹车。点击查看用量",
+    "costChipNotCounted": "暂不统计",
+    "costChipUncollectedHint": "其中 {{engines}} 引擎暂不纳入统计,其实际花费不含在内"
   },
   "dag": {
     "a11y": {
@@ -868,21 +903,6 @@
     "liveTruncatedHint": "录制中，内容不完整：回放只到当前已落盘的部分，结尾可能突然截断。完结后重新打开可看到完整录像。",
     "popupBlocked": "弹窗被拦截"
   },
-  "context": {
-    "title": "上下文",
-    "subtitle": "{{count}} 个 key · 浏览 + 历史（由 agent 写入）",
-    "search": "按 key 搜索",
-    "empty": "共享区暂无内容",
-    "selectKey": "左侧选一个 key 查看",
-    "rendered": "渲染",
-    "raw": "原文",
-    "noSelection": "没有选中任何 key",
-    "meta": "元数据",
-    "size": "大小",
-    "history": "历史 ({{count}})",
-    "noHistory": "暂无历史",
-    "rightHint": "选中 key 查看元数据与历史"
-  },
   "notifications": {
     "title": "通知",
     "subtitle": "来自 /ws/swarm · {{count}} 条未读",
@@ -899,6 +919,7 @@
       "completed": "完成"
     },
     "empty": "该分类暂无通知",
+    "loading": "正在加载通知…",
     "emptyHint": "有成员消息、进展更新或状态变化时，通知会自动出现在这里。",
     "loadError": "加载通知失败",
     "viewAll": "查看全部",
@@ -912,6 +933,7 @@
       "taskLedger": "任务记录更新",
       "progressLedger": "进展状态更新",
       "update": "{{name}} 更新",
+      "failed": "一项工作失败了",
       "mainDir": "主线"
     },
     "fromUser": "你",
@@ -942,6 +964,7 @@
   },
   "agent": {
     "close": "关闭（Esc）",
+    "drawerTitle": "{{role}}",
     "sendMessage": "发送消息",
     "wake": "手动催一下",
     "pause": "暂停",
@@ -958,10 +981,12 @@
       "resume": {
         "title": "让 {{role}} 继续？",
         "desc": "会恢复自动催促，并让它马上接着干。"
+      },
+      "kill": {
+        "title": "终止 {{role}}？",
+        "desc": "会立即结束它的进程，正在做的这一轮会丢失；已完成的部分仍可在「录像 / 消息」里回看。"
       }
     },
-    "restart": "重启",
-    "notImplemented": "暂未实现",
     "terminalLoading": "正在确认状态…",
     "terminalExited": "这位成员已退出，终端不可用。它干了什么可以在「录像 / 消息 / 上下文」里回看。",
     "tabs": {
@@ -1009,10 +1034,14 @@
       "lived": "存活 {{delta}}",
       "error": "出错·无法工作",
       "ended": "已结束",
-      "paused": "已暂停"
+      "paused": "已暂停",
+      "stuckSuspect": "疑似卡住·唤醒无响应"
     },
     "wakeOk": "已催促 {{role}}",
     "wakeFailed": "催促失败",
+    "kill": "终止",
+    "killOk": "已终止 {{role}}",
+    "killFailed": "终止失败",
     "resumeFailed": "无法继续",
     "pauseFailed": "无法暂停",
     "deadNoAction": "这位成员已结束，无法操作",
@@ -1029,6 +1058,7 @@
     "title": "创建工作空间",
     "subtitle": "先选主项目，AI 会自动准备上下文",
     "step1": "给工作空间起个名字",
+    "nameLabel": "名称",
     "namePlaceholder": "例如：我的待办 App",
     "aiNamed": "AI 起名",
     "errAbsolutePath": "请填写绝对路径（以 / 开头），例如 /Users/你的用户名/code/项目",
@@ -1057,10 +1087,10 @@
     "addDir": "再加一个文件夹",
     "pickFolder": "选择文件夹（打开系统对话框）",
     "pickFolderShort": "选择…",
-    "pickFolderUnavailable": "在桌面 app 内可直接选文件夹；浏览器调试模式请手动粘路径",
+    "pickFolderUnavailable": "桌面版可直接选文件夹；网页请粘贴本机绝对路径",
     "accentLabel": "标识色",
     "captainEngine": "规划用引擎",
-    "captainDefault": "默认（Claude）",
+    "captainDefault": "自动选择",
     "captainNotInstalled": "（未安装）",
     "accentTitle": "标识色：{{name}}",
     "accentColors": {
@@ -1074,7 +1104,7 @@
     "needName": "先起个名字",
     "needPath": "先填项目路径",
     "checkingPath": "正在检查路径…",
-    "pathInvalid": "路径无效或目录还不存在——建好目录后点「开始」会再检查一次",
+    "pathInvalid": "路径无效或目录还不存在，请先建好再点开始",
     "fixAttached": "附加目录有问题——展开「高级」修正，或收起以忽略",
     "gitInitSummary": "关于版本控制（可选了解）",
     "gitInitNotice": "只有在你命名方向或发起竞赛时，才会在该目录初始化 git 并做一次全量提交（node_modules / target / dist 会自动排除）。平时建空间不会动你的仓库。",
@@ -1088,7 +1118,20 @@
     "pathNotADirectory": "这个路径是一个文件,不是文件夹 —— 请填项目所在的文件夹路径。",
     "pathPermissionDenied": "没有访问该目录的权限 —— 换一个你有读取权限的目录,或在系统里授予访问权。",
     "attachedErrorCount": "{{count}} 个附加目录有问题，展开修正",
-    "pickFolderTitle": "选择项目文件夹"
+    "pickFolderTitle": "选择项目文件夹",
+    "stepEngines": "确认 AI 引擎能干活",
+    "stepEnginesHint": "「重新检测」会真实启动各引擎，约几十秒",
+    "engineStepIntro": "「已安装」不代表能干活（可能没登录）。至少一个引擎能干活或已装好，才能继续。",
+    "engineProbing": "检测中…",
+    "engineReprobe": "重新检测",
+    "engineLoading": "正在查看本机引擎…",
+    "engineLoadFailed": "没能读到引擎状态。可以直接继续，或稍后点「重新检测」。",
+    "engineNeedsLoginGuide": "去「终端」页登录它，然后点「重新检测」。",
+    "engineMissingGuide": "去「设置」页一键安装，装好后点「重新检测」。",
+    "engineNotUsableGuide": "它没能启动（鼠标悬停可看原因）。处理好之后点「重新检测」。",
+    "engineUnverifiedGuide": "已装好、还没实测过。可以直接继续，也可以点「重新检测」确认。",
+    "noUsableEngine": "还没有能干活的 AI 引擎——去「设置」页装一个，或去「终端」页登录后点「重新检测」",
+    "engineProbeWait": "正在检测引擎，等结果出来再继续…"
   },
   "messages": {
     "filter": "过滤 发送方 / 接收方 / 正文",
@@ -1166,7 +1209,9 @@
     "previewError": "渲染失败",
     "truncatedNotice": "内容过长，仅渲染前 {{n}} 字符",
     "jumpNotVisible": "#{{id}} 不在当前对话里(可能属于别的房间/方向或已滚出范围)",
-    "jumpUnreadNone": "当前对话里没有未读消息了"
+    "jumpUnreadNone": "当前对话里没有未读消息了",
+    "filterWithShortcut": "搜索消息 ({{chord}})",
+    "mentionListboxLabel": "选择要 @ 的成员"
   },
   "cron": {
     "title": "定时任务",
@@ -1205,6 +1250,7 @@
     "cancel": "取消",
     "enable": "启用",
     "disable": "停用",
+    "enabledState": "已启用",
     "paused": "已暂停",
     "lastRun": "上次",
     "running": "触发中…",
@@ -1228,11 +1274,11 @@
     "previewHint": "选择左侧文件预览",
     "binary": "二进制文件，不预览",
     "truncated": "已截断",
-    "browseAll": "浏览整个文件系统",
-    "jailBlocked": "超出当前工作空间范围 — 打开「浏览整个文件系统」以查看。",
+    "browseAll": "浏览工作空间外的文件",
+    "jailBlocked": "超出当前工作空间范围 — 打开「浏览工作空间外的文件」以查看。",
     "readFailed": "文件加载失败",
     "workspacesLoadFailed": "工作区加载失败,请重试",
-    "browseAllWarning": "解除工作区隔离,可浏览整台机器的文件 — 请谨慎使用。",
+    "browseAllWarning": "解除工作区隔离，可浏览工作空间外的文件 — 请谨慎使用。",
     "previewCapped": "仅预览前 {{size}}",
     "noWorkspace": "还没有选择工作区",
     "noWorkspaceHint": "在上方选择一个工作区，即可浏览它的目录与文件。",
@@ -1252,7 +1298,7 @@
     "manual": "手动",
     "live": "运行中",
     "delivered": "已交付",
-    "undelivered": "未交结果",
+    "undelivered": "尚无交付结果",
     "failed": "失败",
     "showAll": "显示全部 {{n}}",
     "collapse": "收起",
@@ -1395,7 +1441,10 @@
     "emptyAction": "去聊天发起",
     "loadError": "用量数据加载失败",
     "chartTableCaption": "每日用量（按日期）",
-    "day": "日期"
+    "day": "日期",
+    "notCountedHint": "{{engine}} 引擎暂不被采集用量:实际花费不显示,也不会触发预算刹车。",
+    "notCounted": "不计入",
+    "uncollectedNote": "{{engines}} 引擎暂不计入用量统计:这些成员的实际花费不显示在本页,也不会触发预算刹车。"
   },
   "terminal": {
     "confirmTitle": "连接本机终端",
@@ -1594,7 +1643,27 @@
     "breadcrumbsCount": "{{n}} 位成员",
     "breadcrumbsEmpty": "还没有成员近况",
     "breadcrumbsEmptyHint": "派出去的成员每完成一步（装依赖、构建、写代码等），这里就会多一行。",
-    "readFailed": "读取失败: {{msg}}"
+    "readFailed": "读取失败: {{msg}}",
+    "report": {
+      "button": "导出战报",
+      "exporting": "导出中…",
+      "hint": "把任务记录、进展、成员和费用估算导出成 Markdown",
+      "failed": "导出战报失败",
+      "title": "战报",
+      "generatedAt": "生成时间",
+      "direction": "方向",
+      "cost": "费用（估算）",
+      "tokens": "tokens（入/出）",
+      "events": "事件",
+      "usageUnavailable": "读取失败",
+      "members": "成员",
+      "emptySection": "（暂无内容）",
+      "statusKilled": "已终止",
+      "statusExited": "已退出（码 {{code}}）",
+      "statusRunning": "运行中",
+      "statusStarting": "启动中",
+      "uncollectedCost": "不含 {{engines}} 引擎的花费（暂不采集）"
+    }
   },
   "home": {
     "deleteFailed": "删除工作空间失败",
@@ -1603,7 +1672,8 @@
     "workspaceCount_other": "{{count}} 个工作空间",
     "loadingWorkspaces": "正在读取工作空间…",
     "backendUnreachable": "暂时读不到工作空间",
-    "backendUnreachableDesc": "服务还没准备好。若顶部有「重启」请点一下；开发时请确认后端已启动，然后重试。"
+    "backendUnreachableDesc": "暂时连不上本地服务。开发时请确认后端已启动，然后重试。",
+    "workspaceCount": "{{count}} 个工作空间"
   },
   "recordings": {
     "downloadFailed": "下载录像失败",
@@ -1665,7 +1735,6 @@
     "more": "+{{count}}",
     "openAgent": "查看 {{role}}",
     "askCaptain": "跟规划说 · {{role}}",
-    "askCaptainToast": "在下面跟规划说一声就行",
     "dismiss": "收起 {{role}}",
     "dismissAll": "知道了",
     "nudgeAgent": "催 {{role}} 继续",
@@ -1675,7 +1744,37 @@
       "error": "出问题了",
       "handoff": "没交结果",
       "stalled": "好像卡住了",
-      "nudge": "催一下"
+      "nudge": "催一下",
+      "stuck": "疑似卡住"
     }
+  },
+  "budget": {
+    "bannerTitle": "已达预算上限（估算），成员已暂停",
+    "bannerDetail": "trip 时估算 {{cost}} / 上限 {{budget}}；金额为估算，不等于订阅账单。调高预算或清除上限后成员自动恢复。",
+    "bannerAction": "去调整预算",
+    "editorTitle": "预算刹车（估算）",
+    "editorHint": "到达上限时暂停本工作空间全部成员，并拒绝新成员/新回合；调高或清除后自动恢复。金额为估算，不等于订阅账单。",
+    "capLabel": "上限 (USD)",
+    "unlimited": "不限",
+    "clear": "清除上限",
+    "currentEstimate": "当前估算花费",
+    "currentCap": "当前上限",
+    "exceededNote": "刹车已触发（trip 时估算 {{cost}})：成员已暂停，新任务被拒绝。调高预算或清除上限后，成员自动恢复。",
+    "invalidInput": "请输入非负数字（留空或 0 表示不限）",
+    "saved": "预算已保存",
+    "cleared": "已清除预算上限",
+    "uncollectedNote": "注意:{{engines}} 引擎暂不计入用量统计,预算刹车覆盖不到这些成员(花费不显示,也不触发刹车)。",
+    "bannerRaisedStillExceeded": "已调高到 {{amount}},但最新估算仍超上限",
+    "bannerRaised": "预算已调高到 {{amount}},成员恢复运行",
+    "bannerRaiseFailed": "调高预算失败",
+    "bannerRaiseResume": "调高到 {{amount}} 并恢复"
+  },
+  "lab": {
+    "gateTitle": "实验室功能已关闭",
+    "gateHint": "「{{feature}}」还在实验阶段，默认不展示；开启后即可使用。",
+    "gateAction": "去设置开启"
+  },
+  "watchdog": {
+    "nudging": "系统正在唤醒它"
   }
 }

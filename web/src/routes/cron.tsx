@@ -591,7 +591,7 @@ export default function CronRoute() {
                         type="button"
                         role="switch"
                         aria-checked={j.enabled}
-                        aria-label={j.enabled ? t("cron.disable") : t("cron.enable")}
+                        aria-label={j.enabled ? t("cron.enabledState") : t("cron.paused")}
                         disabled={togglingId === j.id}
                         onClick={() => toggle(j.id)}
                         title={j.enabled ? t("cron.disable") : t("cron.enable")}

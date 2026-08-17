@@ -1,7 +1,7 @@
 /**
  * McpActivityBar — 最外层应用导航菜单，常驻在 AppShell 内容区最左。横排菜单项
  * (图标 + 文字)，可展开/收起成纯图标窄条(状态存 localStorage)：
- *   - 顶部组 → 对话 / 文件 / 终端 / MCP / 定时 / 目标 / 任务 / 用量(各自独立页面)
+ *   - 顶部组 → 对话 / 用量 常驻;文件 / 终端 / MCP / 定时 / 目标 / 任务 收进「更多」
  *   - 底部分组 → 设置
  *   - 最底     → 菜单展开/收起开关
  *
@@ -10,6 +10,10 @@
  *
  * 这些页面以前只能 ⌘K 或直接敲 URL 到达(发现性差)；放进常驻左栏作为 app-level
  * 入口。图标/标签与 CommandPalette 的 NAV 保持一致。
+ *
+ * R3 形态收敛:栏里只钉 对话 / 用量(设置固定在底部),其余六个目的地收进
+ * 「更多」展开区 —— 每个页面仍然可达,这是 declutter,不是删除。落在被收起的
+ * 页面上时「更多」自动展开(跟 WorkspaceToolbar 的「高级」一个思路)。
  */
 
 import { cloneElement, useEffect, useState, type ComponentType, type ReactElement } from "react";
@@ -18,6 +22,7 @@ import { useTranslation } from "react-i18next";
 import {
   BarChart3,
   Blocks,
+  ChevronDown,
   ChevronsLeft,
   ChevronsRight,
   ClipboardList,
@@ -43,28 +48,33 @@ import type { ThemeMode } from "@/lib/theme";
 
 const MENU_KEY = "swarmx:mcp:menuCollapsed:v1";
 
-/** Top nav group — app-level destinations (each a standalone route). Keep
- *  labels/icons in sync with NAV in components/CommandPalette.tsx. */
-const NAV: ReadonlyArray<{
+interface NavEntry {
   href: string;
   labelKey: string;
   fallback: string;
   icon: ComponentType<{ className?: string }>;
-}> = [
+}
+
+/** Top nav group — app-level destinations (each a standalone route). Keep
+ *  labels/icons in sync with NAV in components/CommandPalette.tsx. */
+const NAV: ReadonlyArray<NavEntry> = [
   // Chat (the workspace surface) leads — it's the product's primary feature and
   // every other page is a tool around it. Without this anchor the only way back
   // to a conversation from a tool page was the logo, and no rail item was ever
   // active on /chat. `startsWith("/chat")` keeps it lit across the Flow/Ledger/
-  // Replays sub-tabs too. MCP is a power-user setup surface, so it sits with the
-  // other workspace tools rather than heading the list.
+  // Replays sub-tabs too.
   { href: "/chat", labelKey: "nav.chat", fallback: "对话", icon: MessageSquare },
+  { href: "/usage", labelKey: "nav.usage", fallback: "用量", icon: BarChart3 },
+];
+
+/** R3「更多」区:次要工具页默认收起,点开或落在这些路由上时展开。 */
+const NAV_MORE: ReadonlyArray<NavEntry> = [
   { href: "/files", labelKey: "nav.files", fallback: "文件", icon: FolderTree },
   { href: "/terminal", labelKey: "nav.terminal", fallback: "终端", icon: Terminal },
   { href: "/mcp", labelKey: "mcp.title", fallback: "MCP", icon: Blocks },
   { href: "/cron", labelKey: "nav.cron", fallback: "定时", icon: Clock },
   { href: "/goals", labelKey: "nav.goals", fallback: "目标", icon: Flag },
   { href: "/tasks", labelKey: "nav.tasks", fallback: "任务", icon: ClipboardList },
-  { href: "/usage", labelKey: "nav.usage", fallback: "用量", icon: BarChart3 },
 ];
 
 function readFlag(key: string): boolean {
@@ -132,6 +142,29 @@ export function McpActivityBar() {
       cloneElement(node, { key })
     );
 
+  // R3「更多」区:session-only 展开状态(不落 localStorage —— 跟工具栏「高级」
+  // 同理,持久化的展开会把陌生人永远埋在完整列表里);当前路由在收起组里时
+  // 自动展开,保证 active 高亮永远可见。
+  const onMoreRoute = NAV_MORE.some((e) => pathname.startsWith(e.href));
+  const [moreExpanded, setMoreExpanded] = useState(false);
+  const moreOpen = moreExpanded || onMoreRoute;
+
+  const renderNavItem = ({ href, labelKey, fallback, icon: Icon }: NavEntry) => {
+    const label = t(labelKey, fallback);
+    return withTip(
+      label,
+      <NavLink
+        to={href}
+        aria-label={label}
+        className={linkClass(pathname.startsWith(href))}
+      >
+        <Icon className="size-[18px] shrink-0" />
+        {!collapsed && <span className="font-heading">{label}</span>}
+      </NavLink>,
+      href,
+    );
+  };
+
   return (
     <aside
       className={cn(
@@ -140,22 +173,34 @@ export function McpActivityBar() {
       )}
     >
       <div className="flex flex-col gap-1">
-        {/* 顶部组：对话 / 文件 / 终端 / MCP / 定时 / 目标 / 任务 / 用量 */}
-        {NAV.map(({ href, labelKey, fallback, icon: Icon }) => {
-          const label = t(labelKey, fallback);
-          return withTip(
-            label,
-            <NavLink
-              to={href}
-              aria-label={label}
-              className={linkClass(pathname.startsWith(href))}
-            >
-              <Icon className="size-[18px] shrink-0" />
-              {!collapsed && <span className="font-heading">{label}</span>}
-            </NavLink>,
-            href,
-          );
-        })}
+        {/* 顶部常驻:对话 / 用量 */}
+        {NAV.map(renderNavItem)}
+
+        {/* 「更多」:文件 / 终端 / MCP / 定时 / 目标 / 任务(默认收起) */}
+        {withTip(
+          t("nav.more", { defaultValue: "更多" }),
+          <button
+            type="button"
+            onClick={() => setMoreExpanded((v) => !v)}
+            aria-expanded={moreOpen}
+            aria-label={t("nav.more", { defaultValue: "更多" })}
+            className={cn(itemBase, collapsed && "justify-center px-0", itemIdle)}
+          >
+            <ChevronDown
+              className={cn(
+                "size-[18px] shrink-0 transition-transform",
+                moreOpen && "rotate-180",
+              )}
+            />
+            {!collapsed && (
+              <span className="font-heading">
+                {t("nav.more", { defaultValue: "更多" })}
+              </span>
+            )}
+          </button>,
+          "more-toggle",
+        )}
+        {moreOpen && NAV_MORE.map(renderNavItem)}
       </div>
 
       {/* 底部分组：设置固定可见，不再和折叠按钮互相挤压。 */}

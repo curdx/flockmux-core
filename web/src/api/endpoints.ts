@@ -156,6 +156,9 @@ export const apiRoutes = {
     rootSuggestions: (id: string, projectPath?: string) =>
       endpoint("workspaces.rootSuggestions", "GET", `/api/workspaces/${encodeURIComponent(id)}/root-suggestions${queryString({ path: projectPath })}`),
     branches: (id: string) => endpoint("workspaces.branches", "GET", `/api/workspaces/${encodeURIComponent(id)}/branches`),
+    /** Workspace budget brake: read the cap + live estimate, set/clear the cap. */
+    budget: (id: string) => endpoint("workspaces.budget", "GET", `/api/workspaces/${encodeURIComponent(id)}/budget`),
+    setBudget: (id: string) => endpoint("workspaces.setBudget", "PUT", `/api/workspaces/${encodeURIComponent(id)}/budget`),
     threads: (id: string) => endpoint("workspaces.threads", "GET", `/api/workspaces/${encodeURIComponent(id)}/threads`),
     createThread: (id: string) => endpoint("workspaces.createThread", "POST", `/api/workspaces/${encodeURIComponent(id)}/threads`),
     updateThread: (id: string, threadId: string) =>

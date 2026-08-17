@@ -16,7 +16,9 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import type { TFunction } from "i18next";
+import { TFunction } from "i18next";
+import i18n from "@/i18n";
+import { dateLocale } from "@/lib/dateLocale";
 import {
   AlertTriangle,
   Bell,
@@ -49,7 +51,10 @@ import {
   friendlyAgent,
   humanizeBlackboard,
   isHiddenWake,
+  isNoisyBlackboard,
   notifBody,
+  NOTIF_READ_KEY,
+  notifyNotifReadChanged,
 } from "@/lib/notif";
 import { buildRoleLookup, resolveRole } from "@/lib/agent";
 
@@ -86,11 +91,10 @@ const KIND_ICON: Record<NotifKind, typeof Bell> = {
   completed: CheckCircle2,
 };
 
-const READ_KEY = "swarmx:notif:read:v1";
 
 function loadRead(): Set<string> {
   try {
-    const raw = window.localStorage.getItem(READ_KEY);
+    const raw = window.localStorage.getItem(NOTIF_READ_KEY);
     if (!raw) return new Set();
     return new Set(JSON.parse(raw));
   } catch {
@@ -100,9 +104,9 @@ function loadRead(): Set<string> {
 
 function saveRead(s: Set<string>) {
   try {
-    // Cap at 500 ids so the key doesn't grow unbounded.
     const arr = Array.from(s).slice(-500);
-    window.localStorage.setItem(READ_KEY, JSON.stringify(arr));
+    window.localStorage.setItem(NOTIF_READ_KEY, JSON.stringify(arr));
+    notifyNotifReadChanged();
   } catch {
     /* ignore */
   }
@@ -113,7 +117,10 @@ function fmtTime(ms: number): string {
   if (delta < 60_000) return "_now_";
   if (delta < 3_600_000) return `_min_${Math.floor(delta / 60_000)}`;
   if (delta < 86_400_000) return `_hour_${Math.floor(delta / 3_600_000)}`;
-  return new Date(ms).toLocaleString();
+  const locale = dateLocale(i18n.language);
+  return new Date(ms).toLocaleString(locale, {
+    hour12: locale?.startsWith("zh") ? false : undefined,
+  });
 }
 
 // Resolve the sentinel strings returned by fmtTime against the active locale.
@@ -266,13 +273,6 @@ function classifyMessage(
     kind: "message",
     title: `${friendlyAgent(m.from_agent, roleLookup, t)} → ${friendlyAgent(m.to_agent, roleLookup, t)}`,
   };
-}
-
-/** Worker heartbeats (`<wsId>/<role>.progress.md`) are written on every
- *  milestone — dozens per task. They're already surfaced in the Ledger 近况
- *  pane; as notifications they bury the real messages. Skip them here. */
-function isNoisyBlackboard(path: string): boolean {
-  return path.endsWith(".progress.md");
 }
 
 /** Extract the numeric message id from a `msg-<N>` notification id, or null
@@ -448,7 +448,7 @@ export default function NotificationsRoute() {
       }
       agentWsRef.current = agentWs;
       const fromMsg: Notif[] = (msgs as MessageRecord[])
-        .filter((m) => !isHiddenWake(m))
+        .filter((m) => !isHiddenWake(m) && m.from_agent !== "cron")
         .map((m) => {
           const c = classifyMessage(m, t, roleRef.current);
           return {
@@ -498,14 +498,6 @@ export default function NotificationsRoute() {
 
   useEffect(() => {
     let alive = true;
-    // AppShell.markSeen() writes session-seen ids into READ_KEY from a parent
-    // effect that fires AFTER this child effect (effects run child→parent), so
-    // the initial useState(loadRead) snapshot misses them on a direct nav to
-    // /notifications — the bell badge cleared but the center still rendered those
-    // items unread until a reload. Re-sync from storage once seed settles (well
-    // after the parent effect) so both views agree. saveRead keeps storage
-    // authoritative on every markRead, so this only ever ADDS seen ids — it can
-    // never drop a user-marked read.
     seed().finally(() => {
       if (alive) setRead(loadRead());
     });
@@ -519,7 +511,7 @@ export default function NotificationsRoute() {
       setItems((prev) => {
         let next: Notif | null = null;
         if (ev.type === "message") {
-          if (isHiddenWake(ev)) return prev;
+          if (isHiddenWake(ev) || ev.from_agent === "cron") return prev;
           const rec: MessageRecord = {
             id: ev.id,
             from_agent: ev.from_agent,
@@ -609,7 +601,13 @@ export default function NotificationsRoute() {
       const ws = n.workspaceId
         ? wsRef.current.find((w) => w.id === n.workspaceId)
         : undefined;
-      if (ws) navigate(`/chat/${ws.slug}/ledger`);
+      if (ws) {
+        if (n.kind === "blackboard") {
+          navigate(`/chat/${ws.slug}/ledger`);
+        } else {
+          navigate(`/chat/${ws.slug}`);
+        }
+      }
     },
     [markRead, navigate],
   );

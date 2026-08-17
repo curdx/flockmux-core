@@ -613,6 +613,37 @@ pub struct UsageQuery {
     workspace_id: Option<String>,
 }
 
+/// One workspace's all-time estimated cost (USD) under the CURRENT pricing
+/// table — the same arithmetic `usage_summary` reports, factored out so the
+/// budget brake (crate::budget) trips on exactly the number the /usage page
+/// shows. Returns `(cost_usd, all_priced)`; `all_priced = false` means some
+/// models were unrecognised and the true spend is >= the returned estimate.
+pub(crate) async fn workspace_cost_estimate(
+    store: &swarmx_storage::Store,
+    workspace_id: &str,
+) -> anyhow::Result<(f64, bool)> {
+    let (pricing_rules, _) = load_pricing_rules();
+    let by_model = store
+        .usage_by_model(Some(workspace_id.to_string()))
+        .await?;
+    let mut cost = 0.0f64;
+    let mut all_priced = true;
+    for m in &by_model {
+        match cost_of(
+            m.model.as_deref(),
+            m.input_tokens,
+            m.output_tokens,
+            m.cache_read_tokens,
+            m.cache_write_tokens,
+            &pricing_rules,
+        ) {
+            Some(c) => cost += c,
+            None => all_priced = false,
+        }
+    }
+    Ok((cost, all_priced))
+}
+
 pub async fn usage_summary(
     State(state): State<AppState>,
     Query(q): Query<UsageQuery>,

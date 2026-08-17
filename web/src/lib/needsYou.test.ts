@@ -159,39 +159,39 @@ describe("deriveNeedsYou", () => {
     expect(deriveNeedsYou([deadOrch, a], {}, [], NOW)).toEqual([]);
   });
 
-  it("UX-034: handoff_failed still shows without live captain (.error trail)", () => {
+  it("UX-034: handoff_failed + no live captain → not needs-you (nobody to tell)", () => {
     const a = agent({
       handoff_failed: true,
       handoff_missing: false,
       handoff_signal: "fixer.done",
       killed_at: NOW - 1000,
     });
-    expect(deriveNeedsYou([a], {}, [], NOW)).toEqual([
-      { agent: a, kind: "handoff" },
-    ]);
+    expect(deriveNeedsYou([a], {}, [], NOW)).toEqual([]);
   });
 
   it("handoff_failed (kill/crash wrote .error) → handoff even when missing=false", () => {
     // UX-016: 常见路径是 handoff_failed=true + handoff_missing=false。
-    // 只认 missing 会让「没交结果就死了」从不进收件箱。
+    // 只认 missing 会让「没交结果就死了」从不进收件箱。规划必须还活着。
+    const orch = agent({ agent_id: "orch-live", role: "orchestrator" });
     const a = agent({
       handoff_failed: true,
       handoff_missing: false,
       handoff_signal: "backend.done",
       killed_at: NOW - 1000,
     });
-    expect(deriveNeedsYou([a], {}, [], NOW)).toEqual([
+    expect(deriveNeedsYou([orch, a], {}, [], NOW)).toEqual([
       { agent: a, kind: "handoff" },
     ]);
   });
 
   it("handoff_failed with shim_exit → handoff", () => {
+    const orch = agent({ agent_id: "orch-live", role: "orchestrator" });
     const a = agent({
       handoff_failed: true,
       handoff_signal: "docs.done",
       shim_exit: 1,
     });
-    expect(deriveNeedsYou([a], {}, [], NOW)).toEqual([
+    expect(deriveNeedsYou([orch, a], {}, [], NOW)).toEqual([
       { agent: a, kind: "handoff" },
     ]);
   });
@@ -250,5 +250,77 @@ describe("deriveNeedsYou", () => {
       NOW,
     );
     expect(items.map((i) => i.kind)).toEqual(["error", "handoff", "stalled"]);
+  });
+
+  it("watchdog stuck mark (last_error_kind=stuck) → stuck lane, not error", () => {
+    // S5: server 已自动唤醒两轮仍零活动才置位 —— 进栏让人看一眼,但它是
+    // 疑似(琥珀)不是确诊(红),所以不能算进 error 道。
+    const a = agent({
+      last_error: "疑似卡住：进程还活着…",
+      last_error_kind: "stuck",
+      last_error_at: NOW - 60_000,
+    });
+    const items = deriveNeedsYou([a], {}, [], NOW);
+    expect(items).toEqual([{ agent: a, kind: "stuck" }]);
+  });
+
+  it("stuck mark + activity strictly newer than the mark → recovered, not needs-you", () => {
+    // 与成员栏同一条恢复守卫:任何比 last_error_at 新的信号都先算「已恢复」,
+    // 不亮 chip(后端下一 tick 也会清掉标记)。
+    const a = agent({
+      last_error: "疑似卡住：进程还活着…",
+      last_error_kind: "stuck",
+      last_error_at: NOW - 120_000,
+      last_activity_at: NOW - 60_000,
+    });
+    expect(deriveNeedsYou([a], {}, [], NOW)).toEqual([]);
+  });
+
+  it("stuck mark on an exited agent is ignored (前端兜底)", () => {
+    const a = agent({
+      last_error: "疑似卡住：进程还活着…",
+      last_error_kind: "stuck",
+      last_error_at: NOW - 60_000,
+      shim_exit: 0,
+    });
+    expect(deriveNeedsYou([a], {}, [], NOW)).toEqual([]);
+  });
+
+  it("stuck mark on a paused agent still shows (pause 不改变它曾卡住的事实)", () => {
+    // server 不会给 paused agent 新置位,但已置位后被 pause 的,标记依然诚实。
+    const a = agent({
+      paused: true,
+      last_error: "疑似卡住：进程还活着…",
+      last_error_kind: "stuck",
+      last_error_at: NOW - 60_000,
+    });
+    const items = deriveNeedsYou([a], {}, [], NOW);
+    expect(items).toEqual([{ agent: a, kind: "stuck" }]);
+  });
+
+  it("orders error < handoff < stuck < stalled", () => {
+    const orch = agent({ agent_id: "orch-live", role: "orchestrator" });
+    const stalledA = agent({ agent_id: "a-stalled", role: "backend", stalled: true });
+    const stuckA = agent({
+      agent_id: "a-stuck",
+      role: "frontend",
+      last_error: "疑似卡住：进程还活着…",
+      last_error_kind: "stuck",
+      last_error_at: NOW - 60_000,
+    });
+    const miss = agent({
+      agent_id: "a-miss",
+      handoff_missing: true,
+      handoff_signal: "x.done",
+      shim_exit: 1,
+    });
+    const err = agent({ agent_id: "a-err", role: "reviewer" });
+    const items = deriveNeedsYou(
+      [orch, stalledA, stuckA, miss, err],
+      { [err.agent_id]: { state: "error" } },
+      [],
+      NOW,
+    );
+    expect(items.map((i) => i.kind)).toEqual(["error", "handoff", "stuck", "stalled"]);
   });
 });

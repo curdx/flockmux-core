@@ -11,8 +11,23 @@ import { EmptyState } from "@/components/EmptyState";
 import { api } from "@/api/http";
 import type { FusionConsultResponse } from "@/api/types";
 import { useWorkspaceContext } from "../Shell";
+import { LabGate } from "@/components/LabGate";
 
+// R3:实验室功能(默认 OFF)。深链进来时给诚实空态 + 去设置开启;
+// ON 时走 ConsultViewBody,行为不变。
 export default function ConsultView() {
+  const { t } = useTranslation();
+  return (
+    <LabGate
+      icon={<Users className="size-8" />}
+      feature={t("chat.tabs.consult")}
+    >
+      <ConsultViewBody />
+    </LabGate>
+  );
+}
+
+function ConsultViewBody() {
   const { t } = useTranslation();
   const { workspace } = useWorkspaceContext();
   const workspaceId = workspace.workspaceId;
@@ -28,11 +43,11 @@ export default function ConsultView() {
       .getZuluModels()
       .then((m) => {
         setModels(m);
-        // default panel: a cross-vendor trio if present, else first 3.
-        const prefer = ["Deepseek V4 Pro", "GLM-5.2", "Kimi-K2.6"];
+        // Default panel: first 3 models from the real list. (A hardcoded
+        // cross-vendor trio used to live here — the names could never match
+        // getZuluModels output, so the fallback always won anyway.)
         const names = m.map((x) => x.displayName);
-        const def = prefer.filter((p) => names.includes(p));
-        setPicked(def.length >= 2 ? def : names.slice(0, 3));
+        setPicked(names.slice(0, 3));
       })
       .catch((e) => setError((e as Error).message));
   }, []);

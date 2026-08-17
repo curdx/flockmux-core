@@ -79,12 +79,19 @@ function classifyBash(arg: string): ActivityVerb {
  * Map one activity label to a user-facing verb descriptor.
  *
  * @param label  the raw `AgentActivity.label`.
- * @param kind   "tool" | "system" — system steps that don't match a known tool
- *               degrade to a neutral verb instead of echoing internal phrasing.
+ * @param kind   "tool" | "system" | "watchdog" — system steps that don't match a known tool
+ *               degrade to a neutral verb instead of echoing internal phrasing;
+ *               "watchdog" is the S5 stuck-watchdog nudge (its label is a full
+ *               Chinese sentence the member rail renders as-is).
  */
-export function activityVerb(label: string, kind: "tool" | "system" = "tool"): ActivityVerb {
+export function activityVerb(label: string, kind: "tool" | "system" | "watchdog" = "tool"): ActivityVerb {
   if (!label || !label.trim()) {
     return { key: "chat.verb.generic", params: {}, fallback: "处理中" };
+  }
+  // S5 看门狗唤醒:后端 label 是整句中文(成员条/活动流原样展示);聊天里的
+  // "正在做什么"行动词行走 i18n 键,而不是被 jargon-firewall 压成"处理中"。
+  if (kind === "watchdog") {
+    return { key: "watchdog.nudging", params: {}, fallback: "系统正在唤醒它" };
   }
   const { tool, arg } = splitLabel(label);
   const t = tool.toLowerCase();

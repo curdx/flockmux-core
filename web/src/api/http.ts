@@ -43,6 +43,7 @@ import type {
   UsagePricingRule,
   UsageSummary,
   Workspace,
+  WorkspaceBudget,
   WorkspaceRoot,
   WriteBlackboardRequest,
 } from "./types";
@@ -406,6 +407,15 @@ export const api = {
   // direction" picker.
   listBranches: (id: string) =>
     requestEndpoint<BranchInfo[]>(apiRoutes.workspaces.branches(id)),
+  // Workspace budget brake: current cap + live all-time estimate + brake state.
+  // `putWorkspaceBudget(id, null)` clears the cap (unlimited). Amounts are
+  // ESTIMATES — never the subscription invoice (honesty red line).
+  getWorkspaceBudget: (id: string) =>
+    requestEndpoint<WorkspaceBudget>(apiRoutes.workspaces.budget(id)),
+  putWorkspaceBudget: (id: string, budgetUsd: number | null) =>
+    requestEndpoint<WorkspaceBudget>(apiRoutes.workspaces.setBudget(id), {
+      budget_usd: budgetUsd,
+    }),
   createThread: (id: string, req: CreateThreadRequest) =>
     requestEndpoint<ThreadInfo>(apiRoutes.workspaces.createThread(id), req),
   updateThread: (id: string, threadId: string, req: { name: string }) =>

@@ -61,6 +61,7 @@ enum Flavor {
 pub fn spawn_tailer(
     swarm: Arc<Swarm>,
     store: Arc<swarmx_storage::Store>,
+    registry: crate::registry::Registry,
     agent_id: String,
     cli: String,
     cwd: PathBuf,
@@ -77,13 +78,14 @@ pub fn spawn_tailer(
         return;
     };
     tokio::spawn(async move {
-        run(swarm, store, &agent_id, flavor, &cwd, session_id.as_deref()).await;
+        run(swarm, store, registry, &agent_id, flavor, &cwd, session_id.as_deref()).await;
     });
 }
 
 async fn run(
     swarm: Arc<Swarm>,
     store: Arc<swarmx_storage::Store>,
+    registry: crate::registry::Registry,
     agent_id: &str,
     flavor: Flavor,
     cwd: &Path,
@@ -119,7 +121,15 @@ async fn run(
                 st.poll(&path, &swarm, agent_id).await;
                 let advanced =
                     persist_activity(&store, agent_id, st.last_emit_at, &mut persisted).await;
+                let had_usage = !st.pending_usage.is_empty();
                 persist_usage(&store, agent_id, &mut st.pending_usage).await;
+                // Budget brake: fresh usage just landed — re-check the
+                // workspace's estimated all-time cost against its cap and
+                // trip (pause everyone + mark + notify) on crossing. Cheap
+                // early-out inside when no cap is set.
+                if had_usage {
+                    crate::budget::maybe_trip_after_usage(&swarm, &registry, &store, agent_id).await;
+                }
                 // Recovery: a soft-errored agent that just produced real
                 // activity is back to work — clear the persisted error and
                 // publish a non-error state so the failure card / red dot /
@@ -154,7 +164,11 @@ async fn run(
                         if dead {
                             st.poll(&path, &swarm, agent_id).await; // final flush
                             persist_activity(&store, agent_id, st.last_emit_at, &mut persisted).await;
+                            let had_usage = !st.pending_usage.is_empty();
                             persist_usage(&store, agent_id, &mut st.pending_usage).await;
+                            if had_usage {
+                                crate::budget::maybe_trip_after_usage(&swarm, &registry, &store, agent_id).await;
+                            }
                             break;
                         }
                         // Soft error: keep tailing so we can detect recovery.

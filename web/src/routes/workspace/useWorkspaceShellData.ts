@@ -1,17 +1,11 @@
 /**
- * useWorkspaceShellData — the data-orchestration layer behind WorkspaceShell.
+ * useWorkspaceShellData — REST roster/workspaces + derived view-models.
  *
- * Extracted from Shell.tsx (which, after the earlier UI split, still carried
- * ~260 lines of state + fetching + the swarm subscription + the optimistic
- * cascade-delete all inline). Pulling it into a hook leaves Shell as a thin
- * layout/nav component and makes this logic independently reasoned-about.
- *
- * Owns: the agents / workspaces / unread state, the three refreshers, the
- * single `/ws/swarm` subscription (the only one in the app — child views read
- * derived data via Outlet context), and the derived view-models
- * (`workspaces` / `activeWs` / per-workspace unread). Navigation stays in the
- * component: `deleteWorkspace` performs the kill+delete+optimistic-drop and
- * RETURNS where to navigate (or null), so this hook has no router dependency.
+ * Live `/ws/swarm` reduction lives in SwarmProjection. This hook reads that
+ * snapshot and still owns the REST snapshots (listAgents / listWorkspaces)
+ * plus derived workspace/thread view-models. Child views should also read
+ * the projection (or generation counters) instead of opening another
+ * event-switch.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -23,27 +17,17 @@ import type {
   AgentInfo,
   AgentLiveState,
   MessageRecord,
-  SwarmEvent,
   ThreadInfo,
   Workspace,
 } from "../../api/types";
-import { useSwarmFeed } from "../../hooks/useSwarmFeed";
+import { useSwarmRefresh, useSwarmSnapshot } from "../../hooks/useSwarmProjection";
+import { type LiveRead } from "../../lib/swarmProjection";
+import { hydrateSwarmUnread } from "../../lib/swarmProjectionStore";
 import { accentToCssVar, splitWorkspacePath } from "../../lib/workspace";
 import { agentInThread, mainThreadOf } from "../../lib/thread";
-import { dlog } from "../../lib/debugLog";
-import { countsAsUserUnread } from "../../lib/unread";
-import type { ReasoningSummary } from "../../components/MessagesPanel";
 import type { WorkspaceSummary } from "./types";
 
-/** Cap on per-agent activity history kept in memory for the drawer Activity
- *  tab. Bounded so a long-running worker can't grow this unboundedly. */
-const MAX_ACTIVITY = 100;
-
-export interface LiveRead {
-  ids: number[];
-  to_agent: string;
-  at: number;
-}
+export type { LiveRead };
 
 export interface WorkspaceShellData {
   agents: AgentInfo[];
@@ -93,7 +77,7 @@ export interface WorkspaceShellData {
   agentStageById: Record<string, { stage: string; at: number }>;
   /** Live in-flight reasoning steps keyed by agent id, fed by
    *  `thought_trace_event` so the pending bubble grows its steps mid-turn. */
-  reasoningById: Record<string, ReasoningSummary>;
+  reasoningById: Record<string, { steps: string[]; durationMs: number | null }>;
   /** Unread tally already filtered to the active workspace's senders. */
   activeWorkspaceUnread: Record<string, number>;
   totalUnread: number;
@@ -126,39 +110,7 @@ export function useWorkspaceShellData(
   // produces — without this flag the sidebar lies "还没有工作空间" when the real
   // reason is the backend is down (P0-5 regression).
   const [wsError, setWsError] = useState(false);
-  // Lossless append-only buffer of live WS messages (bounded). Consumers merge
-  // by id — never a single `liveMessage` slot that batched arrivals overwrite.
-  const [liveMessages, setLiveMessages] = useState<MessageRecord[]>([]);
-  const [liveRead, setLiveRead] = useState<LiveRead | null>(null);
-  const [agentStateById, setAgentStateById] = useState<
-    Record<string, AgentLiveState>
-  >({});
-  const [agentActivityById, setAgentActivityById] = useState<
-    Record<string, AgentActivity[]>
-  >({});
-  // Live, in-flight reasoning steps keyed by AGENT id (an agent has at most one
-  // active trace at a time), fed by `thought_trace_event` so the "正在响应"
-  // bubble grows its step list during the turn. Keyed by agent — NOT by trigger
-  // message id — because the pending bubble's trigger can be a later system
-  // "wake" message while the trace is keyed to the user message; agent id is the
-  // stable join. Cleared when that agent's reply lands.
-  const [reasoningById, setReasoningById] = useState<
-    Record<string, ReasoningSummary>
-  >({});
-  const [unreadByFrom, setUnreadByFrom] = useState<Record<string, number>>({});
-  // Latest cold-start stage per agent (`agent_stage` events): drives the
-  // narrative stage bar on pending agent cards (see Chat.tsx). Cleared when
-  // the agent's first activity lands (first turn started) or the agent exits.
-  const [agentStageById, setAgentStageById] = useState<
-    Record<string, { stage: string; at: number }>
-  >({});
-  const idToFromRef = useRef<Map<number, string>>(new Map());
-  // The set of message ids we actually counted toward the user's unread badge
-  // (agent→user, countsAsUserUnread). Decrement-on-read must only subtract ids
-  // that were counted — otherwise an AGENT reading its own inbox (agent↔agent
-  // traffic flowing through the same message_read event) would zero out the
-  // user's real unread for that sender, making the badge lie "0 unread".
-  const countedUnreadRef = useRef<Set<number>>(new Set());
+  const snap = useSwarmSnapshot();
 
   // F19: drop async results that resolve after the Shell unmounts.
   const mountedRef = useRef(true);
@@ -200,28 +152,7 @@ export function useWorkspaceShellData(
   const recomputeUnread = useCallback(async () => {
     try {
       const rows = await api.listMessages({ limit: 200 });
-      const counts: Record<string, number> = {};
-      const ids = new Map<number, string>();
-      const counted = new Set<number>();
-      for (const m of rows) {
-        ids.set(m.id, m.from_agent);
-        // `to_agent === "user"` is REQUIRED here: listMessages returns the whole
-        // recent stream including agent↔agent traffic. Without this gate the
-        // full recompute counts coordination replies as the user's unread —
-        // over-reporting, and disagreeing with the live increment (which already
-        // gates on to_agent), so the badge flickers between two wrong values.
-        if (
-          m.to_agent === "user" &&
-          m.read_at === null &&
-          countsAsUserUnread(m.from_agent, m.kind, m.meta)
-        ) {
-          counts[m.from_agent] = (counts[m.from_agent] ?? 0) + 1;
-          counted.add(m.id);
-        }
-      }
-      idToFromRef.current = ids;
-      countedUnreadRef.current = counted;
-      if (mountedRef.current) setUnreadByFrom(counts);
+      hydrateSwarmUnread(rows);
     } catch {
       /* best-effort */
     }
@@ -269,220 +200,14 @@ export function useWorkspaceShellData(
     }, 200);
   }, [refreshAgents]);
 
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      switch (ev.type) {
-        case "agent_state":
-          // Patch the agent's live state slice for an immediate visual update
-          // (no listAgents roundtrip). We STILL scheduleRefresh because a state
-          // transition often coincides with a roster change (new spawn /
-          // killed_at) that only the REST row reflects — the patch covers the
-          // member dot, the refresh covers membership.
-          setAgentStateById((prev) => {
-            const cur = prev[ev.agent_id];
-            if (cur?.state === ev.state) return prev; // no-op → stable ref
-            return { ...prev, [ev.agent_id]: { ...cur, state: ev.state } };
-          });
-          // Terminal states end the cold-start story either way (error card
-          // replaces the stage bar; exit removes the agent).
-          if (ev.state === "error" || ev.state === "exited") {
-            setAgentStageById((prev) => {
-              if (!(ev.agent_id in prev)) return prev;
-              const next = { ...prev };
-              delete next[ev.agent_id];
-              return next;
-            });
-          }
-          scheduleRefresh();
-          break;
-        case "agent_activity":
-          // Pure step-level stream — never touches the agent roster, so no
-          // refresh. Replace ONLY this agent's slice so unrelated member rows
-          // keep their object identity and don't re-render.
-          setAgentStateById((prev) => ({
-            ...prev,
-            [ev.agent_id]: {
-              ...prev[ev.agent_id],
-              activity: {
-                agent_id: ev.agent_id,
-                kind: ev.kind,
-                label: ev.label,
-                phase: ev.phase,
-                seq: ev.seq,
-                duration_ms: ev.duration_ms,
-                at: ev.at,
-              },
-            },
-          }));
-          // First activity = the first turn started → the cold-start stage
-          // bar has done its job; drop the stage so it never reappears.
-          setAgentStageById((prev) => {
-            if (!(ev.agent_id in prev)) return prev;
-            const next = { ...prev };
-            delete next[ev.agent_id];
-            return next;
-          });
-          // Persistent stream for the drawer's Activity tab — append, with
-          // same-seq (running → ok/error) replaced in place, bounded to the
-          // last MAX_ACTIVITY. Survives close/reopen since it lives here, not
-          // in the (ephemeral) tab component.
-          setAgentActivityById((prev) => {
-            const cur = prev[ev.agent_id] ?? [];
-            const act: AgentActivity = {
-              agent_id: ev.agent_id,
-              kind: ev.kind,
-              label: ev.label,
-              phase: ev.phase,
-              seq: ev.seq,
-              duration_ms: ev.duration_ms,
-              at: ev.at,
-            };
-            const idx = cur.findIndex((s) => s.seq === act.seq);
-            let next: AgentActivity[];
-            if (idx >= 0) {
-              next = cur.slice();
-              next[idx] = act;
-            } else {
-              next = cur.length >= MAX_ACTIVITY ? cur.slice(1) : cur.slice();
-              next.push(act);
-            }
-            return { ...prev, [ev.agent_id]: next };
-          });
-          break;
-        case "message": {
-          const rec: MessageRecord = {
-            id: ev.id,
-            from_agent: ev.from_agent,
-            to_agent: ev.to_agent,
-            kind: ev.kind,
-            body: ev.body,
-            sent_at: ev.sent_at,
-            delivered_at: null,
-            read_at: null,
-            in_reply_to: ev.in_reply_to ?? null,
-            thread_id: ev.thread_id ?? null,
-            meta: ev.meta ?? null,
-            thought_trace: ev.thought_trace ?? null,
-          };
-          dlog("ws.message", {
-            id: ev.id,
-            from: ev.from_agent,
-            to: ev.to_agent,
-            kind: ev.kind,
-            thread: ev.thread_id ?? null,
-          });
-          // LOSSLESS relay: APPEND via a functional updater, never overwrite a
-          // single slot. When several messages land in one React batch (a burst
-          // of replies, a worker reporting, rapid sends), a `setLiveMessage(rec)`
-          // single-value setter keeps only the LAST — the rest never reach the
-          // chat's append effect and vanish from the UI until a refresh. A
-          // functional append is applied once per call even when batched, so all
-          // N survive. Bounded so a long session can't grow it unbounded; the
-          // consumer drains it into `items` after each commit, so the cap never
-          // drops an unconsumed message in any realistic burst.
-          setLiveMessages((prev) => {
-            const next = [...prev, rec];
-            return next.length > 200 ? next.slice(-200) : next;
-          });
-          idToFromRef.current.set(ev.id, ev.from_agent);
-          // F4: this agent's reply landed — the persisted thought_trace on the
-          // message takes over, so drop its in-flight live reasoning (keyed by
-          // agent) to avoid carrying stale steps into its next turn.
-          if (ev.from_agent !== "user" && ev.to_agent === "user") {
-            const replier = ev.from_agent;
-            setReasoningById((prev) => {
-              if (!(replier in prev)) return prev;
-              const next = { ...prev };
-              delete next[replier];
-              return next;
-            });
-          }
-          if (ev.to_agent === "user" && countsAsUserUnread(ev.from_agent, ev.kind, ev.meta)) {
-            countedUnreadRef.current.add(ev.id);
-            setUnreadByFrom((prev) => ({
-              ...prev,
-              [ev.from_agent]: (prev[ev.from_agent] ?? 0) + 1,
-            }));
-          }
-          break;
-        }
-        case "message_read": {
-          setLiveRead({ ids: ev.ids, to_agent: ev.to_agent, at: ev.at });
-          // Resolve which counted ids to drop HERE — outside the state updater.
-          // A `setState` updater must be pure: React StrictMode (dev) and
-          // concurrent rendering can invoke it more than once, and mutating
-          // `countedUnreadRef` inside it poisons the replay — the first
-          // (discarded) pass deletes the id, the second (kept) pass sees it gone
-          // and skips the decrement, so the badge never goes down and lies at
-          // the cumulative arrival count (live-observed: stuck at "3 未读" with 0
-          // actually unread, only a reload reconciled it). Mutate the ref once
-          // here, then apply a pure, idempotent updater.
-          const decByFrom: Record<string, number> = {};
-          for (const id of ev.ids) {
-            // Only subtract ids we actually counted as USER unread. Skips
-            // agent↔agent reads and non-counted (wake/system/completion) ids,
-            // so an agent reading its mailbox can't deflate the user's badge.
-            if (!countedUnreadRef.current.has(id)) continue;
-            countedUnreadRef.current.delete(id);
-            const from = idToFromRef.current.get(id);
-            if (!from) continue;
-            decByFrom[from] = (decByFrom[from] ?? 0) + 1;
-          }
-          if (Object.keys(decByFrom).length > 0) {
-            setUnreadByFrom((prev) => {
-              const next = { ...prev };
-              for (const [from, dec] of Object.entries(decByFrom)) {
-                const cur = (next[from] ?? 0) - dec;
-                if (cur <= 0) delete next[from];
-                else next[from] = cur;
-              }
-              return next;
-            });
-          }
-          break;
-        }
-        case "blackboard_changed":
-          // workspace name / accent now live in the `workspaces` table,
-          // not the blackboard, so we don't react to blackboard events
-          // for that any more. Member-count changes are picked up via
-          // `agent_state` → scheduleRefresh → refreshAgents → recompute.
-          break;
-        case "thread_changed":
-          // A direction was created / renamed / isolated / deleted server-side
-          // (e.g. the orchestrator's swarm_name_thread → background worktree
-          // isolation). Threads live in the workspaces snapshot, which no other
-          // live event refetches — pull it so the sidebar's direction tree
-          // reflects the new name + branch icon without a manual reload.
-          refreshWorkspaces();
-          break;
-        case "thought_trace_event": {
-          // Live, real steps appended to an in-flight trace — grow the pending
-          // bubble's step list mid-turn. Full snapshot, keyed by the trace's
-          // agent. (No synthesized steps: the backend only emits this for real,
-          // captured tool steps.)
-          const steps = ev.steps.map((s) => s.label).filter(Boolean);
-          setReasoningById((prev) => ({
-            ...prev,
-            [ev.agent_id]: { steps, durationMs: null },
-          }));
-          break;
-        }
-        case "agent_stage":
-          // Cold-start heartbeat (shim_ready → mcp_ready → bootstrap_injected).
-          // Just record the latest stage; the stage bar clears on the agent's
-          // first activity (see the agent_activity case) or terminal state.
-          setAgentStageById((prev) => ({
-            ...prev,
-            [ev.agent_id]: { stage: ev.stage, at: ev.at },
-          }));
-          break;
-      }
-    },
-    onReconnect: () => {
-      scheduleRefresh();
-      recomputeUnread();
-      refreshWorkspaces();
-    },
+  // Live agent_state also patches agentStateById immediately. REST still
+  // needed: spawn / killed_at only exist on the roster row.
+  useSwarmRefresh((s) => s.rosterGen, scheduleRefresh);
+  useSwarmRefresh((s) => s.threadGen, refreshWorkspaces);
+  useSwarmRefresh((s) => s.reconnectGen, () => {
+    scheduleRefresh();
+    void recomputeUnread();
+    void refreshWorkspaces();
   });
 
   // ── Workspaces (server-side, alive only) ────────────────────────────
@@ -611,9 +336,9 @@ export function useWorkspaceShellData(
     if (!activeWs) return {} as Record<string, number>;
     const threadSet = new Set(threadAgentIds);
     return Object.fromEntries(
-      Object.entries(unreadByFrom).filter(([from]) => threadSet.has(from)),
+      Object.entries(snap.unreadByFrom).filter(([from]) => threadSet.has(from)),
     );
-  }, [unreadByFrom, activeWs, threadAgentIds]);
+  }, [snap.unreadByFrom, activeWs, threadAgentIds]);
   const totalUnread = Object.values(activeWorkspaceUnread).reduce((a, b) => a + b, 0);
 
   const deleteWorkspace = useCallback(
@@ -682,12 +407,12 @@ export function useWorkspaceShellData(
     threadMembers,
     handoffMissingAgents,
     needsYouMembers,
-    liveMessages,
-    liveRead,
-    agentStateById,
-    agentActivityById,
-    agentStageById,
-    reasoningById,
+    liveMessages: snap.liveMessages,
+    liveRead: snap.liveRead,
+    agentStateById: snap.agentStateById,
+    agentActivityById: snap.agentActivityById,
+    agentStageById: snap.agentStageById,
+    reasoningById: snap.reasoningById,
     activeWorkspaceUnread,
     totalUnread,
     refreshAgents,

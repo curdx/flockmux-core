@@ -14,6 +14,7 @@
 
 mod agent_lifecycle;
 mod billing;
+mod budget;
 // Per-CLI behavior adapters (claude / codex / opencode) behind one CliAdapter
 // trait — every CLI-specific spawn seam lives in its own `cli/<name>.rs`, so the
 // generic spawn pipeline never branches on a CLI id. See `cli/mod.rs`.
@@ -42,6 +43,7 @@ mod routes;
 mod runtime_path;
 mod spawn;
 mod spells;
+mod stuck_watchdog;
 mod tokens;
 mod transcript;
 mod wake;
@@ -384,6 +386,12 @@ async fn main() -> Result<()> {
     // the UI never sits forever on a green dot for a process that is gone.
     reaper::spawn(state.clone());
     info!("liveness reaper started");
+
+    // S5 stuck watchdog: wakes live-but-silent agents that still owe a
+    // handoff; marks them 疑似卡住 (soft, recoverable, never a kill) only
+    // after consecutive ignored wakes.
+    stuck_watchdog::spawn(state.clone());
+    info!("stuck watchdog started");
 
     // Periodic retention: the boot-time prune above runs once; this keeps the
     // append-only tables (messages / blackboard / recordings / agent_usage /

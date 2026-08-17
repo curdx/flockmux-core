@@ -60,6 +60,7 @@ import type { WorkspaceSummary } from "./types";
 import { WorkspaceList } from "./WorkspaceSidebar";
 import { WorkspaceToolbar, ViewTransition, buildTabs } from "./WorkspaceToolbar";
 import { NeedsYouBar } from "@/components/workspace/NeedsYouBar";
+import { BudgetBrakeBanner } from "@/components/workspace/BudgetBrakeBanner";
 import { useWorkspaceShellData } from "./useWorkspaceShellData";
 
 const AgentDrawer = lazy(() =>
@@ -182,11 +183,15 @@ export default function WorkspaceShell() {
     });
   }, [setSearchParams]);
 
-  // CreateWizard opens from sidebar + ⌘K (window event).
+  // CreateWizard opens from sidebar + ⌘K (window event). Mark the event handled
+  // so AppShell's global fallback host doesn't open a second wizard.
   const [wizardOpen, setWizardOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   useEffect(() => {
-    const onOpen = () => setWizardOpen(true);
+    const onOpen = (e: Event) => {
+      (e as CustomEvent<{ handled: boolean }>).detail.handled = true;
+      setWizardOpen(true);
+    };
     window.addEventListener("swarmx:open-wizard", onOpen as EventListener);
     return () =>
       window.removeEventListener("swarmx:open-wizard", onOpen as EventListener);
@@ -603,6 +608,9 @@ export default function WorkspaceShell() {
             messages={liveMessages}
             onOpenAgent={openAgent}
           />
+          {/* 预算刹车:只在 exceeded 时可见(组件内部自判),trip/lift 走
+              budget_changed WS 事件驱动刷新,不轮询。 */}
+          <BudgetBrakeBanner workspaceId={activeWs.workspaceId} />
           <ViewTransition>
             {/* View-level boundary: a crash in one tab (malformed ledger
                 markdown, ReactFlow state, …) shows a contained fallback while

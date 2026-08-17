@@ -1,17 +1,18 @@
 /**
  * NeedsYouBar — 「需要你」收件箱：单行、紧凑、不抢戏。
  *
- * error → 开抽屉。handoff（已死）→ 聚焦输入框；× 本会话收起。
- * stalled 不进栏（自动催）。
+ * error → 开抽屉。handoff（已死）且规划还活着 → 聚焦输入框。
+ * stuck（看门狗「疑似卡住」,自动唤醒已耗尽）→ 开抽屉,文案只说「疑似卡住」。
+ * 规划已死：handoff 不进人（没人可说）。stalled 不进栏（自动催）。
+ * 点芯片不弹 toast。
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AlertTriangle, PackageX, X } from "lucide-react";
+import { AlertTriangle, Hourglass, PackageX, X } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { deriveNeedsYou, type NeedsYouItem, type NeedsYouKind } from "@/lib/needsYou";
 import { roleLabelAmong } from "@/lib/agent";
-import { toast } from "@/lib/toast";
 import type { AgentInfo, AgentLiveState, MessageRecord } from "@/api/types";
 
 export const FOCUS_COMPOSER_EVENT = "swarmx:focus-composer";
@@ -43,17 +44,26 @@ function agentEnded(a: AgentInfo): boolean {
 
 const KIND_META: Record<
   Exclude<NeedsYouKind, "stalled">,
-  { icon: typeof AlertTriangle; tone: string; key: string }
+  { icon: typeof AlertTriangle; tone: string; key: string; defaultValue: string }
 > = {
   error: {
     icon: AlertTriangle,
     tone: "text-status-danger bg-status-danger-soft/80 hover:bg-status-danger-soft",
     key: "needsYou.kind.error",
+    defaultValue: "出问题了",
   },
   handoff: {
     icon: PackageX,
     tone: "text-accent-primary-deep bg-accent-primary-soft/70 hover:bg-accent-primary-soft",
     key: "needsYou.kind.handoff",
+    defaultValue: "没交结果",
+  },
+  // 看门狗的「疑似卡住」是怀疑不是确诊:琥珀,不是 error 的红。
+  stuck: {
+    icon: Hourglass,
+    tone: "text-status-warning bg-status-warning-soft/80 hover:bg-status-warning-soft",
+    key: "needsYou.kind.stuck",
+    defaultValue: "疑似卡住",
   },
 };
 
@@ -81,8 +91,8 @@ export function NeedsYouBar({
   const items = useMemo(
     () =>
       deriveNeedsYou(members, liveById, messages, now).filter(
-        (i): i is NeedsYouItem & { kind: "error" | "handoff" } =>
-          (i.kind === "error" || i.kind === "handoff") &&
+        (i): i is NeedsYouItem & { kind: "error" | "handoff" | "stuck" } =>
+          (i.kind === "error" || i.kind === "handoff" || i.kind === "stuck") &&
           !dismissed.has(i.agent.agent_id),
       ),
     [members, liveById, messages, now, dismissed],
@@ -113,11 +123,6 @@ export function NeedsYouBar({
 
   const askCaptain = () => {
     window.dispatchEvent(new CustomEvent(FOCUS_COMPOSER_EVENT));
-    toast.message(
-      t("needsYou.askCaptainToast", {
-        defaultValue: "在下面跟规划说一声就行",
-      }),
-    );
   };
 
   return (
@@ -167,7 +172,7 @@ function NeedsYouChip({
   onAskCaptain,
   onDismiss,
 }: {
-  item: NeedsYouItem & { kind: "error" | "handoff" };
+  item: NeedsYouItem & { kind: "error" | "handoff" | "stuck" };
   peers: AgentInfo[];
   onOpen: (agentId: string) => void;
   onAskCaptain: () => void;
@@ -209,7 +214,7 @@ function NeedsYouChip({
           {role}
         </span>
         <span className="shrink-0 font-caption text-[10px] opacity-70">
-          {t(meta.key)}
+          {t(meta.key, { defaultValue: meta.defaultValue })}
         </span>
       </button>
       <button

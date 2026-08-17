@@ -13,6 +13,10 @@
  *
  * 视觉是双卡片 + markdown 渲染 + 顶部 "最后更新 XX 秒前"。没有任何编辑能力 —
  * orchestrator 是唯一 writer,用户是 reader。
+ *
+ * R8 战报导出:顶栏「导出战报」把这一屏已有的数据(双台账 + 近况 + 成员
+ * 名单)加上 getUsage 的费用估算拼成一份 markdown 下载 —— 不取新数据源,
+ * 不做图片导出,就是给用户一份能贴给别人的总结。
  */
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -20,16 +24,24 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import { ClipboardList, RefreshCw, Activity, Radio, Sparkles } from "lucide-react";
+import { ClipboardList, RefreshCw, Activity, Radio, Sparkles, Download } from "lucide-react";
 import { api } from "../../../api/http";
-import type { BlackboardEntry, BlackboardSnapshot, SwarmEvent } from "../../../api/types";
-import { useSwarmFeed } from "../../../hooks/useSwarmFeed";
+import type { AgentInfo, BlackboardEntry, BlackboardSnapshot, UsageSummary } from "../../../api/types";
+import {
+  useLiveBbChanges,
+  useSwarmRefresh,
+} from "../../../hooks/useSwarmProjection";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/EmptyState";
 import { cn } from "@/lib/cn";
 import { roleDisplayName } from "@/lib/agent";
+import { uncollectedEngines } from "@/lib/usageCoverage";
 import { useWorkspaceContext } from "../Shell";
 import { MarkdownInput, MarkdownLink } from "@/lib/markdownLinks";
+import { downloadTextFile } from "@/lib/download";
+import { fmtTokens } from "@/lib/format";
+import { track } from "@/lib/telemetry";
+import { toast } from "@/lib/toast";
 
 function fmtAgo(at: number | null, nowTick: number, t: TFunction): string {
   if (at == null) return "—";
@@ -62,8 +74,120 @@ function stripLedgerHeading(content: string): string {
   return content.replace(/^\s*#{0,6}\s*(?:task|progress)\s+ledger\s*\r?\n+/i, "");
 }
 
+// ── R8 战报导出 ─────────────────────────────────────────────────────────
+
+/** 战报里的成员状态一行 —— AgentInfo 字段直译(跟侧栏/DAG 同一套事实),
+ *  不造新状态机。 */
+function memberStatusLine(a: AgentInfo, t: TFunction): string {
+  if (a.killed_at != null)
+    return t("ledger.report.statusKilled", { defaultValue: "已终止" });
+  if (a.shim_exit != null)
+    return t("ledger.report.statusExited", {
+      code: a.shim_exit,
+      defaultValue: "已退出（码 {{code}}）",
+    });
+  if (a.shim_ready)
+    return t("ledger.report.statusRunning", { defaultValue: "运行中" });
+  return t("ledger.report.statusStarting", { defaultValue: "启动中" });
+}
+
+/** 把 Ledger 页已有的数据(双台账 + 近况 + 成员名单)加 getUsage 的费用估算
+ *  拼成 markdown 战报。除用量外没有任何新数据源 —— 导出的就是用户屏幕上
+ *  看到的东西,不是另一份"更全"的隐藏数据。 */
+function buildBattleReport(opts: {
+  t: TFunction;
+  lang: string;
+  workspaceName: string;
+  threadSlug: string;
+  members: AgentInfo[];
+  task: LedgerSnap;
+  progress: LedgerSnap;
+  breadcrumbs: { role: string; content: string; at: number }[];
+  usage: UsageSummary | null;
+  now: Date;
+}): string {
+  const { t, lang, workspaceName, threadSlug, members, task, progress, breadcrumbs, usage, now } = opts;
+  const L: string[] = [];
+  const empty = `_${t("ledger.report.emptySection", { defaultValue: "（暂无内容）" })}_`;
+  L.push(
+    `# ${workspaceName} · ${t("ledger.report.title", { defaultValue: "战报" })}`,
+  );
+  L.push("");
+  L.push(
+    `- ${t("ledger.report.generatedAt", { defaultValue: "生成时间" })}：${now.toLocaleString(lang)}`,
+  );
+  L.push(
+    `- ${t("ledger.report.direction", { defaultValue: "方向" })}：${threadSlug}`,
+  );
+  // 费用是后端按定价规则算出来的估算 —— 有模型没定价时只有 token 数,
+  // 实际花费不低于这个数,所以标 "≥" 而不是假装精确。
+  if (usage) {
+    const cost = `$${usage.totals.cost_usd.toFixed(2)}`;
+    L.push(
+      `- ${t("ledger.report.cost", { defaultValue: "费用（估算）" })}：` +
+        `${usage.totals.priced ? cost : `≥ ${cost}`} · ` +
+        `${t("ledger.report.tokens", { defaultValue: "tokens（入/出）" })} ` +
+        `${fmtTokens(usage.totals.input_tokens)} / ${fmtTokens(usage.totals.output_tokens)} · ` +
+        `${t("ledger.report.events", { defaultValue: "事件" })} ${usage.totals.events}`,
+    );
+    // F1 诚实性:未采集引擎(opencode/reasonix/zulu…)的成员没有任何 usage
+    // 记录,上面的费用不含他们的花费 —— 战报必须交代,否则读的人以为
+    // 全员花费都在这一行里。
+    const missing = uncollectedEngines(members);
+    if (missing.length > 0) {
+      L.push(
+        `- ${t("ledger.report.uncollectedCost", {
+          engines: missing.join(" / "),
+          defaultValue: "不含 {{engines}} 引擎的花费（暂不采集）",
+        })}`,
+      );
+    }
+  } else {
+    L.push(
+      `- ${t("ledger.report.cost", { defaultValue: "费用（估算）" })}：` +
+        t("ledger.report.usageUnavailable", { defaultValue: "读取失败" }),
+    );
+  }
+  L.push("");
+  L.push(
+    `## ${t("ledger.report.members", { defaultValue: "成员" })}（${members.length}）`,
+  );
+  L.push("");
+  if (members.length === 0) {
+    L.push(empty);
+  } else {
+    for (const m of members) {
+      L.push(
+        `- ${roleDisplayName(m.role)} · ${m.cli} — ${memberStatusLine(m, t)}`,
+      );
+    }
+  }
+  L.push("");
+  L.push(`## ${t("ledger.taskTitle", { defaultValue: "任务记录" })}`);
+  L.push("");
+  L.push(task.content.trim() || empty);
+  L.push("");
+  L.push(`## ${t("ledger.progressTitle", { defaultValue: "进展状态" })}`);
+  L.push("");
+  L.push(progress.content.trim() || empty);
+  L.push("");
+  L.push(`## ${t("ledger.breadcrumbsTitle", { defaultValue: "近况" })}`);
+  L.push("");
+  if (breadcrumbs.length === 0) {
+    L.push(empty);
+  } else {
+    for (const b of breadcrumbs) {
+      L.push(
+        `- **${roleDisplayName(b.role)}**：${b.content}（${fmtAgo(b.at, now.getTime(), t)}）`,
+      );
+    }
+  }
+  L.push("");
+  return L.join("\n");
+}
+
 export default function LedgerView() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { workspace, threadSlug } = useWorkspaceContext();
   // Direction-scoped blackboard paths. All workspaces + directions share one
   // blackboard tree, so the orchestrator writes (and we read) the ledger under
@@ -263,6 +387,49 @@ export default function LedgerView() {
     }
   }, [taskKey, progressKey, refresh, t]);
 
+  // R8 战报导出:页面已有数据 + getUsage 估算 → markdown 下载。用量接口
+  // 挂了不该让整个导出失败 —— 报告里如实写「读取失败」就行。
+  const [exporting, setExporting] = useState(false);
+  const exportReport = useCallback(async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const usage = await api
+        .getUsage(workspace.workspaceId)
+        .catch(() => null);
+      const now = new Date();
+      const md = buildBattleReport({
+        t,
+        lang: i18n.language,
+        workspaceName: workspace.name,
+        threadSlug,
+        members: workspace.members,
+        task,
+        progress,
+        breadcrumbs,
+        usage,
+        now,
+      });
+      // 文件名:<workspace>-战报-<date>.md。空格/路径分隔符折叠成 "-",
+      // 各平台文件系统都安全(中文部分 macOS/Windows/Linux 都没问题)。
+      const safe =
+        workspace.name.trim().replace(/[\\/:*?"<>|\s]+/g, "-") || "workspace";
+      downloadTextFile(
+        `${safe}-战报-${now.toISOString().slice(0, 10)}.md`,
+        md,
+        "text/markdown",
+      );
+      track("report.export");
+    } catch (e) {
+      toast.error(
+        t("ledger.report.failed", { defaultValue: "导出战报失败" }),
+        { description: (e as Error)?.message },
+      );
+    } finally {
+      if (mountedRef.current) setExporting(false);
+    }
+  }, [exporting, workspace, threadSlug, task, progress, breadcrumbs, t, i18n.language]);
+
   // 监听 blackboard_changed —— orchestrator 写 ledger 时立即重拉,
   // 别等用户手动 refresh。
   //
@@ -273,7 +440,6 @@ export default function LedgerView() {
   // (80ms) coalesces the burst the orchestrator emits when it writes
   // task + progress + several assignments in one turn. The id-equality guard
   // still drops exact-duplicate redeliveries.
-  const lastEventIdRef = useRef<number>(0);
   const pendingRef = useRef<{ ledgers: Set<string>; crumbs: Map<string, string> }>(
     { ledgers: new Set(), crumbs: new Map() },
   );
@@ -302,20 +468,15 @@ export default function LedgerView() {
       if (debounceRef.current != null) window.clearTimeout(debounceRef.current);
     };
   }, []);
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (ev.type !== "blackboard_changed") return;
-      if (ev.id === lastEventIdRef.current) return;
-      const isLedger = ev.path === taskKey || ev.path === progressKey;
-      const isBreadcrumb =
-        ev.path.startsWith(keyPrefix) && ev.path.endsWith(".progress.md");
-      if (!isLedger && !isBreadcrumb) return;
-      lastEventIdRef.current = ev.id;
-      if (isLedger) pendingRef.current.ledgers.add(ev.path);
-      else pendingRef.current.crumbs.set(ev.path, ev.op);
-      scheduleFlush();
-    },
-    onReconnect: () => refresh(),
+  useSwarmRefresh((s) => s.reconnectGen, refresh);
+  useLiveBbChanges((ev) => {
+    const isLedger = ev.path === taskKey || ev.path === progressKey;
+    const isBreadcrumb =
+      ev.path.startsWith(keyPrefix) && ev.path.endsWith(".progress.md");
+    if (!isLedger && !isBreadcrumb) return;
+    if (isLedger) pendingRef.current.ledgers.add(ev.path);
+    else pendingRef.current.crumbs.set(ev.path, ev.op);
+    scheduleFlush();
   });
 
   return (
@@ -341,6 +502,21 @@ export default function LedgerView() {
               {compactNote}
             </span>
           )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={exportReport}
+            disabled={exporting}
+            title={t("ledger.report.hint", {
+              defaultValue: "把任务记录、进展、成员和费用估算导出成 Markdown",
+            })}
+            className="gap-1.5"
+          >
+            <Download className={cn("size-3.5", exporting && "animate-pulse")} />
+            {exporting
+              ? t("ledger.report.exporting", { defaultValue: "导出中…" })
+              : t("ledger.report.button", { defaultValue: "导出战报" })}
+          </Button>
           <Button
             variant="outline"
             size="sm"

@@ -15,7 +15,8 @@ mod schema;
 mod store;
 
 pub use models::{
-    AgentActivityRow, AgentRecord, BlackboardOpRecord, CronJobRecord, FusionBatchRecord,
+    AgentActivityRow, AgentRecord, BlackboardOpRecord, BudgetGate, CronJobRecord,
+    FusionBatchRecord,
     GoalEvidenceRecord,
     GoalRecord,
     ListMessagesOpts, MessageRecord, NewAgent, NewBlackboardOp, NewFusionBatch, NewGoal,
@@ -25,4 +26,4 @@ pub use models::{
     SpellRunRecord, TaskRecord, ThoughtTraceRecord, ThoughtTraceStep, ThreadRecord, UsageByAgent,
     UsageByDay, UsageByModel, WorkerRecord, WorkspaceRecord, WorkspaceRootRecord,
 };
-pub use store::{PruneStats, Store};
+pub use store::{PruneStats, Store, TripPersist};

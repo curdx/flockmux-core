@@ -215,6 +215,15 @@ fn now_ms() -> i64 {
 /// fire actually runs instead of silently skipping. Shared by the scheduler and
 /// the manual `POST /run`.
 pub async fn run_job(state: &AppState, job: &CronJobRecord) -> Result<(), String> {
+    // Budget brake: a cron fire is a turn delivery (message + wake, possibly
+    // an orchestrator revive). While the workspace's brake is on, skip with
+    // the honest error — a silently-dropped schedule would look broken, and
+    // running it would burn the capped budget.
+    if let Some(msg) =
+        crate::budget::exceeded_error_for_workspace(&state.store, &job.workspace_id).await
+    {
+        return Err(msg);
+    }
     let agents = state.store.list_agents().await.map_err(|e| e.to_string())?;
     let live_orch = agents.into_iter().find(|a| {
         a.killed_at.is_none()

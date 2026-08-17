@@ -12,6 +12,8 @@
  * JSON / no-localStorage environment all fall back to them.
  */
 
+import { useEffect, useState } from "react";
+
 const STORAGE_KEY = "swarmx:settings:v1";
 
 export interface AppSettings {
@@ -21,12 +23,16 @@ export interface AppSettings {
   desktopNotify: boolean;
   /** When an agent fails, kill the other live agents in its workspace/run. */
   killOthersOnFail: boolean;
+  /** R3 形态收敛:竞赛(fusion)/多模对比(consult) 等实验室功能的总开关。
+   *  默认 OFF —— 陌生人先只看到核心循环(对话/台账/录像)。 */
+  labFeatures: boolean;
 }
 
 const DEFAULTS: AppSettings = {
   openMainOnLaunch: true,
   desktopNotify: true,
   killOthersOnFail: false,
+  labFeatures: false,
 };
 
 /** Read the current preference values from localStorage, defaulting any
@@ -51,8 +57,28 @@ export function loadAppSettings(): AppSettings {
         typeof parsed.killOthersOnFail === "boolean"
           ? parsed.killOthersOnFail
           : DEFAULTS.killOthersOnFail,
+      labFeatures:
+        typeof parsed.labFeatures === "boolean"
+          ? parsed.labFeatures
+          : DEFAULTS.labFeatures,
     };
   } catch {
     return { ...DEFAULTS };
   }
+}
+
+/** Reactive read of the lab-features toggle (R3). The writer lives on the
+ *  /settings route — a separate page, so same-window flips apply on the next
+ *  mount; the `storage` listener covers edits from another tab/window (the
+ *  only way it can change while a gated component stays mounted). */
+export function useLabFeatures(): boolean {
+  const [on, setOn] = useState(() => loadAppSettings().labFeatures);
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === STORAGE_KEY) setOn(loadAppSettings().labFeatures);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+  return on;
 }

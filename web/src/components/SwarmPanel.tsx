@@ -1,20 +1,21 @@
 /**
  * SwarmPanel — right-hand side drawer with three tabs: messages, blackboard,
- * recordings. Owns the single `/ws/swarm` subscription and routes events
- * down to the appropriate child via cheap props.
+ * recordings. Reads SwarmProjection (the dashboard's one /ws/swarm reduction).
  *
- * M5a: maintains an `unreadByFrom` map. The map is seeded from a REST
- * snapshot on mount + each reconnect, then maintained incrementally from
- * `message` / `message_read` events. We index by `from_agent` (rather than
- * `to_agent`) because the UI is a single-user observer — "X unread from
- * agent A" is what the user wants to see in the tab badge.
+ * Unread uses the same `countsAsUserUnread` contract as the workspace shell —
+ * wake/system/agent↔agent traffic is not a user badge.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useSwarmFeed } from "../hooks/useSwarmFeed";
+import { useSwarmFeedStatus } from "../hooks/useSwarmFeed";
+import {
+  useLiveBbChanges,
+  useSwarmRefresh,
+  useSwarmSnapshot,
+} from "../hooks/useSwarmProjection";
+import { hydrateSwarmUnread } from "../lib/swarmProjectionStore";
 import { api } from "../api/http";
-import type { MessageRecord, SwarmEvent } from "../api/types";
 import { MessagesPanel } from "./MessagesPanel";
 import { BlackboardPanel } from "./BlackboardPanel";
 import { RecordingsPanel } from "./RecordingsPanel";
@@ -36,119 +37,34 @@ const TAB_LABELS: Record<Tab, { key: string; zh: string }> = {
 export function SwarmPanel() {
   const { t } = useTranslation();
   const [tab, setTab] = useState<Tab>("messages");
-  // Append-only bounded buffer (not a single slot) so a batch of messages
-  // arriving in one React tick all reach the chat — see the same fix in
-  // useWorkspaceShellData. A single `liveMessage` setter kept only the last.
-  const [liveMessages, setLiveMessages] = useState<MessageRecord[]>([]);
-  const [liveRead, setLiveRead] = useState<{
-    ids: number[];
-    to_agent: string;
-    at: number;
-  } | null>(null);
   const [liveChange, setLiveChange] = useState<{
     path: string;
     agent_id: string | null;
     op: string;
   } | null>(null);
-  const [recordingsTick, setRecordingsTick] = useState(0);
-  const [unreadByFrom, setUnreadByFrom] = useState<Record<string, number>>({});
-
-  // Reverse lookup: id → from_agent. Lets `message_read` events decrement
-  // the right bucket without forcing the panel to refetch the whole list.
-  const idToFromRef = useRef<Map<number, string>>(new Map());
+  const snap = useSwarmSnapshot();
+  const status = useSwarmFeedStatus();
 
   const recomputeUnread = useCallback(async () => {
     try {
-      const rows = await api.listMessages({ limit: 200 });
-      const counts: Record<string, number> = {};
-      const ids = new Map<number, string>();
-      for (const m of rows) {
-        ids.set(m.id, m.from_agent);
-        if (m.read_at === null) {
-          counts[m.from_agent] = (counts[m.from_agent] ?? 0) + 1;
-        }
-      }
-      idToFromRef.current = ids;
-      setUnreadByFrom(counts);
+      hydrateSwarmUnread(await api.listMessages({ limit: 200 }));
     } catch {
       // best-effort; leave existing state
     }
   }, []);
 
   useEffect(() => {
-    recomputeUnread();
+    void recomputeUnread();
   }, [recomputeUnread]);
 
-  const status = useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      switch (ev.type) {
-        case "message": {
-          const rec: MessageRecord = {
-            id: ev.id,
-            from_agent: ev.from_agent,
-            to_agent: ev.to_agent,
-            kind: ev.kind,
-            body: ev.body,
-            sent_at: ev.sent_at,
-            delivered_at: null,
-            read_at: null,
-            in_reply_to: ev.in_reply_to ?? null,
-            thread_id: ev.thread_id ?? null,
-            meta: ev.meta ?? null,
-            thought_trace: ev.thought_trace ?? null,
-          };
-          setLiveMessages((prev) => {
-            const next = [...prev, rec];
-            return next.length > 200 ? next.slice(-200) : next;
-          });
-          idToFromRef.current.set(ev.id, ev.from_agent);
-          // Every newly arrived message is unread by definition — the agent
-          // who eventually reads it will trigger `message_read` to decrement.
-          setUnreadByFrom((prev) => ({
-            ...prev,
-            [ev.from_agent]: (prev[ev.from_agent] ?? 0) + 1,
-          }));
-          break;
-        }
-        case "message_read": {
-          setLiveRead({ ids: ev.ids, to_agent: ev.to_agent, at: ev.at });
-          setUnreadByFrom((prev) => {
-            const next = { ...prev };
-            for (const id of ev.ids) {
-              const from = idToFromRef.current.get(id);
-              if (!from) continue;
-              const cur = next[from] ?? 0;
-              const dec = Math.max(0, cur - 1);
-              if (dec === 0) delete next[from];
-              else next[from] = dec;
-            }
-            return next;
-          });
-          break;
-        }
-        case "blackboard_changed":
-          setLiveChange({
-            path: ev.path,
-            agent_id: ev.agent_id,
-            op: ev.op,
-          });
-          break;
-        case "agent_state":
-          // Only exits matter to this panel now (the Recordings tab); the
-          // graph that consumed every state change moved to /chat/:wsId/dag.
-          if (ev.state === "exited") {
-            setRecordingsTick((t) => t + 1);
-          }
-          break;
-      }
-    },
-    onReconnect: () => {
-      setRecordingsTick((t) => t + 1);
-      recomputeUnread();
-    },
+  useSwarmRefresh((s) => s.reconnectGen, () => {
+    void recomputeUnread();
+  });
+  useLiveBbChanges((c) => {
+    setLiveChange({ path: c.path, agent_id: c.agent_id, op: c.op });
   });
 
-  const totalUnread = Object.values(unreadByFrom).reduce((a, b) => a + b, 0);
+  const totalUnread = Object.values(snap.unreadByFrom).reduce((a, b) => a + b, 0);
 
   return (
     <aside style={container}>
@@ -195,13 +111,15 @@ export function SwarmPanel() {
       <div style={body}>
         {tab === "messages" && (
           <MessagesPanel
-            liveMessages={liveMessages}
-            liveRead={liveRead}
-            unreadByFrom={unreadByFrom}
+            liveMessages={snap.liveMessages}
+            liveRead={snap.liveRead}
+            unreadByFrom={snap.unreadByFrom}
           />
         )}
         {tab === "blackboard" && <BlackboardPanel liveChange={liveChange} />}
-        {tab === "recordings" && <RecordingsPanel refreshTick={recordingsTick} />}
+        {tab === "recordings" && (
+          <RecordingsPanel refreshTick={snap.recordingsGen + snap.reconnectGen} />
+        )}
       </div>
     </aside>
   );

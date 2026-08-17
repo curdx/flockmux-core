@@ -2610,6 +2610,87 @@ async fn stalled_agents_with_unread_never_flags_the_dead_or_unborn() {
     );
 }
 
+#[tokio::test]
+async fn latest_liveness_signals_take_the_max_across_all_channels() {
+    let (_dir, store) = fresh_store().await;
+    let msg = |from: &str, sent_at: i64| NewMessage {
+        from_agent: from.into(),
+        to_agent: "user".into(),
+        kind: "note".into(),
+        body: "ping".into(),
+        sent_at,
+        in_reply_to: None,
+        meta: None,
+    };
+
+    // l-1: only a mailbox send counts.
+    store.record_agent_spawn(spawn_agent_row("l-1")).await.unwrap();
+    store.insert_message(msg("l-1", ts(10))).await.unwrap();
+
+    // l-2: only token usage counts.
+    store.record_agent_spawn(spawn_agent_row("l-2")).await.unwrap();
+    store
+        .insert_agent_usage("l-2".into(), None, 1, 1, 0, 0, ts(20))
+        .await
+        .unwrap();
+
+    // l-3: only a blackboard write counts (kimi's evidence channel).
+    store.record_agent_spawn(spawn_agent_row("l-3")).await.unwrap();
+    store
+        .insert_blackboard_op(swarmx_storage::NewBlackboardOp {
+            agent_id: Some("l-3".into()),
+            op: "write".into(),
+            path: "l3.done".into(),
+            content: "x".into(),
+            sha256: "x".into(),
+            at: ts(30),
+        })
+        .await
+        .unwrap();
+
+    // l-4: several channels — the MAX wins, not any single one.
+    store.record_agent_spawn(spawn_agent_row("l-4")).await.unwrap();
+    store.touch_agent_activity("l-4".into(), ts(40)).await.unwrap();
+    store.insert_message(msg("l-4", ts(45))).await.unwrap();
+    store
+        .insert_agent_usage("l-4".into(), None, 1, 1, 0, 0, ts(41))
+        .await
+        .unwrap();
+
+    // l-5: never produced anything → present with 0.
+    store.record_agent_spawn(spawn_agent_row("l-5")).await.unwrap();
+
+    // A message FROM someone else must not count as l-1's life.
+    store.insert_message(msg("other", ts(99))).await.unwrap();
+
+    let got = store
+        .latest_liveness_signals(vec![
+            "l-1".into(),
+            "l-2".into(),
+            "l-3".into(),
+            "l-4".into(),
+            "l-5".into(),
+            "no-such-agent".into(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(got.get("l-1"), Some(&ts(10)));
+    assert_eq!(got.get("l-2"), Some(&ts(20)));
+    assert_eq!(got.get("l-3"), Some(&ts(30)));
+    assert_eq!(got.get("l-4"), Some(&ts(45)), "max across channels");
+    assert_eq!(got.get("l-5"), Some(&0), "never active reads as 0");
+    assert!(!got.contains_key("no-such-agent"));
+
+    // Empty input short-circuits without touching the db.
+    assert!(
+        store
+            .latest_liveness_signals(Vec::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // ── dangling in_reply_to is dropped, not FK-500'd (QA 2026-06-21) ──────────
 // An LLM worker can set `in_reply_to` to a message id that doesn't exist
 // (hallucinated, cross-thread, or not-yet-committed). The column is
@@ -2690,5 +2771,218 @@ async fn dangling_in_reply_to_is_dropped_not_errored() {
         all.iter()
             .any(|m| m.id == dangling.id && m.in_reply_to.is_none()),
         "the dangling-ref message must be delivered with a NULL parent"
+    );
+}
+
+
+// ── workspace budget brake (migration 0030) ─────────────────────────────
+
+async fn ws_with_budget(budget: Option<f64>) -> (TempDir, Store, swarmx_storage::WorkspaceRecord) {
+    let (dir, store) = fresh_store().await;
+    let ws = store
+        .create_workspace(
+            NewWorkspace {
+                name: "proj".into(),
+                cwd: "/tmp/proj".into(),
+                accent: None,
+            },
+            ts(0),
+        )
+        .await
+        .unwrap();
+    let ws = store
+        .set_workspace_budget(ws.id.clone(), budget)
+        .await
+        .unwrap()
+        .expect("workspace row");
+    (dir, store, ws)
+}
+
+#[tokio::test]
+async fn budget_defaults_unlimited_and_roundtrips() {
+    let (_dir, store) = fresh_store().await;
+    let ws = store
+        .create_workspace(
+            NewWorkspace {
+                name: "proj".into(),
+                cwd: "/tmp/proj".into(),
+                accent: None,
+            },
+            ts(0),
+        )
+        .await
+        .unwrap();
+    // Fresh workspace: no cap, no trip marker — and the gate reflects it.
+    assert_eq!(ws.budget_usd, None);
+    assert_eq!(ws.budget_exceeded_at, None);
+    let gate = store
+        .budget_gate_for_workspace(ws.id.clone())
+        .await
+        .unwrap()
+        .expect("gate row");
+    assert!(!gate.has_cap());
+    assert!(!gate.exceeded());
+
+    // Set → read back through every accessor.
+    let updated = store
+        .set_workspace_budget(ws.id.clone(), Some(25.5))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.budget_usd, Some(25.5));
+    let fetched = store.get_workspace_by_id(ws.id.clone()).await.unwrap().unwrap();
+    assert_eq!(fetched.budget_usd, Some(25.5));
+    let listed = store.list_workspaces(false).await.unwrap();
+    assert_eq!(listed[0].budget_usd, Some(25.5));
+
+    // Clear → unlimited again.
+    let cleared = store
+        .set_workspace_budget(ws.id.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.budget_usd, None);
+
+    // Unknown id → None, not an error.
+    assert!(
+        store
+            .set_workspace_budget("nope".into(), Some(1.0))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn trip_marks_once_and_lift_returns_exactly_the_brake_paused() {
+    let (_dir, store, ws) = ws_with_budget(Some(10.0)).await;
+
+    // First trip sets the marker and records the brake-paused set.
+    let first = store
+        .trip_workspace_budget(ws.id.clone(), 10.25, ts(1), vec!["a-1".into(), "a-2".into()])
+        .await
+        .unwrap();
+    assert_eq!(first, swarmx_storage::TripPersist::Tripped, "first trip must win the marker");
+
+    // A concurrent/duplicate trip must NOT overwrite the original trip-time
+    // cost, but its pause rows still union in (a racing trip must not lose
+    // the agents it paused).
+    let second = store
+        .trip_workspace_budget(ws.id.clone(), 99.0, ts(2), vec!["a-2".into(), "a-3".into()])
+        .await
+        .unwrap();
+    assert_eq!(second, swarmx_storage::TripPersist::AlreadyTripped, "second trip keeps the first marker");
+    let rec = store.get_workspace_by_id(ws.id.clone()).await.unwrap().unwrap();
+    assert_eq!(rec.budget_exceeded_at, Some(ts(1)));
+    assert_eq!(rec.budget_exceeded_cost_usd, Some(10.25));
+    let gate = store
+        .budget_gate_for_workspace(ws.id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(gate.exceeded());
+
+    // Lift returns the union of brake-paused agents and clears the marker.
+    let paused = store.lift_workspace_budget(ws.id.clone()).await.unwrap();
+    assert_eq!(paused, vec!["a-1".to_string(), "a-2".to_string(), "a-3".to_string()]);
+    let rec = store.get_workspace_by_id(ws.id.clone()).await.unwrap().unwrap();
+    assert_eq!(rec.budget_exceeded_at, None);
+    assert_eq!(rec.budget_exceeded_cost_usd, None);
+    // The budget itself survives a lift — raising the cap is what lifts,
+    // not clearing it.
+    assert_eq!(rec.budget_usd, Some(10.0));
+
+    // Lifting an untripped workspace is a no-op.
+    assert!(store.lift_workspace_budget(ws.id.clone()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn trip_is_rejected_when_the_cap_moved_under_the_check() {
+    let (_dir, store, ws) = ws_with_budget(Some(10.0)).await;
+
+    // Cost estimate (5) below the CURRENT cap (10): the raise/clear raced the
+    // check — the trip must not persist anything (no marker, no pause rows).
+    let outcome = store
+        .trip_workspace_budget(ws.id.clone(), 5.0, ts(1), vec!["a-1".into()])
+        .await
+        .unwrap();
+    assert_eq!(outcome, swarmx_storage::TripPersist::BudgetMoved);
+    let rec = store.get_workspace_by_id(ws.id.clone()).await.unwrap().unwrap();
+    assert_eq!(rec.budget_exceeded_at, None);
+    assert!(store.lift_workspace_budget(ws.id.clone()).await.unwrap().is_empty());
+
+    // And a cleared cap (unlimited) can never be tripped.
+    store.set_workspace_budget(ws.id.clone(), None).await.unwrap();
+    let outcome = store
+        .trip_workspace_budget(ws.id.clone(), 999.0, ts(2), vec!["a-1".into()])
+        .await
+        .unwrap();
+    assert_eq!(outcome, swarmx_storage::TripPersist::BudgetMoved);
+}
+
+#[tokio::test]
+async fn budget_gate_for_agent_joins_through_workspace() {
+    let (_dir, store, ws) = ws_with_budget(Some(5.0)).await;
+    store
+        .record_agent_spawn(NewAgent {
+            id: "a-1".into(),
+            cli: "claude".into(),
+            role: "orchestrator".into(),
+            workspace: "/tmp/proj".into(),
+            spawned_at: ts(1),
+            workspace_id: Some(ws.id.clone()),
+            spell_run_id: None,
+            thread_id: None,
+        })
+        .await
+        .unwrap();
+
+    let gate = store
+        .budget_gate_for_agent("a-1".into())
+        .await
+        .unwrap()
+        .expect("agent has a workspace");
+    assert_eq!(gate.workspace_id, ws.id);
+    assert_eq!(gate.budget_usd, Some(5.0));
+    assert!(!gate.exceeded());
+
+    store
+        .trip_workspace_budget(ws.id.clone(), 5.5, ts(2), vec!["a-1".into()])
+        .await
+        .unwrap();
+    let gate = store
+        .budget_gate_for_agent("a-1".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(gate.exceeded());
+
+    // Legacy orphan (no workspace_id) → ungated, same as interrupt_all.
+    store
+        .record_agent_spawn(NewAgent {
+            id: "a-orphan".into(),
+            cli: "claude".into(),
+            role: "worker".into(),
+            workspace: "/tmp/x".into(),
+            spawned_at: ts(3),
+            workspace_id: None,
+            spell_run_id: None,
+            thread_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .budget_gate_for_agent("a-orphan".into())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .budget_gate_for_agent("ghost".into())
+            .await
+            .unwrap()
+            .is_none()
     );
 }

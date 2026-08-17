@@ -59,7 +59,6 @@ export class ErrorBoundary extends Component<Props, State> {
 }
 
 function ErrorFallback({
-  error,
   onReset,
 }: {
   error: Error;
@@ -79,11 +78,6 @@ function ErrorFallback({
           {t("error.body")}
         </p>
       </div>
-      {error.message && (
-        <pre className="max-h-32 max-w-md overflow-auto rounded-md border border-border-subtle bg-surface-secondary px-3 py-2 text-left font-mono text-[11px] text-foreground-secondary">
-          {error.message}
-        </pre>
-      )}
       <div className="flex items-center gap-2">
         <button
           type="button"

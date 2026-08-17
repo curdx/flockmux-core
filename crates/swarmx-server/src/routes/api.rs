@@ -120,6 +120,10 @@ pub fn router() -> Router<AppState> {
             get(super::workspaces::list_branches_handler),
         )
         .route(
+            "/api/workspaces/:id/budget",
+            get(super::budget::get_budget).put(super::budget::put_budget),
+        )
+        .route(
             "/api/workspaces/:id/threads",
             get(super::workspaces::list_threads_handler)
                 .post(super::workspaces::create_thread_handler),

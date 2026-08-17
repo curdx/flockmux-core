@@ -26,7 +26,9 @@ import { MessagesPanel } from "../../../components/MessagesPanel";
 import { OrchestratorFailureCard } from "../../../components/workspace/OrchestratorFailureCard";
 import { BootstrapChecklistCard } from "../../../components/chat/BootstrapChecklistCard";
 import { PlanStickyCard } from "../../../components/chat/PlanStickyCard";
+import { CostChip } from "../../../components/chat/CostChip";
 import { PulseRail } from "../../../components/workspace/PulseRail";
+import { MemberStrip } from "../../../components/workspace/MemberStrip";
 import { parsePlan, type ParsedPlan } from "../../../lib/parsePlan";
 import {
   TaskActivity,
@@ -67,9 +69,11 @@ import type {
   BlackboardSnapshot,
   MessageRecord,
   SwarmAgentState,
-  SwarmEvent,
 } from "../../../api/types";
-import { useSwarmFeed } from "../../../hooks/useSwarmFeed";
+import {
+  useLiveBbChanges,
+  useSwarmRefresh,
+} from "../../../hooks/useSwarmProjection";
 import { useWorkspaceContext } from "../Shell";
 
 /** Pull every `<workspace_id>/<thread_slug>/<role>.progress.md` breadcrumb the
@@ -112,17 +116,13 @@ function useBreadcrumbs(prefix: string) {
   useEffect(() => {
     reload();
   }, [reload]);
-  const lastIdRef = useRef<number>(0);
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (ev.type !== "blackboard_changed") return;
-      if (ev.id === lastIdRef.current) return;
-      if (!ev.path.startsWith(prefix)) return;
-      if (!ev.path.endsWith(".progress.md")) return;
-      lastIdRef.current = ev.id;
-      reload();
-    },
-    onReconnect: () => reload(),
+  useSwarmRefresh((s) => s.reconnectGen, () => {
+    void reload();
+  });
+  useLiveBbChanges((ev) => {
+    if (!ev.path.startsWith(prefix)) return;
+    if (!ev.path.endsWith(".progress.md")) return;
+    void reload();
   });
   return rows;
 }
@@ -151,16 +151,12 @@ function usePlan(prefix: string): ParsedPlan | null {
   useEffect(() => {
     reload();
   }, [reload]);
-  const lastIdRef = useRef<number>(0);
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (ev.type !== "blackboard_changed") return;
-      if (ev.id === lastIdRef.current) return;
-      if (ev.path !== path) return;
-      lastIdRef.current = ev.id;
-      reload();
-    },
-    onReconnect: () => reload(),
+  useSwarmRefresh((s) => s.reconnectGen, () => {
+    void reload();
+  });
+  useLiveBbChanges((ev) => {
+    if (ev.path !== path) return;
+    void reload();
   });
   return plan;
 }
@@ -259,8 +255,10 @@ function WorkspaceStatusStrip({
   sourceCount,
   cwdBranch,
   readiness,
+  workspaceId,
   hasError = false,
   preparing = false,
+  hasHistory = false,
 }: {
   workspaceName: string;
   directionName: string;
@@ -268,6 +266,8 @@ function WorkspaceStatusStrip({
   sourceCount: number;
   cwdBranch: string | null;
   readiness: EngineReadinessState;
+  /** Workspace id for the CostChip's usage query. */
+  workspaceId: string;
   /** True when the direction's orchestrator is in an error state (auth/quota/
    *  watchdog). Keeps the strip's liveness dot honest — without it the strip
    *  would still say "1 个 AI 在线" directly above the failure card. */
@@ -276,6 +276,9 @@ function WorkspaceStatusStrip({
    *  "preparing",或规划已 spawn 但 PTY 还没 ready 的冷启动窗口)——
    *  the orchestrator is on its way up. */
   preparing?: boolean;
+  /** True when this room already has chat history so "AI 未上线" vs
+   *  "AI 已下线" can be told apart. */
+  hasHistory?: boolean;
 }) {
   const { t } = useTranslation();
   // A member that exists but can't work is NOT "online". `hasError` overrides
@@ -332,7 +335,9 @@ function WorkspaceStatusStrip({
                   ? t("chat.workspaceStripFailed", "AI 启动失败")
                   : hasMembers
                     ? t("chat.workspaceStripOnline", { count: memberCount })
-                    : t("chat.workspaceStripIdle")}
+                    : hasHistory
+                      ? t("chat.workspaceStripAway", { defaultValue: "AI 已下线" })
+                      : t("chat.workspaceStripIdle")}
               </span>
               <span className="inline-flex items-center gap-1">
                 <FolderOpen className="size-3" />
@@ -344,6 +349,9 @@ function WorkspaceStatusStrip({
                   <span className="truncate font-mono">{cwdBranch}</span>
                 </span>
               )}
+              {/* 成本可见性是一等功能(R1):常驻估算花费,点击进 /usage。
+                  组件自带诚实规则:零事件不渲染、未计价加 ≥ 前缀。 */}
+              <CostChip workspaceId={workspaceId} />
               {/* Engine chip: only when members are up but engines aren't
                   verified usable yet. Empty room already has EmptyState;
                   online+usable is redundant next to「N 人在线」. */}
@@ -995,12 +1003,10 @@ export default function ChatView() {
           sourceCount={workspace.roots.length + 1}
           cwdBranch={workspace.cwdBranch}
           readiness={readiness}
+          workspaceId={workspace.workspaceId}
           hasError={orchestratorFailure != null}
-          // P1-08: while the direction is still bootstrapping the orchestrator
-          // is already on its way up. `orchestratorStarting`
-          // covers the post-spawn cold-start window (规划已 spawn、PTY 未
-          // ready),where memberCount 的 agentIsWorkable 仍为 false。
           preparing={activeThread?.state === "preparing" || orchestratorStarting}
+          hasHistory={recentMessages.length > 0}
         />
         {/* P2: the captain's structured plan, pinned above the conversation —
             accurate ✓/◐/○ from plan.json, not guessed from prose. */}
@@ -1014,6 +1020,22 @@ export default function ChatView() {
               (a) => a.killed_at == null && a.shim_exit == null,
             ).length}
           />
+        )}
+        {/* <xl 紧凑成员条:<1280px 时右侧 PulseRail(≥xl)与完整成员面板(≥2xl)
+            都不渲染,「谁在线 / 谁卡住」整体蒸发 —— 靠这一横排诚实点(逻辑同
+            PulseRail,不重构它)保住核心信号;点击开成员抽屉。≥xl 由 rail 接管
+            (xl:hidden 不占高)。无成员时不渲染 —— 空房间的引导由 MessagesPanel
+            的 EmptyState 负责,一条空横条只是噪音。 */}
+        {activeMembers.length > 0 && (
+          <div className="shrink-0 border-b border-border-subtle bg-surface-secondary xl:hidden">
+            <MemberStrip
+              members={activeMembers}
+              agentStateById={agentStateById}
+              recentMessages={recentMessages}
+              unreadByFrom={activeWorkspaceUnread}
+              onOpenAgent={openAgent}
+            />
+          </div>
         )}
         <MessagesPanel
           liveMessages={liveMessages}
@@ -1101,8 +1123,12 @@ export default function ChatView() {
             <div className="mx-2 mt-2 rounded-xl border border-border-subtle bg-surface-elevated px-4 py-4">
               <p className="font-caption text-xs leading-6 text-foreground-tertiary">
                 {t(
-                  "chat.noMembers",
-                  "还没有成员在线。在对话里发一条消息，规划就会上线。",
+                  recentMessages.length > 0
+                    ? "chat.noMembersAway"
+                    : "chat.noMembers",
+                  recentMessages.length > 0
+                    ? "成员已下线。再发一条消息，规划会回来。"
+                    : "还没有成员在线。在对话里发一条消息，规划就会上线。",
                 )}
               </p>
             </div>

@@ -147,9 +147,6 @@ test("terminal page requires an explicit connect action", async ({ page }) => {
 });
 
 test("create workspace dialog keeps form controls named and labelled", async ({ page }) => {
-  await page.addInitScript(() => {
-    window.localStorage.setItem("swarmx:tour:onboarding-v1", "1");
-  });
   await page.goto("/chat");
   await page.waitForLoadState("domcontentloaded");
   await page.keyboard.press("Control+K");
@@ -211,7 +208,6 @@ test("notification mark-all-read uses app confirmation before changing read stat
 }) => {
   let markReadCalls = 0;
   await page.addInitScript(() => {
-    window.localStorage.setItem("swarmx:tour:onboarding-v1", "1");
     window.localStorage.removeItem("swarmx:notif:read:v1");
   });
   await page.route(/\/api\/message(\?.*)?$/, async (route) => {
@@ -260,7 +256,6 @@ test("notification mark-all-read uses app confirmation before changing read stat
 
 test("privacy clear local data requires app confirmation", async ({ page }) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem("swarmx:tour:onboarding-v1", "1");
     window.localStorage.setItem("swarmx:test-preserve", "1");
   });
 
@@ -279,9 +274,6 @@ test("privacy clear local data requires app confirmation", async ({ page }) => {
 });
 
 test("mcp api-key dialog keeps the secret input named and labelled", async ({ page }) => {
-  await page.addInitScript(() => {
-    window.localStorage.setItem("swarmx:tour:onboarding-v1", "1");
-  });
   await page.route("**/api/mcp/env", async (route) => {
     await route.fulfill({
       json: {

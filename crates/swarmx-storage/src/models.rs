@@ -149,6 +149,40 @@ pub struct WorkspaceRecord {
     pub created_at: i64,
     #[serde(default)]
     pub deleted_at: Option<i64>,
+    /// Optional all-time estimated-spend cap (USD), migration 0030. `None`
+    /// (or a non-positive value, normalized by callers) = unlimited. Compared
+    /// against the same all-time estimate /api/usage reports — an ESTIMATE,
+    /// never the subscription invoice.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
+    /// Budget-brake trip marker: non-None = the brake is ON (spawns + new
+    /// turn deliveries for this workspace are refused until lifted).
+    #[serde(default)]
+    pub budget_exceeded_at: Option<i64>,
+    /// Estimated all-time cost at the moment the brake tripped (for honest
+    /// "trip 时估算 $X" display).
+    #[serde(default)]
+    pub budget_exceeded_cost_usd: Option<f64>,
+}
+
+/// Budget-brake gate state for one workspace (migration 0030). Read by the
+/// spawn / turn-delivery gates: `exceeded()` ⇒ fail closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetGate {
+    pub workspace_id: String,
+    pub budget_usd: Option<f64>,
+    pub exceeded_at: Option<i64>,
+}
+
+impl BudgetGate {
+    /// A cap is in force only when set AND positive (0/negative = unlimited).
+    pub fn has_cap(&self) -> bool {
+        self.budget_usd.is_some_and(|b| b > 0.0)
+    }
+    /// The brake is ON — refuse new spawns / turn deliveries.
+    pub fn exceeded(&self) -> bool {
+        self.exceeded_at.is_some()
+    }
 }
 
 /// Insert payload for an attached workspace root (a node in the workspace's

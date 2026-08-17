@@ -977,6 +977,17 @@ pub(crate) async fn spawn_with_bookkeeping(
         ));
     }
 
+    // Budget brake: while the workspace's estimated all-time spend sits at or
+    // above its cap, fail EVERY spawn path (here = /api/agent, /api/worker,
+    // run_spell, fusion/merge auto-spawns) with an honest, actionable error —
+    // a paused-forever spawn would look like a hang. Fail-open on lookup
+    // failure (see budget.rs): the brake is soft, a storage hiccup must not
+    // brick spawning.
+    if let Some(msg) = crate::budget::exceeded_error_for_workspace(&state.store, &workspace_id).await
+    {
+        return Err((StatusCode::PAYMENT_REQUIRED, msg));
+    }
+
     let (selected_plugin, fallback_from) = select_spawn_plugin(&state.plugins, cli)?;
     if let Some(requested) = fallback_from {
         tracing::warn!(
@@ -1328,6 +1339,7 @@ pub(crate) async fn spawn_with_bookkeeping(
     crate::transcript::spawn_tailer(
         state.swarm.clone(),
         state.store.clone(),
+        state.registry.clone(),
         agent_id.clone(),
         result.slot.cli.clone(),
         std::path::PathBuf::from(&result.slot.workspace),
@@ -1718,6 +1730,11 @@ pub async fn wake_agent(
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("agent {agent_id} not found")})),
         );
+    }
+    // Budget brake: a manual wake is a new turn delivery — while the
+    // workspace's brake is on it would burn more of the capped budget.
+    if let Some(msg) = crate::budget::exceeded_error_for_agent(&state.store, &agent_id).await {
+        return (StatusCode::PAYMENT_REQUIRED, Json(json!({"error": msg})));
     }
     match crate::wake::deliver_manual_wake(
         &state.swarm,
@@ -2469,9 +2486,12 @@ pub async fn list_roles(State(state): State<AppState>) -> Json<serde_json::Value
 // blackboard writes from the paused window gets a fresh look.
 // ────────────────────────────────────────────────────────────────────────
 
-async fn interrupt_one_inner(state: &AppState, agent_id: &str) -> Result<(), String> {
-    let slot = state
-        .registry
+pub(crate) async fn interrupt_one_inner(
+    registry: &crate::registry::Registry,
+    swarm: &swarmx_swarm::Swarm,
+    agent_id: &str,
+) -> Result<(), String> {
+    let slot = registry
         .get(agent_id)
         .ok_or_else(|| format!("agent {agent_id} not found"))?;
     let input_tx = {
@@ -2509,7 +2529,7 @@ async fn interrupt_one_inner(state: &AppState, agent_id: &str) -> Result<(), Str
             // resting state after a cancelled turn (resume re-wakes it). The
             // clicking client also clears optimistically; this covers the member
             // rail, workers, and other clients.
-            state.swarm.publish_event(SwarmEvent::AgentState {
+            swarm.publish_event(SwarmEvent::AgentState {
                 agent_id: agent_id.to_string(),
                 state: AgentState::Idle,
             });
@@ -2526,7 +2546,7 @@ pub async fn interrupt(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
-    match interrupt_one_inner(&state, &agent_id).await {
+    match interrupt_one_inner(&state.registry, &state.swarm, &agent_id).await {
         Ok(_) => (
             StatusCode::OK,
             Json(json!({"ok": true, "agent_id": agent_id, "paused": true})),
@@ -2553,6 +2573,13 @@ pub async fn resume(
             );
         }
     };
+    // Budget brake: resuming while the workspace is still over cap would
+    // immediately re-burn. The budget lift path (budget::lift_workspace)
+    // resumes brake-paused agents itself after clearing the marker, so it
+    // never passes through this gate.
+    if let Some(msg) = crate::budget::exceeded_error_for_agent(&state.store, &agent_id).await {
+        return (StatusCode::PAYMENT_REQUIRED, Json(json!({"error": msg})));
+    }
     slot.lock()
         .paused
         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2624,7 +2651,7 @@ pub async fn interrupt_all(
     let mut interrupted: Vec<String> = Vec::new();
     let mut failed: Vec<serde_json::Value> = Vec::new();
     for id in target_ids {
-        match interrupt_one_inner(&state, &id).await {
+        match interrupt_one_inner(&state.registry, &state.swarm, &id).await {
             Ok(_) => interrupted.push(id),
             Err(msg) => {
                 // Agent may have exited between list_agents and now —

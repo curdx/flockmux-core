@@ -110,7 +110,13 @@ export function SystemCard({
           <Split className="size-3.5" />
         </span>
         <span className="min-w-0 truncate font-body text-xs text-foreground-primary">
-          {t("chat.dispatch.title", { role: childRoleLabel, defaultValue: "派给 {{role}}" })}
+          {(message.meta?.dispatch_count ?? 1) > 1
+            ? t("chat.dispatch.titleCount", {
+                role: childRoleLabel,
+                count: message.meta?.dispatch_count,
+                defaultValue: "派给 {{role}} · {{count}}",
+              })
+            : t("chat.dispatch.title", { role: childRoleLabel, defaultValue: "派给 {{role}}" })}
         </span>
         {/* role-color tick so the worker's identity reads consistently */}
         <span

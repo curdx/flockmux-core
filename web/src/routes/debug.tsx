@@ -19,11 +19,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Loader2 } from "lucide-react";
 import { api, ApiError } from "../api/http";
-import type { CliPluginInfo, SpawnAgentResponse, SwarmEvent } from "../api/types";
+import type { CliPluginInfo, SpawnAgentResponse } from "../api/types";
 import { XtermPane } from "../components/XtermPane";
 import { SwarmPanel } from "../components/SwarmPanel";
 import { SpellsLauncher } from "../components/SpellsLauncher";
-import { useSwarmFeed } from "../hooks/useSwarmFeed";
+import { useSwarmRefresh } from "../hooks/useSwarmProjection";
 import { toast } from "@/lib/toast";
 import { notifySpawnFallbacks } from "../lib/engineFallback";
 import {
@@ -134,14 +134,10 @@ export default function DebugRoute() {
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, 200);
   }, []);
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (ev.type === "agent_state") {
-        scheduleRefresh();
-      }
-    },
-    onReconnect: scheduleRefresh,
-  });
+  useSwarmRefresh(
+    (s) => `${s.rosterGen}:${s.reconnectGen}`,
+    scheduleRefresh,
+  );
 
   const spawn = async (cli: string) => {
     setSpawning(true);

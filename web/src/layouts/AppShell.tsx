@@ -21,9 +21,9 @@
  * /debug renders without AppShell (it owns its own dark chrome).
  */
 
-import { Link, Outlet, useLocation } from "react-router-dom";
+import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Command, Search } from "lucide-react";
 import { BrandMark } from "@/components/Brand";
 import { CommandPalette } from "@/components/CommandPalette";
@@ -48,22 +48,45 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
+import { ensureSwarmProjection } from "@/lib/swarmProjectionStore";
+
+const CreateWizard = lazy(() =>
+  import("@/components/workspace/CreateWizard").then((m) => ({
+    default: m.CreateWizard,
+  })),
+);
+
 export function AppShell() {
+  // Start the immortal /ws/swarm reduction before any workspace view mounts
+  // so Chat / Dag / Ledger share one snapshot instead of each re-reducing.
+  ensureSwarmProjection();
   const { t } = useTranslation();
   const location = useLocation();
-  const { hasUnseen, markSeen } = useNotificationBadge();
+  const navigate = useNavigate();
+  const { unseenCount } = useNotificationBadge();
+
+  // Global fallback host for ⌘K → 新建工作空间. Home / WorkspaceShell claim
+  // the event first (their listeners register before this one); on pages with
+  // no host (/settings, /usage, /mcp…) this opens the wizard instead of the
+  // event silently dying. Navigating after create is race-free here: no
+  // Shell is mounted (it would have claimed the event), so the destination
+  // Shell fetches a fresh workspace list that already contains the new slug.
+  const [wizardOpen, setWizardOpen] = useState(false);
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      if ((e as CustomEvent<{ handled: boolean }>).detail?.handled) return;
+      setWizardOpen(true);
+    };
+    window.addEventListener("swarmx:open-wizard", onOpen as EventListener);
+    return () =>
+      window.removeEventListener("swarmx:open-wizard", onOpen as EventListener);
+  }, []);
 
   // Wire the three behavioural Settings toggles (launch show/hide, desktop
   // notifications, kill-others-on-fail) to real runtime effects. Mounted here
   // because AppShell is the cross-route always-on host; behaviours read the
   // latest persisted preference on each use, so no re-mount on a toggle change.
   useAppSettingsBehaviors();
-
-  // 进入 /notifications 时把 badge 标记 seen — 用户已经在看了，红点应该
-  // 消失。其他路由变化不动 seenAt。
-  useEffect(() => {
-    if (location.pathname.startsWith("/notifications")) markSeen();
-  }, [location.pathname, markSeen]);
 
   // Prime per-CLI input policies from the backend plugin manifest once at
   // startup, so the terminal's keystroke-settle timing is data-driven (no
@@ -163,8 +186,8 @@ export function AppShell() {
               panel 显示最近 12 条事件，每条 click 跳对应 workspace；底
               部"查看全部"跳 /notifications 完整页。GitHub / Discord /
               Notion 同款做法 — 通知是"瞄一眼"动作，不该跳走当前 view。
-              hasUnseen 触发右上红点；popover open 时自动 markSeen 清掉。 */}
-          <NotificationPopover hasUnseen={hasUnseen} onSeen={markSeen} />
+              unseenCount 显示数字徽章；瞄一眼弹层不算已读。 */}
+          <NotificationPopover unseenCount={unseenCount} />
 
           {/* 设置已挪到最左导航菜单条(McpActivityBar)底部 — 顶栏只留
               ⌘K + 通知,跟 VS Code 把设置放活动栏底一致。 */}
@@ -183,6 +206,17 @@ export function AppShell() {
           </div>
         </main>
         <CommandPalette />
+        {wizardOpen && (
+          <Suspense fallback={null}>
+            <CreateWizard
+              open={wizardOpen}
+              onClose={() => setWizardOpen(false)}
+              onCreated={(ws) => {
+                if (ws) navigate(`/chat/${ws.slug}`);
+              }}
+            />
+          </Suspense>
+        )}
       </div>
     </TooltipProvider>
   );

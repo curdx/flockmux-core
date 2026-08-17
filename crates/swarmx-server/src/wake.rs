@@ -398,6 +398,41 @@ pub async fn deliver_manual_wake(
     .await
 }
 
+/// S5 stuck-watchdog wake (see `stuck_watchdog.rs`). Same delivery shape as
+/// the operator ⚡ (`deliver_manual_wake`): the mailbox `kind=wake` row is
+/// the source of truth, the engine kick via TurnDelivery is best-effort. The
+/// prose names the owed handoff key and says plainly the system will NOT kill
+/// the agent — a suspected-stuck agent must never read its own obituary, and
+/// an honest "prove you're alive" beats a vague poke (the M6d TTL scanner was
+/// removed because naked nudges pushed agents into fabricating handoffs).
+pub async fn deliver_watchdog_wake(
+    swarm: &Swarm,
+    registry: &Registry,
+    server_url: &str,
+    target: &str,
+    handoff_key: &str,
+    silence_min: u64,
+) -> Result<()> {
+    let body = format!(
+        "系统看门狗：你的进程还活着，但已超过 {silence_min} 分钟没有任何活动迹象\
+         （无工具调用 / 消息 / token 用量 / 黑板写入），而你的交付键 `{handoff_key}` 还没写。\
+         请查收邮箱和共享区，继续推进并写出交付键；如果你真的被卡住（授权弹窗 / 网络 / 等待输入），\
+         用 swarm_send_message(to=\"user\", kind=\"reply\", body=…) 说明卡点。\
+         这只是提醒——系统不会杀你。"
+    );
+    let meta = serde_json::json!({ "subtype": "wake", "reason": "watchdog" });
+    deliver_wake_with_body(
+        swarm,
+        registry,
+        server_url,
+        target,
+        &body,
+        meta,
+        "watchdog wake",
+    )
+    .await
+}
+
 /// Shared delivery engine behind `deliver_manual_wake` and the W2-1 verify
 /// gate's bounce-back: mailbox `kind="wake"` row (source of truth) +
 /// engine-routed kick. Every branch that successfully starts a turn also

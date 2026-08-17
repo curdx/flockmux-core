@@ -18,6 +18,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { ShieldAlert, Terminal as TerminalIcon } from "lucide-react";
 import { WS_HOST, WS_PROTO } from "@/lib/apiBase";
+import { networkErrorCopy } from "@/api/http";
 import { useToolWorkspaces } from "@/lib/useToolWorkspaces";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
 import { Button } from "@/components/ui/button";
@@ -214,10 +215,7 @@ export default function TerminalRoute() {
             <div className="flex items-center gap-3 border-b border-border-subtle bg-status-warning-soft px-4 py-2">
               <span className="font-caption text-xs text-status-warning">
                 {error
-                  ? t("terminal.backendDown", {
-                      defaultValue:
-                        "暂时打不开终端。若顶部有「重启」请点一下，或重新打开应用。",
-                    })
+                  ? networkErrorCopy()
                   : t("terminal.disconnected", { defaultValue: "连接已断开" })}
               </span>
               <Button
@@ -260,10 +258,7 @@ export default function TerminalRoute() {
                   }`}
                 >
                   {error
-                    ? t("terminal.backendDown", {
-                        defaultValue:
-                          "暂时打不开终端。若顶部有「重启」请点一下，或重新打开应用。",
-                      })
+                    ? networkErrorCopy()
                     : t("terminal.confirmDesc", {
                         workspace: activeWs?.name ?? t("common.all"),
                       })}

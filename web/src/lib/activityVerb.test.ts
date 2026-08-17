@@ -25,4 +25,10 @@ describe("activityVerb — swarm MCP tools", () => {
     expect(activityVerb("bash ls -la").fallback).toContain("ls");
     expect(activityVerb("").fallback).toBe("处理中");
   });
+
+  it("renders a watchdog nudge as 系统正在唤醒它, not 处理中", () => {
+    const v = activityVerb("系统正在唤醒它（第 1/2 次）：…", "watchdog");
+    expect(v.key).toBe("watchdog.nudging");
+    expect(v.fallback).toBe("系统正在唤醒它");
+  });
 });

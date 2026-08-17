@@ -115,6 +115,20 @@ pub async fn send_message(
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<MessageRecord>, (StatusCode, Json<serde_json::Value>)> {
     let from = req.from.clone().unwrap_or_else(|| "system".into());
+    // Budget brake: an external (user/system) message to a LIVE agent triggers
+    // a wake — i.e. a new turn that would burn more of a capped budget. Fail
+    // closed with the honest, actionable error instead of silently queueing a
+    // message no paused agent will ever read. Agent-to-agent / to-user traffic
+    // is unaffected (those agents are already paused; their mail stays
+    // recordable for the post-lift catch-up).
+    if matches!(from.as_str(), "user" | "system")
+        && req.to != "user"
+        && state.registry.get(&req.to).is_some()
+    {
+        if let Some(msg) = crate::budget::exceeded_error_for_agent(&state.store, &req.to).await {
+            return Err((StatusCode::PAYMENT_REQUIRED, Json(json!({"error": msg}))));
+        }
+    }
     let fp = msg_fingerprint(&from, &req);
     // Idempotency: a retried identical send within the window returns the first
     // result instead of inserting a duplicate (and does NOT re-fire the auto-wake).
@@ -322,6 +336,27 @@ pub async fn consume_wakes(
     State(state): State<AppState>,
     Query(q): Query<UnreadCountQuery>,
 ) -> Result<Json<ConsumeWakesResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Budget brake: while the workspace's brake is on, the Stop hook must let
+    // the CLI STOP — claiming wakes here would hand back a continuation prompt
+    // and burn another turn of the capped budget. Return a valid empty claim
+    // (count=0 → wake-check noops and the turn ends); the pending wake rows
+    // stay unread so the post-lift resume wake still finds the backlog. This
+    // is the one gate that answers 200-empty instead of an error: the hook
+    // protocol needs a well-formed body, and the operator-facing signal rides
+    // the banner + the spawn/send gates.
+    if crate::budget::exceeded_error_for_agent(&state.store, &q.to)
+        .await
+        .is_some()
+    {
+        tracing::info!(agent = %q.to, "consume_wakes swallowed: workspace budget brake is on");
+        return Ok(Json(ConsumeWakesResponse {
+            to: q.to,
+            count: 0,
+            ids: Vec::new(),
+            wakes: Vec::new(),
+            reason: String::new(),
+        }));
+    }
     let at = now_ms();
     let resp = crate::wake_claim::claim(&state.swarm, &q.to, at)
         .await

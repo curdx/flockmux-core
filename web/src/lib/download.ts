@@ -34,3 +34,26 @@ export async function downloadRecordingCast(id: string): Promise<void> {
     });
   }
 }
+
+/**
+ * Save a text payload (markdown / json / …) as a file. Same blob + object-URL
+ * trick as downloadRecordingCast above, so downloads behave identically in the
+ * Tauri webview and the browser. Fire-and-forget: nothing here can throw
+ * meaningfully, so callers don't await a result.
+ */
+export function downloadTextFile(
+  filename: string,
+  content: string,
+  mime = "text/plain",
+): void {
+  const blob = new Blob([content], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoke after a tick so the download has a chance to grab the blob.
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}

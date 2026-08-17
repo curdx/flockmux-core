@@ -40,12 +40,16 @@ import type {
   FusionContestantDiff,
   FusionDecideResponse,
   FusionJudgeResponse,
-  SwarmEvent,
 } from "../../../api/types";
-import { useSwarmFeed } from "../../../hooks/useSwarmFeed";
+import { useSwarmRefresh } from "../../../hooks/useSwarmProjection";
 import { useWorkspaceContext } from "../Shell";
+import { LabGate } from "@/components/LabGate";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/EmptyState";
+import {
+  ConfirmActionDialog,
+  type ConfirmActionState,
+} from "@/components/ConfirmActionDialog";
 import { cn } from "@/lib/cn";
 import { toast } from "@/lib/toast";
 
@@ -335,6 +339,9 @@ function BatchCard({
   const [judging, setJudging] = useState(false);
   const [decision, setDecision] = useState<FusionDecideResponse | null>(null);
   const [deciding, setDeciding] = useState<string | null>(null);
+  // Picking a winner merges its branch into the mainline — irreversible, so it
+  // goes through ConfirmActionDialog like every other destructive action.
+  const [pendingWinner, setPendingWinner] = useState<FusionContestantDiff | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const runJudge = async (auto?: boolean, synthesize?: boolean) => {
@@ -408,6 +415,26 @@ function BatchCard({
   // Decide is available with judge diffs, OR when the watchdog fell back to
   // needs_decision (server-side auto-judge couldn't pick — the human picks now).
   const canDecide = (hasDiffs || needsDecision) && !isDone;
+
+  const pickConfirm: ConfirmActionState | null = pendingWinner
+    ? {
+        title: t("fusion.confirmPickTitle", { defaultValue: "选为赢家并合并？" }),
+        description: pendingWinner.branch
+          ? t("fusion.confirmPickDescBranch", {
+              name: contestantLabel(pendingWinner),
+              branch: pendingWinner.branch,
+              defaultValue:
+                "将把「{{name}}」分支（{{branch}}）的改动合并回主线。这会直接改动代码，无法自动撤销。",
+            })
+          : t("fusion.confirmPickDesc", {
+              name: contestantLabel(pendingWinner),
+              defaultValue:
+                "将把「{{name}}」的改动合并回主线。这会直接改动代码，无法自动撤销。",
+            }),
+        confirmLabel: t("fusion.confirmPickConfirm", { defaultValue: "选为赢家并合并" }),
+        onConfirm: () => decide(pendingWinner.thread_id),
+      }
+    : null;
 
   return (
     <div className="space-y-3 rounded-lg border border-border-subtle bg-surface-elevated p-4">
@@ -549,7 +576,7 @@ function BatchCard({
                 <Button
                   size="xs"
                   variant={isWinner ? "default" : "outline"}
-                  onClick={() => decide(c.thread_id)}
+                  onClick={() => setPendingWinner(c)}
                   disabled={deciding != null}
                   className="mt-auto"
                 >
@@ -628,13 +655,32 @@ function BatchCard({
           {error}
         </p>
       )}
+
+      <ConfirmActionDialog
+        action={pickConfirm}
+        onOpenChange={(open) => !open && setPendingWinner(null)}
+      />
     </div>
   );
 }
 
 // ── View ────────────────────────────────────────────────────────────────────
 
+// R3:实验室功能(默认 OFF)。深链进来时给诚实空态 + 去设置开启的入口,
+// 而不是把整个功能藏起来假装不存在。ON 时走下面的 FusionViewBody,行为不变。
 export default function FusionView() {
+  const { t } = useTranslation();
+  return (
+    <LabGate
+      icon={<Swords className="size-8" />}
+      feature={t("chat.tabs.fusion")}
+    >
+      <FusionViewBody />
+    </LabGate>
+  );
+}
+
+function FusionViewBody() {
   const { t } = useTranslation();
   const { workspace } = useWorkspaceContext();
   const workspaceId = workspace.workspaceId;
@@ -673,18 +719,10 @@ export default function FusionView() {
   // Refetch on swarm activity so a running competition's status updates live.
   // `thread_changed` covers the decide/merge moment (the judge's curl or the
   // watchdog) — without it the card sticks on 'judging' until a manual refresh.
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (
-        ev.type === "agent_state" ||
-        ev.type === "blackboard_changed" ||
-        ev.type === "thread_changed"
-      ) {
-        refresh();
-      }
-    },
-    onReconnect: () => refresh(),
-  });
+  useSwarmRefresh(
+    (s) => `${s.rosterGen}:${s.bbGen}:${s.threadGen}:${s.reconnectGen}`,
+    refresh,
+  );
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto">

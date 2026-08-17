@@ -38,9 +38,11 @@ import { cn } from "@/lib/cn";
 import { toast } from "@/lib/toast";
 import { relTime } from "@/lib/relTime";
 import {
+  blackboardWorkspaceId,
   friendlyAgent,
   humanizeBlackboard,
   isHiddenWake,
+  isNoisyBlackboard,
   notifBody,
 } from "@/lib/notif";
 import { buildRoleLookup } from "@/lib/agent";
@@ -101,14 +103,14 @@ function itemFromMessage(
 }
 
 interface Props {
-  hasUnseen: boolean;
-  onSeen: () => void;
+  unseenCount: number;
 }
 
-export function NotificationPopover({ hasUnseen, onSeen }: Props) {
+export function NotificationPopover({ unseenCount }: Props) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [items, setItems] = useState<Item[]>([]);
   const [roleLookup, setRoleLookup] = useState<Map<string, string>>(
     () => new Map(),
@@ -125,6 +127,7 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
 
   // 拉一次最近事件 — popover 打开瞬间加载，不订阅常住的 fetch。
   const refresh = useCallback(async () => {
+    setLoading(true);
     try {
       const [msgs, bb, agents, wss] = await Promise.all([
         api.listMessages({ limit: 40 }),
@@ -141,12 +144,10 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
       setRoleLookup(rl);
       setWorkspaces(wss as Workspace[]);
       const fromMsgs: Item[] = (msgs as MessageRecord[])
-        .filter((m) => !isHiddenWake(m))
+        .filter((m) => !isHiddenWake(m) && m.from_agent !== "cron")
         .map((m) => itemFromMessage(m, rl, wsM.get(m.from_agent), t));
       const fromBb: Item[] = bb
-        // Skip worker heartbeats (`<wsId>/<role>.progress.md`) — they're
-        // written on every milestone and would drown out real messages.
-        .filter((e) => !e.path.endsWith(".progress.md"))
+        .filter((e) => !isNoisyBlackboard(e.path))
         .slice(0, 20)
         .map((e) => {
           const { title, context } = humanizeBlackboard(
@@ -155,11 +156,9 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
             t,
           );
           return {
-            // Stable id = path (no `at`), mirroring the full /notifications
-            // page: a rewrite of the same key is the same entry refreshed, not
-            // a new one. The live handler below updates it in place.
             id: `bb-${e.path}`,
             kind: "blackboard" as const,
+            workspaceId: blackboardWorkspaceId(e.path),
             title,
             body: context,
             at: e.at,
@@ -171,15 +170,16 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
       setItems(merged);
     } catch {
       /* best-effort */
+    } finally {
+      setLoading(false);
     }
   }, [t]);
 
-  // 打开 popover 时拉新数据 + 标 seen。
+  // 打开时拉新数据。不 markSeen：瞄一眼 ≠ 已读。
   useEffect(() => {
     if (!open) return;
-    refresh();
-    onSeen();
-  }, [open, refresh, onSeen]);
+    void refresh();
+  }, [open, refresh]);
 
   // 关着也接 live event → 让红点能动；但不重新 fetch 列表 (open 时再拉)。
   useSwarmFeed({
@@ -188,7 +188,7 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
       // popover 当前打开时把新事件 prepend，用户能看到实时滚动。
       let next: Item | null = null;
       if (ev.type === "message") {
-        if (isHiddenWake(ev)) return;
+        if (isHiddenWake(ev) || ev.from_agent === "cron") return;
         next = itemFromMessage(
           ev,
           roleLookup,
@@ -196,13 +196,12 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
           t,
         );
       } else if (ev.type === "blackboard_changed") {
-        if (ev.path.endsWith(".progress.md")) return; // skip heartbeats
+        if (isNoisyBlackboard(ev.path)) return;
         const { title, context } = humanizeBlackboard(ev.path, workspaces, t);
         next = {
-          // Stable id = path; a rewrite refreshes the existing row in place
-          // (see update below) rather than minting a new one.
           id: `bb-${ev.path}`,
           kind: "blackboard",
+          workspaceId: blackboardWorkspaceId(ev.path),
           title,
           body: context,
           at: ev.at,
@@ -230,10 +229,10 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
       ? workspaces.find((w) => w.id === item.workspaceId)
       : undefined;
     if (ws) {
-      if (item.kind === "message" && item.agent) {
-        navigate(`/chat/${ws.slug}?agent=${encodeURIComponent(item.agent)}`);
-      } else {
+      if (item.kind === "blackboard") {
         navigate(`/chat/${ws.slug}/ledger`);
+      } else {
+        navigate(`/chat/${ws.slug}`);
       }
     } else if (item.workspaceId) {
       // We know which workspace this came from, but it's no longer in the
@@ -273,8 +272,10 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
           aria-label={t("nav.notifications")}
         >
           <Bell className="size-4" />
-          {hasUnseen && (
-            <span className="absolute right-1 top-1 size-1.5 rounded-full bg-state-danger" />
+          {unseenCount > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-state-danger px-1 font-caption text-[9px] font-semibold leading-none text-white">
+              {unseenCount > 99 ? "99+" : unseenCount}
+            </span>
           )}
         </button>
       </PopoverTrigger>
@@ -303,7 +304,14 @@ export function NotificationPopover({ hasUnseen, onSeen }: Props) {
           </button>
         </div>
         <ul className="max-h-[420px] overflow-y-auto py-1">
-          {items.length === 0 ? (
+          {loading && items.length === 0 ? (
+            <li className="flex flex-col items-center gap-2 px-4 py-12 text-foreground-tertiary">
+              <Bell className="size-7 opacity-40" />
+              <span className="font-caption text-xs">
+                {t("notifications.loading", { defaultValue: "正在加载通知…" })}
+              </span>
+            </li>
+          ) : items.length === 0 ? (
             <li className="flex flex-col items-center gap-2 px-4 py-12 text-foreground-tertiary">
               <BellOff className="size-7 opacity-40" />
               <span className="font-caption text-xs">

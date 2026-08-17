@@ -46,6 +46,7 @@ import {
   MessageSquare,
   Pause,
   Play,
+  Square,
   Terminal as TerminalIcon,
   Zap,
 } from "lucide-react";
@@ -58,12 +59,11 @@ import type {
   BlackboardEntry,
   MessageRecord,
   RecordingInfo,
-  SwarmEvent,
   Workspace,
 } from "../../api/types";
 import { XtermPane } from "../XtermPane";
 import { AgentActivityLog } from "./AgentActivityLog";
-import { useSwarmFeed } from "../../hooks/useSwarmFeed";
+import { useSwarmField, useSwarmRefresh } from "../../hooks/useSwarmProjection";
 import { Button } from "@/components/ui/button";
 import {
   ConfirmActionDialog,
@@ -246,13 +246,10 @@ export function AgentDrawer({ agentId, activities, onClose }: Props) {
 
   // Esc 关闭由 Sheet 自身处理（Radix Dialog primitive 内部监听）。
 
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (ev.type === "agent_state" && ev.agent_id === agentId) {
-        refreshInfo();
-      }
-    },
-  });
+  useSwarmRefresh(
+    (s) => s.agentStateById[agentId]?.state ?? "",
+    refreshInfo,
+  );
 
   const wake = () =>
     setConfirm({
@@ -329,6 +326,43 @@ export function AgentDrawer({ agentId, activities, onClose }: Props) {
     });
   };
 
+  // Kill ends the member's process outright (previously only reachable from
+  // /debug). Destructive → same ConfirmActionDialog as pause/wake. The drawer
+  // stays open afterwards: a dead member's recordings/messages are exactly
+  // what the user wants to check next, and the drawer already handles the
+  // dead-agent view (defaults to recordings).
+  const requestKill = () => {
+    setConfirm({
+      title: t("agent.confirm.kill.title", {
+        role: info?.role ?? agentId.slice(0, 8),
+        defaultValue: "终止 {{role}}？",
+      }),
+      description: t("agent.confirm.kill.desc", {
+        defaultValue:
+          "会立即结束它的进程，正在做的这一轮会丢失；已完成的部分仍可在「录像 / 消息」里回看。",
+      }),
+      confirmLabel: t("agent.kill", { defaultValue: "终止" }),
+      variant: "destructive",
+      onConfirm: async () => {
+        try {
+          await api.killAgent(agentId);
+          toast.success(
+            t("agent.killOk", {
+              role: info?.role ?? agentId.slice(0, 8),
+              defaultValue: "已终止 {{role}}",
+            }),
+          );
+          await refreshInfo();
+        } catch (e) {
+          toast.error(
+            t("agent.killFailed", { defaultValue: "终止失败" }),
+            { description: e instanceof ApiError ? e.detail : (e as Error)?.message },
+          );
+        }
+      },
+    });
+  };
+
   // The URL slug (≠ id, and NOT the id's first 8 chars — slug is generated
   // independently) is what /chat/:wsId routing expects. Map the agent's
   // workspace_id FK to its workspace's slug via the canonical workspace list,
@@ -361,7 +395,12 @@ export function AgentDrawer({ agentId, activities, onClose }: Props) {
         onPointerDownOutside={(e) => e.preventDefault()}
       >
         <SheetHeader className="sr-only">
-          <SheetTitle>{`Agent drawer · ${info?.role ?? agentId}`}</SheetTitle>
+          <SheetTitle>
+            {t("agent.drawerTitle", {
+              role: info ? roleDisplayName(info.role) : agentId,
+              defaultValue: "{{role}}",
+            })}
+          </SheetTitle>
           <SheetDescription>
             {t("agent.sheetDesc", {
               id: agentId,
@@ -375,6 +414,7 @@ export function AgentDrawer({ agentId, activities, onClose }: Props) {
           now={now}
           onWake={wake}
           onTogglePause={requestTogglePause}
+          onKill={requestKill}
         />
         <TabBar tab={tab} onChange={setTab} />
         <div className="min-h-0 flex-1 overflow-hidden">
@@ -415,12 +455,14 @@ function Header({
   now,
   onWake,
   onTogglePause,
+  onKill,
 }: {
   info: AgentInfo | null;
   agentId: string;
   now: number;
   onWake: () => void;
   onTogglePause: () => void;
+  onKill: () => void;
 }) {
   const { t } = useTranslation();
   const role = info?.role ?? "—";
@@ -431,13 +473,18 @@ function Header({
   // M3: "alive" (PTY up) is NOT "working". An agent flagged by the server's
   // HealthScanner / first-response watchdog (last_error set) is alive but
   // wedged — paint it red "出错", not a green "Ready" with a working spinner.
+  // 但 S5 看门狗的「疑似卡住」标记(last_error_kind="stuck")只是怀疑、不是
+  // 确诊 —— 琥珀 + 「疑似卡住」,不说「出错·无法工作」。
   const errored = !!info?.last_error;
+  const stuckSuspect = info?.last_error_kind === "stuck";
   const dotColor = !info
     ? "bg-state-idle"
     : !live
       ? "bg-state-idle"
       : errored
-        ? "bg-status-danger"
+        ? stuckSuspect
+          ? "bg-state-warning"
+          : "bg-status-danger"
         : info.shim_ready
           ? "bg-state-success"
           : "bg-state-wake";
@@ -482,7 +529,9 @@ function Header({
               {!live
                 ? t("agent.status.exited")
                 : errored
-                  ? t("agent.status.error", { defaultValue: "出错·无法工作" })
+                  ? stuckSuspect
+                    ? t("agent.status.stuckSuspect", { defaultValue: "疑似卡住·唤醒无响应" })
+                    : t("agent.status.error", { defaultValue: "出错·无法工作" })
                   : info?.shim_ready
                     ? t("agent.status.ready")
                     : t("agent.status.starting")}
@@ -548,6 +597,20 @@ function Header({
         )}
         {/* "重启" 按钮删了 —— 它一直 disabled 标"暂未实现"，给用户露出一个
             按不动的死按钮。等真支持重启再加回来。 */}
+        {/* 终止 = 杀进程（此前只在 /debug 有）。确认走 Drawer 统一的
+            ConfirmActionDialog；只在活着时出现，与唤醒/暂停同一规则。 */}
+        {live && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-state-danger"
+            onClick={onKill}
+            title={t("agent.confirm.kill.desc")}
+          >
+            <Square className="size-3" />
+            {t("agent.kill")}
+          </Button>
+        )}
       </div>
     </header>
   );
@@ -773,11 +836,6 @@ function MessagesTab({ agentId }: { agentId: string }) {
   // a previous agent could land after a fast pull for the current one and show
   // the wrong agent's messages when the user clicks between agents quickly.
   const reqIdRef = useRef(0);
-  // Debounce timer for swarm-triggered refreshes. Each inbound `message` event
-  // would otherwise fire TWO list requests (from + to) immediately — a burst of
-  // chatter to/from this agent meant a request storm. Coalesce into one refresh
-  // per quiet window.
-  const debounceRef = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
     const reqId = ++reqIdRef.current;
@@ -808,29 +866,22 @@ function MessagesTab({ agentId }: { agentId: string }) {
   }, [agentId]);
 
   useEffect(() => {
-    refresh();
-    // Cancel any pending debounced refresh when the agent changes/unmounts so a
-    // stale timer doesn't fire a pull for the previous agent.
-    return () => {
-      if (debounceRef.current != null) {
-        window.clearTimeout(debounceRef.current);
-        debounceRef.current = null;
-      }
-    };
+    void refresh();
   }, [agentId, refresh]);
 
-  useSwarmFeed({
-    onEvent: (ev: SwarmEvent) => {
-      if (ev.type !== "message") return;
-      if (ev.from_agent !== agentId && ev.to_agent !== agentId) return;
-      // 200ms de-bounce: collapse a burst of message events into one refresh.
-      if (debounceRef.current != null) window.clearTimeout(debounceRef.current);
-      debounceRef.current = window.setTimeout(() => {
-        debounceRef.current = null;
-        refresh();
-      }, 200);
-    },
-  });
+  const liveMessages = useSwarmField((s) => s.liveMessages);
+  useEffect(() => {
+    const extra = liveMessages.filter(
+      (m) => m.from_agent === agentId || m.to_agent === agentId,
+    );
+    if (extra.length === 0) return;
+    setItems((prev) => {
+      const seen = new Set(prev.map((m) => m.id));
+      const added = extra.filter((m) => !seen.has(m.id));
+      if (added.length === 0) return prev;
+      return [...prev, ...added].sort((a, b) => a.sent_at - b.sent_at);
+    });
+  }, [liveMessages, agentId]);
 
   if (error) {
     return <div className="p-5 text-xs text-state-danger">{error}</div>;

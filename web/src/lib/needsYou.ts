@@ -11,9 +11,14 @@
  *                     `handoff_failed`(写了 `<key>.error`,常见于 kill/崩溃)。
  *                     **两者都要进人收件箱** —— 只认 missing 会漏掉真实用户
  *                     杀进程路径(见 UX-016)。
- *   3. stalled      — 「该醒没醒」(server 算)。**不展示给用户点** —— Shell 用
+ *   3. stuck        — S5 看门狗的「疑似卡住」软标记(server 置
+ *                     `last_error_kind="stuck"`:进程活着、欠着交付键、连续
+ *                     两轮系统唤醒仍零活动)。自动催已经耗尽了,剩下要人看一
+ *                     眼(开终端 / 手动唤醒 / 终止)——所以进栏,但文案是
+ *                     「疑似卡住」,不是「死了」。
+ *   4. stalled      — 「该醒没醒」(server 算)。**不展示给用户点** —— Shell 用
  *                     `useAutoNudgeStalled` 自动催；收件箱只留需要人做决定的
- *                     error / handoff。
+ *                     error / handoff / stuck。
  *
  * stalled 不是 0.3.0 被撤下的「疑似卡住」:那版只看「多久没活动」,而现代
  * agent 的回合可以合法跑十几二十分钟(长思考、大构建、API 重试),阈值再宽
@@ -26,9 +31,9 @@
 
 import type { AgentInfo, AgentLiveState } from "@/api/types";
 import type { MessageRecord } from "@/api/types";
-import { resolveMemberVisual } from "./agent";
+import { hasRecoveredSinceError, resolveMemberVisual } from "./agent";
 
-export type NeedsYouKind = "error" | "handoff" | "stalled";
+export type NeedsYouKind = "error" | "handoff" | "stuck" | "stalled";
 
 export interface NeedsYouItem {
   agent: AgentInfo;
@@ -72,19 +77,27 @@ export function deriveNeedsYou(
     // handoff 必须先于退出过滤:server 对已退出 agent 置 missing/failed。
     // 先 skip 已退出会让「worker 没交付就死了」永远进不了收件箱。
     if (hasUndeliveredHandoff(a)) {
-      // UX-034: silent missing（.error 已清/从未写）+ 规划也挂了 →
-      // 「跟规划说」没对象，条会永久赖着。有 .error 的 failed 仍亮，
-      // 或规划还活着时仍亮（真的能跟规划说）。
-      const silentMissing = !!a.handoff_missing && !a.handoff_failed;
-      if (silentMissing && !captainLive) {
-        continue;
-      }
+      // 芯片的动作是「跟规划说」。规划也死了就没有对象 —— missing
+      // 和 failed 一样，亮着只能点出一句空 toast。只在规划还活着时收人。
+      if (!captainLive) continue;
       out.push({ agent: a, kind: "handoff" });
       continue;
     }
     // 已退出(主动 kill / shim 退出)的 agent 不参与 error/stalled 判定:
     // 刻意 kill 且无 handoff 契约不是 needs-you;server 也只对活着的 agent 置 stalled。
     if (a.killed_at != null || a.shim_exit != null) continue;
+    // S5 看门狗的「疑似卡住」软标记先于通用 error 判定:它不是确凿故障
+    // (resolveMemberVisual 对它给琥珀、isError=false),但自动唤醒已耗尽,
+    // 需要人看一眼。恢复守卫与成员栏同一条真相:严格新于标记时刻的活动
+    // 一到,标记即刻不再算数(后端下一 tick 也会清掉它)。
+    if (
+      a.last_error != null &&
+      a.last_error_kind === "stuck" &&
+      !hasRecoveredSinceError(a, liveById[a.agent_id])
+    ) {
+      out.push({ agent: a, kind: "stuck" });
+      continue;
+    }
     const v = resolveMemberVisual(a, liveById[a.agent_id], messages, PLACEHOLDER_LABELS, now);
     if (v.isError) {
       // error 优先于 stalled:同一个 agent 既报错又有滞留邮件时,真正要人
@@ -95,8 +108,9 @@ export function deriveNeedsYou(
     }
   }
   // 排序:确凿的故障(error / handoff,工作已受损或无法进行)排在疑似
-  // (stalled,唤醒链「可能」断了)前面 —— 收件箱的注意力分配与文案的
-  // 诚实度梯度一致。
-  const rank: Record<NeedsYouKind, number> = { error: 0, handoff: 1, stalled: 2 };
+  // (stuck / stalled,只是「可能」出事)前面 —— 收件箱的注意力分配与文案的
+  // 诚实度梯度一致。stuck 排在 stalled 前:它的两轮自动催已经耗尽,
+  // 比「该醒没醒」更接近真的需要人。
+  const rank: Record<NeedsYouKind, number> = { error: 0, handoff: 1, stuck: 2, stalled: 3 };
   return out.sort((x, y) => rank[x.kind] - rank[y.kind]);
 }

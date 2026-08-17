@@ -358,9 +358,7 @@ export function resolveMemberVisual(
   // (终端内 /login、慢首响)后已恢复干活。后端 tailer 会清 last_error 并 publish
   // 非 error 状态,这里只兜住"恢复活动已到、后端清除事件尚未到/被 lossy WS 丢掉"
   // 的窗口。绝不会造成假绿:仅当存在严格新于 last_error_at 的活动时才放行。
-  const errAt = agent.last_error_at ?? null;
-  const freshSignalAt = Math.max(agent.last_activity_at ?? 0, live?.activity?.at ?? 0);
-  const recoveredSinceError = errAt != null && freshSignalAt > errAt;
+  const recoveredSinceError = hasRecoveredSinceError(agent, live);
 
   // 2) 真实 swarm state(若已收到事件)。
   const st = live?.state;
@@ -383,6 +381,13 @@ export function resolveMemberVisual(
     typing: false,
     isError: false,
   });
+  // 3-stuck) S5 看门狗的「疑似卡住」软标记(last_error_kind="stuck"):进程活着、
+  //     连续两轮系统唤醒仍零活动——琥珀「久无活动」,不是红色「异常退出」(它不是
+  //     确凿故障,只是需要人看一眼)。放在 3a/3b 之前:任何严格新于标记时刻的活动
+  //     已被 recoveredSinceError 放行到正常层,走到这里就不存在"在干活"的证据。
+  if (agent.last_error && agent.last_error_kind === "stuck" && !recoveredSinceError) {
+    return stalled(labels.stalled);
+  }
   const act = live?.activity;
   // 3a) 某个工具"running"卡太久 → 大概率卡死,别再 typing 假装在跑。
   if (act && act.phase === "running") {
@@ -480,6 +485,20 @@ export function agentIsAlive(a: AgentInfo): boolean {
  *  present `last_error` means it is still failing right now. */
 export function agentIsErrored(a: AgentInfo): boolean {
   return a.last_error != null;
+}
+
+/** 恢复守卫:存在严格新于 `last_error_at` 的活动信号(持久化的
+ *  `last_activity_at` 或 live activity)→ 软错误(未登录/看门狗/疑似卡住)
+ *  之后 agent 已恢复干活。`resolveMemberVisual` 与 NeedsYou 派生共用这一条
+ *  真相,免得两处各自重算而漂移。 */
+export function hasRecoveredSinceError(
+  agent: AgentInfo,
+  live: AgentLiveState | undefined,
+): boolean {
+  const errAt = agent.last_error_at ?? null;
+  if (errAt == null) return false;
+  const freshSignalAt = Math.max(agent.last_activity_at ?? 0, live?.activity?.at ?? 0);
+  return freshSignalAt > errAt;
 }
 
 /** Honest "ready to work": PTY up, alive, and NOT flagged as failing. What a
