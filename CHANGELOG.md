@@ -7,6 +7,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Before tagging a release, run `node scripts/bump-version.mjs <x.y.z>` to sync
 the version across all four manifests.
 
+## [0.3.1] — 2026-08-15
+
+装包用户文案一轮收口：角色显示名改成中文动作系，多页文案去开发黑话，MCP 开关瘦身。
+
+### Changed
+- 角色显示与多页文案按装包用户重写（规划/调研/解冲突等中文动作系命名），
+  不再把 spell / 编排 / 台账等内部词甩给使用者。
+- MCP 页的 Claude/Codex 开关从 32px 方块收成 14px 细条。
+
+### Fixed
+- 补齐 harness 缺失的 i18n 文案与 `SWARMX_DISABLE_LITELLM_REFRESH` 文档。
+
 ## [0.3.0] — 2026-07-21
 
 「Mission Control」体验重构 + SwarmX 品牌。Agent 冷启动不再黑盒,「需要我」
