@@ -119,7 +119,7 @@ export function Welcome({ onCreateWorkspace }: Props) {
             <ArrowRight className="size-4" />
           </button>
           <a
-            href="https://github.com/curdx/swarmx#readme"
+            href="https://github.com/mugsun/swarmx#readme"
             target="_blank"
             rel="noreferrer"
             className="inline-flex items-center gap-1.5 font-caption text-[12px] text-foreground-tertiary transition-colors hover:text-foreground-secondary hover:underline"

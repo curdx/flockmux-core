@@ -6,14 +6,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/curdx/swarmx/releases/latest"><img src="https://img.shields.io/github/v/release/curdx/swarmx?style=for-the-badge&label=Download" alt="Download latest release"></a>
+  <a href="https://github.com/mugsun/swarmx/releases/latest"><img src="https://img.shields.io/github/v/release/curdx/swarmx?style=for-the-badge&label=Download" alt="Download latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/Desktop-Tauri-24C8DB.svg?style=for-the-badge&logo=tauri&logoColor=white" alt="Tauri">
   <a href="README.en.md"><img src="https://img.shields.io/badge/Lang-English-blue?style=for-the-badge" alt="English"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/curdx/swarmx/releases/latest"><strong>下载安装包 → 打开 → 跟队长说话</strong></a>
+  <a href="https://github.com/mugsun/swarmx/releases/latest"><strong>下载安装包 → 打开 → 跟队长说话</strong></a>
   · 全程不碰命令行
 </p>
 
@@ -35,7 +35,7 @@ swarmx 不读、也不存你的任何 token。
 
 ## 快速开始（推荐）
 
-1. 打开 [Releases](https://github.com/curdx/swarmx/releases/latest)，按系统下载：
+1. 打开 [Releases](https://github.com/mugsun/swarmx/releases/latest)，按系统下载：
    - **macOS：** `swarmx_*_macos-arm64.dmg` 或 `macos-x64.dmg`
    - **Windows：** `swarmx_*_windows-x64-setup.exe` 或 `.msi`
    - **Linux：** `.AppImage` / `.deb` / `.rpm`
@@ -70,7 +70,7 @@ server / shim / mcp 三个二进制作为 sidecar 内嵌——下载装好就能
 前置：Rust 1.83+、Node 22+，以及至少一个登录好的 CLI。
 
 ```bash
-git clone https://github.com/curdx/swarmx.git
+git clone https://github.com/mugsun/swarmx.git
 cd swarmx
 cargo build --workspace
 cd web && npm install && cd ..

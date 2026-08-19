@@ -507,7 +507,7 @@
       "appName": "swarmx",
       "version": "Version v{{v}}",
       "repo": "Repository",
-      "repoUrl": "github.com/curdx/swarmx",
+    "repoUrl": "github.com/mugsun/swarmx",
       "endpointTitle": "Local service address",
       "endpointHint": "Only this computer can reach it",
       "cratesTitle": "Rust crates",
