@@ -6,14 +6,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/curdx/swarmx/releases/latest"><img src="https://img.shields.io/github/v/release/curdx/swarmx?style=for-the-badge&label=Download" alt="Download latest release"></a>
+  <a href="https://github.com/mugsun/swarmx/releases/latest"><img src="https://img.shields.io/github/v/release/curdx/swarmx?style=for-the-badge&label=Download" alt="Download latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/Desktop-Tauri-24C8DB.svg?style=for-the-badge&logo=tauri&logoColor=white" alt="Tauri">
   <a href="README.md"><img src="https://img.shields.io/badge/Lang-中文-red?style=for-the-badge" alt="中文"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/curdx/swarmx/releases/latest"><strong>Download → install → open → talk to the orchestrator</strong></a>
+  <a href="https://github.com/mugsun/swarmx/releases/latest"><strong>Download → install → open → talk to the orchestrator</strong></a>
   · no terminal required
 </p>
 
@@ -36,7 +36,7 @@ buy you a subscription; it coordinates agents you already have.
 
 ## Quick start (recommended)
 
-1. Open [Releases](https://github.com/curdx/swarmx/releases/latest) and download for your OS:
+1. Open [Releases](https://github.com/mugsun/swarmx/releases/latest) and download for your OS:
    - **macOS:** `swarmx_*_macos-arm64.dmg` or `macos-x64.dmg`
    - **Windows:** `swarmx_*_windows-x64-setup.exe` or `.msi`
    - **Linux:** `.AppImage` / `.deb` / `.rpm`
@@ -74,7 +74,7 @@ For contributors. Everyday use should go through the installer above.
 Prereqs: Rust 1.83+, Node 22+, and at least one logged-in CLI.
 
 ```bash
-git clone https://github.com/curdx/swarmx.git
+git clone https://github.com/mugsun/swarmx.git
 cd swarmx
 cargo build --workspace
 cd web && npm install && cd ..

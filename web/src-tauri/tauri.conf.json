@@ -55,7 +55,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFDOEIwMDI1OEI5OTFBRjkKUldUNUdwbUxKUUNMSEVPcmM1d3I1TE1iQW9TMGFHQjFEaHFFamNrUkhtVVg1aGZqTDVQYnI5ZEYK",
       "endpoints": [
-        "https://github.com/curdx/swarmx/releases/latest/download/latest.json"
+        "https://github.com/mugsun/swarmx/releases/latest/download/latest.json"
       ]
     }
   }

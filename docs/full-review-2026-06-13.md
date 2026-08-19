@@ -1491,7 +1491,7 @@
 
 1. [首页/工作空间列表 + 新建空间向导] 向导扫描完成靠‘看到任意 project.summary.* 写入’判定，并发/残留 scout 会让向导提前误关并跳错房间
 2. [首页/工作空间列表 + 新建空间向导] 向导原生选目录按钮(Tauri)选中后未做存在性/目录校验即可能直接放行
-3. [首页/工作空间列表 + 新建空间向导] Welcome 文档外链硬编码到 github.com/curdx/swarmx-core，与实际仓库可能不符
+3. [首页/工作空间列表 + 新建空间向导] Welcome 文档外链硬编码到 github.com/mugsun/swarmx-core，与实际仓库可能不符
 4. [对话主面板 MessagesPanel(核心)] composer 在无活成员且无 onSend 时禁用，但占位文案/提示未明确告诉小白「先唤醒」
 5. [工作空间外壳 + 侧边栏 + 工具条] 未读计数依赖最近 200 条消息的 id→sender 映射，超过 200 条历史时 message_read 可能无法递减、未读 badge 卡住
 6. [依赖图 DAG 视图] interrupt-all 返回 failed 列表被前端丢弃，部分 agent 暂停失败仍显示成功

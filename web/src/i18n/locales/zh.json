@@ -507,7 +507,7 @@
       "appName": "swarmx",
       "version": "版本 v{{v}}",
       "repo": "仓库",
-      "repoUrl": "github.com/curdx/swarmx",
+    "repoUrl": "github.com/mugsun/swarmx",
       "endpointTitle": "本机服务地址",
       "endpointHint": "仅这台电脑可以访问",
       "cratesTitle": "Rust crate 列表",
